@@ -10,13 +10,18 @@ while one runs gets Busy instead of queueing behind it.
 
 from __future__ import annotations
 
+import os
 import threading
 import uuid
 
+from ..adapters.github_cli import GitHubCLI
+from ..adapters.session_env import SessionEnvironment
 from ..models import ActiveState, ClaudeFolder, Config
 from ..paths import AppPaths
 from ..rendering import gitconfig
+from ..rendering.envfile import SECRET_TOOL, APIKeyExport, ShellEnvironment, render_fish, render_posix
 from ..storage import AtomicFileWriter, StateStore, read_bytes, restore_file
+from ..tools import Tool
 from ..validation import issues_in
 from .types import (
     Busy, ClaudeTarget, InvalidConfiguration, Preflight, PreflightFailure, RollbackOutcome, StateUnreadable,
@@ -38,12 +43,13 @@ class _Operation:
 
 
 class SwitchEngine:
-    def __init__(self, environment, tools, log=None):
+    def __init__(self, environment, tools, log=None, secret_tool: str = SECRET_TOOL):
         self.environment = environment
         self.paths = AppPaths(environment)
         self.tools = tools
         self.state_store = StateStore(self.paths, environment.clock)
         self.log = log
+        self.secret_tool = secret_tool
         self._lock = threading.Lock()
 
     # MARK: public API
@@ -115,11 +121,48 @@ class SwitchEngine:
             activated_at=now if operation.starts_new_activation else (previous.activated_at or now),
             generation=previous.generation + 1,
         )
+        api_keys = [config.api_key(k) for k in (profile.api_key_ids if profile else [])]
+        api_keys = [k for k in api_keys if k is not None]
+        shell_environment = ShellEnvironment(
+            generation=new_state.generation,
+            managed_vars=config.managed_env_vars,
+            claude=claude_target,
+            api_keys=[APIKeyExport(k.env_var, k.secret_account) for k in api_keys],
+        )
+        child_environment = self.environment.base_process_environment(self.tools.search_directories())
+
+        # Preflight: everything that can be checked without changing anything.
+        # gh token validity is deliberately not checked: `gh auth status` tests
+        # every token over the network, which would make switching slow and
+        # impossible offline. An account gh does not know makes `gh auth switch`
+        # fail, and the transaction rolls back. Token health belongs to Verificar.
+        github_plan = None
+        github_account = config.github_account(profile.github_account_id if profile else None)
+        if touches_git_and_github and github_account is not None:
+            gh = self.tools.locate(Tool.GH)
+            if gh is None:
+                raise Preflight(PreflightFailure("toolMissing", "gh"))
+            github_plan = (GitHubCLI(self.environment.runner, gh, child_environment), github_account)
+        if claude_target.kind == "directory" and not os.path.isdir(claude_target.path):
+            raise Preflight(PreflightFailure("claudeDirectoryMissing", claude_target.path))
+        for key in api_keys:
+            try:
+                present = self.environment.secrets.contains_item(key.secret_account)
+            except Exception as error:
+                raise Preflight(PreflightFailure("secretsUnavailable", str(error))) from error
+            if not present:
+                raise Preflight(PreflightFailure("apiKeyMissing", key.nickname, key.env_var))
 
         steps: list[SwitchStep] = []
         if touches_git_and_github:
             identity = config.git_identity(profile.git_identity_id if profile else None)
             steps.append(self._git_step(gitconfig.render(identity, self.environment)))
+        if github_plan is not None:
+            steps.append(self._github_step(*github_plan))
+        # Switching only the Claude account never moves the folder.
+        if touches_git_and_github and claude_target.kind != "unchanged":
+            steps.append(self._session_step(claude_target, SessionEnvironment(self.environment, child_environment)))
+        steps.append(self._env_files_step(shell_environment))
         steps.append(self._state_step(new_state))
 
         self._log("info", f"switch {transaction}: start profile={profile.name if profile else '-'} "
@@ -164,6 +207,44 @@ class SwitchEngine:
             return lambda: restore_file(previous, path)
 
         return SwitchStep(SwitchStepKind.GIT, apply)
+
+    def _github_step(self, cli: GitHubCLI, account) -> SwitchStep:
+        def apply():
+            previous = cli.active_login(account.host)
+            if previous is not None and previous.lower() == account.username.lower():
+                return lambda: None
+            cli.switch_account(account.host, account.username)
+
+            def undo():
+                if previous is not None:
+                    cli.switch_account(account.host, previous)
+            return undo
+
+        return SwitchStep(SwitchStepKind.GITHUB, apply)
+
+    def _session_step(self, target: ClaudeTarget, session: SessionEnvironment) -> SwitchStep:
+        return SwitchStep(SwitchStepKind.SESSION, lambda: session.apply(CLAUDE_VARIABLE, target.desired_value))
+
+    def _env_files_step(self, shell_environment: ShellEnvironment) -> SwitchStep:
+        sh, fish = self.paths.env_sh, self.paths.env_fish
+        posix = render_posix(shell_environment, self.secret_tool).encode()
+        fish_text = render_fish(shell_environment, self.secret_tool).encode()
+
+        def apply():
+            previous_sh, previous_fish = read_bytes(sh), read_bytes(fish)
+            AtomicFileWriter.write(posix, sh, permissions=0o644)
+            try:
+                AtomicFileWriter.write(fish_text, fish, permissions=0o644)
+            except Exception:
+                restore_file(previous_sh, sh)
+                raise
+
+            def undo():
+                restore_file(previous_fish, fish)
+                restore_file(previous_sh, sh)
+            return undo
+
+        return SwitchStep(SwitchStepKind.ENV_FILES, apply)
 
     def _state_step(self, new_state: ActiveState) -> SwitchStep:
         store = self.state_store

@@ -42,6 +42,8 @@ def two_profiles():
 class SwitchSkeletonTests(SafeTestCase):
     def setUp(self):
         super().setUp()
+        from tests.test_engine import FakeSystem
+        self.system = FakeSystem(self.runner)  # gh and systemctl --user
         self.paths = AppPaths(self.environment)
         self.engine = SwitchEngine(self.environment, FixedTools())
         self.config = two_profiles()
@@ -61,7 +63,7 @@ class SwitchSkeletonTests(SafeTestCase):
         self.assertEqual(state["profileId"], str(work.id).upper())
         self.assertEqual(result.state.generation, 1)
         self.assertEqual(result.state.activated_at, FIXED_NOW)
-        self.assertEqual([k.value for k in result.applied_steps], ["git", "state"])
+        self.assertEqual([k.value for k in result.applied_steps], ["git", "session", "envFiles", "state"])
 
         self.engine.switch_profile(self.config.profiles[1].id, self.config)
         self.assertEqual(self.git_email(), "rafa@example.com")

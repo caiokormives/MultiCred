@@ -1,6 +1,7 @@
 """S-01: the minimal window lists the profiles and a row switches the profile.
 
-Needs a display: run under `xvfb-run -a`. Skipped when GTK cannot open one.
+Runs only under tests/run-ui-tests.sh (private Xvfb display and private bus):
+without it GTK would fall back to the user's real Wayland desktop.
 """
 
 import os
@@ -9,14 +10,16 @@ import tempfile
 import unittest
 from pathlib import Path
 
-try:
-    import gi
-    gi.require_version("Gtk", "4.0")
-    gi.require_version("Adw", "1")
-    from gi.repository import Adw, Gio, GLib, Gtk
-    HAS_DISPLAY = Gtk.init_check()
-except (ImportError, ValueError):
-    HAS_DISPLAY = False
+HAS_DISPLAY = False
+if os.environ.get("MULTICRED_PRIVATE_BUS") == "1":
+    try:
+        import gi
+        gi.require_version("Gtk", "4.0")
+        gi.require_version("Adw", "1")
+        from gi.repository import Adw, Gio, GLib, Gtk
+        HAS_DISPLAY = Gtk.init_check()
+    except (ImportError, ValueError):
+        HAS_DISPLAY = False
 
 
 class FixedTools:
@@ -27,7 +30,7 @@ class FixedTools:
         return ["/usr/bin", "/bin"]
 
 
-@unittest.skipUnless(HAS_DISPLAY, "no display (run under xvfb-run)")
+@unittest.skipUnless(HAS_DISPLAY, "needs tests/run-ui-tests.sh (private display and bus)")
 class MainWindowSkeletonTests(unittest.TestCase):
     def setUp(self):
         from multicred.core import real_env
