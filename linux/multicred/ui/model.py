@@ -7,8 +7,8 @@ import threading
 from typing import Callable
 
 from ..core.engine.switch_engine import SwitchEngine
-from ..core.engine.types import SwitchError
-from ..core.models import ActiveState, Config
+from ..core.engine.types import StepFailed, SwitchError
+from ..core.models import ActiveState, ClaudeFolder, Config
 from ..core.storage import ConfigRepository, JSONStoreError
 
 
@@ -24,6 +24,9 @@ class AppModel:
         self.state = ActiveState()
         self.load_error: Exception | None = None
         self.switching = False
+        # A switch failed and could not undo everything: the machine is half switched.
+        # Cleared by the next successful switch (the tray shows the orange dot meanwhile).
+        self.inconsistent = False
         self._listeners: list[Callable[[], None]] = []
 
     @property
@@ -60,13 +63,22 @@ class AppModel:
 
     def switch_profile(self, profile_id, on_done: Callable[[object | None, Exception | None], None]) -> None:
         """Runs the switch off the UI thread; `on_done(result, error)` runs on the UI thread."""
+        self._run_switch(lambda config: self.engine.switch_profile(profile_id, config), on_done)
+
+    def switch_claude_only(self, account_id, on_done: Callable[[object | None, Exception | None], None]) -> None:
+        """Switches only the Claude account (None = the profile folder's own login), like the
+        Mac `switchClaudeOnly(to:)`: choosing the profile's own account clears the override."""
+        override = ClaudeFolder.override_for(account_id, self.active_profile)
+        self._run_switch(lambda config: self.engine.switch_claude_only(override, config), on_done)
+
+    def _run_switch(self, operation, on_done) -> None:
         config = self.config
         self.switching = True
         self.notify()
 
         def work():
             try:
-                result, error = self.engine.switch_profile(profile_id, config), None
+                result, error = operation(config), None
             except SwitchError as failure:
                 result, error = None, failure
             self.dispatch(self._finish, result, error, on_done)
@@ -77,6 +89,9 @@ class AppModel:
         self.switching = False
         if result is not None:
             self.state = result.state
+            self.inconsistent = False
+        elif isinstance(error, StepFailed) and not error.rollback.complete:
+            self.inconsistent = True
         on_done(result, error)
         self.notify()
         return False  # GLib.idle_add: run once
