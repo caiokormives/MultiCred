@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=MultiCred
+Comment=Troca de identidade de dev com um clique
+Exec=multicred
+Icon=app.multicred.MultiCred
+Terminal=false
+Categories=Development;Utility;
+Keywords=git;github;claude;perfil;identidade;
+StartupNotify=true

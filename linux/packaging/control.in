@@ -1,0 +1,14 @@
+Package: multicred
+Version: @VERSION@
+Section: devel
+Priority: optional
+Architecture: all
+Installed-Size: @SIZE@
+Depends: python3 (>= 3.12), python3-gi, python3-gi-cairo, gir1.2-gtk-4.0, gir1.2-adw-1 (>= 1.5), gir1.2-secret-1, libsecret-tools, git
+Recommends: gh
+Maintainer: MultiCred <noreply@multicred.app>
+Homepage: https://github.com/Rafael-Leivas/MultiCred
+Description: troca de identidade de dev com um clique
+ Troca, de forma transacional, a identidade do git, a conta ativa do GitHub
+ CLI, a pasta e a conta do Claude Code e as chaves de API dos terminais.
+ Fica na bandeja do COSMIC (Pop!_OS) e do GNOME (Ubuntu).
