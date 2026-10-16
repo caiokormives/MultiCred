@@ -34,8 +34,10 @@ class AtomicFileWriter:
     """Temp file in the same directory, fsync, rename: a crash leaves the old file or the new one."""
 
     @staticmethod
-    def write(data: bytes, path, permissions: int = 0o644, follow_symlink: bool = False) -> Path:
-        """Writes `data`. A new file gets `permissions`; an existing file keeps its mode.
+    def write(data: bytes, path, permissions: int = 0o644, follow_symlink: bool = False,
+              keep_mode: bool = True) -> Path:
+        """Writes `data`. A new file gets `permissions`; an existing file keeps its mode
+        unless `keep_mode` is False (then it gets `permissions` too).
 
         With `follow_symlink`, a symlink target (stow, chezmoi) is written at its
         destination instead of replacing the link. Returns the path written.
@@ -48,10 +50,11 @@ class AtomicFileWriter:
             raise WriteFailed(directory, error.strerror) from error
 
         mode = permissions
-        try:
-            mode = stat.S_IMODE(os.lstat(target).st_mode)
-        except FileNotFoundError:
-            pass
+        if keep_mode:
+            try:
+                mode = stat.S_IMODE(os.lstat(target).st_mode)
+            except FileNotFoundError:
+                pass
 
         temp = directory / f".{target.name}.multicred-{uuid.uuid4()}"
         try:

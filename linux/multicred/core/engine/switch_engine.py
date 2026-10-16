@@ -16,7 +16,9 @@ import uuid
 
 from ..adapters.github_cli import GitHubCLI
 from ..adapters.session_env import SessionEnvironment
-from ..models import ActiveState, ClaudeFolder, Config
+from ..claude import attribution
+from ..claude.login_vault import ClaudeLoginSwitcher
+from ..models import ActiveState, ClaudeAccountKind, ClaudeFolder, Config, uuid_text
 from ..paths import AppPaths
 from ..rendering import gitconfig
 from ..rendering.envfile import SECRET_TOOL, APIKeyExport, ShellEnvironment, render_fish, render_posix
@@ -107,27 +109,44 @@ class SwitchEngine:
                 and config.claude_account(override) is None):
             raise Preflight(PreflightFailure("claudeAccountNotFound"))
 
+        # The Claude folder (agents, skills, chats) belongs to the profile and only
+        # changes with the profile. The Claude account is just the credential: the
+        # override (switch only the Claude account) wins over the profile's choice,
+        # and no account means the folder's own login.
         if profile is None:
             claude_target = ClaudeTarget.unchanged()
         elif profile.claude_config_dir is None:
             claude_target = ClaudeTarget.default()
         else:
             claude_target = ClaudeTarget.directory(profile.claude_config_dir)
+        if override == ClaudeFolder.OWN_LOGIN_OVERRIDE:
+            chosen = None
+        else:
+            chosen = override if override is not None else (profile.claude_account_id if profile else None)
+        chosen_account = config.claude_account(chosen)
+        token_account = chosen_account if chosen_account and chosen_account.kind == ClaudeAccountKind.TOKEN else None
+        login_account = chosen_account if chosen_account and chosen_account.kind == ClaudeAccountKind.LOGIN else None
+        applied_account = token_account or login_account
+        login_switcher = ClaudeLoginSwitcher(self.environment)
 
         now = self.environment.clock()
         new_state = ActiveState(
             profile_id=profile_id,
             claude_override_id=override,
+            applied_claude_account_id=applied_account.id if applied_account else None,
             activated_at=now if operation.starts_new_activation else (previous.activated_at or now),
             generation=previous.generation + 1,
         )
         api_keys = [config.api_key(k) for k in (profile.api_key_ids if profile else [])]
         api_keys = [k for k in api_keys if k is not None]
+        exports = [APIKeyExport(k.env_var, k.secret_account) for k in api_keys]
+        if token_account is not None:
+            exports.append(APIKeyExport(ClaudeFolder.TOKEN_VARIABLE, token_account.secret_account))
         shell_environment = ShellEnvironment(
             generation=new_state.generation,
             managed_vars=config.managed_env_vars,
             claude=claude_target,
-            api_keys=[APIKeyExport(k.env_var, k.secret_account) for k in api_keys],
+            api_keys=exports,
         )
         child_environment = self.environment.base_process_environment(self.tools.search_directories())
 
@@ -152,6 +171,24 @@ class SwitchEngine:
                 raise Preflight(PreflightFailure("secretsUnavailable", str(error))) from error
             if not present:
                 raise Preflight(PreflightFailure("apiKeyMissing", key.nickname, key.env_var))
+        # (The macOS check for tokens stored by an old build under a different
+        # Keychain ACL, claudeTokenNeedsRefresh, has no Linux counterpart.)
+        # A Secret Service error is reported as such (the macOS app reported it as
+        # "missing"), so a locked keyring is not mistaken for a deleted login.
+        if login_account is not None:
+            try:
+                present = self.environment.claude_credentials.read_vault(uuid_text(login_account.id)) is not None
+            except Exception as error:
+                raise Preflight(PreflightFailure("secretsUnavailable", str(error))) from error
+            if not present:
+                raise Preflight(PreflightFailure("claudeLoginMissing", login_account.nickname))
+        if token_account is not None:
+            try:
+                present = self.environment.secrets.contains_item(token_account.secret_account)
+            except Exception as error:
+                raise Preflight(PreflightFailure("secretsUnavailable", str(error))) from error
+            if not present:
+                raise Preflight(PreflightFailure("claudeTokenMissing", token_account.nickname))
 
         steps: list[SwitchStep] = []
         if touches_git_and_github:
@@ -162,11 +199,22 @@ class SwitchEngine:
         # Switching only the Claude account never moves the folder.
         if touches_git_and_github and claude_target.kind != "unchanged":
             steps.append(self._session_step(claude_target, SessionEnvironment(self.environment, child_environment)))
+        # Claude as co-author follows the profile's GitHub account, written to the
+        # profile's Claude folder (Claude Code reads it only from settings).
+        if touches_git_and_github and github_account is not None:
+            steps.append(self._claude_settings_step(profile.claude_config_dir, github_account.claude_co_author))
+        # Login accounts live in the folder's own credentials; leaving one (another
+        # account or the folder's own login chosen) puts the folder's login back.
+        if profile is not None and (login_account is not None
+                                    or login_switcher.occupancy().account_in(profile.claude_config_dir) is not None):
+            steps.append(self._claude_login_step(login_switcher, login_account.id if login_account else None,
+                                                 profile.claude_config_dir))
         steps.append(self._env_files_step(shell_environment))
         steps.append(self._state_step(new_state))
 
+        account_name = applied_account.nickname if applied_account else "login da pasta"
         self._log("info", f"switch {transaction}: start profile={profile.name if profile else '-'} "
-                          f"folder={claude_target} steps={[s.kind.value for s in steps]}")
+                          f"folder={claude_target} account={account_name} steps={[s.kind.value for s in steps]}")
         undo_stack = []
         for step in steps:
             try:
@@ -224,6 +272,34 @@ class SwitchEngine:
 
     def _session_step(self, target: ClaudeTarget, session: SessionEnvironment) -> SwitchStep:
         return SwitchStep(SwitchStepKind.SESSION, lambda: session.apply(CLAUDE_VARIABLE, target.desired_value))
+
+    def _claude_settings_step(self, config_dir: str | None, co_author: bool) -> SwitchStep:
+        path = attribution.settings_file(config_dir, self.environment)
+
+        def apply():
+            if not path.parent.is_dir():
+                return lambda: None
+            target = AtomicFileWriter.resolve_target(path, follow_symlink=True)
+            previous = read_bytes(target)
+            try:
+                content = attribution.updated(previous, co_author)
+            except attribution.UnreadableSettings:
+                # A settings.json MultiCred cannot parse is left untouched.
+                self._log("warning", f"claude settings not changed (unreadable): {target}")
+                return lambda: None
+            if content is None:
+                return lambda: None
+            # One backup of the user's original file, kept next to it.
+            backup = target.with_name(target.name + ".multicred-backup")
+            if previous is not None and not os.path.lexists(backup):
+                AtomicFileWriter.write(previous, backup, permissions=0o600)
+            AtomicFileWriter.write(content, target, permissions=0o644)
+            return lambda: restore_file(previous, target)
+
+        return SwitchStep(SwitchStepKind.CLAUDE_SETTINGS, apply)
+
+    def _claude_login_step(self, switcher: ClaudeLoginSwitcher, account, folder: str | None) -> SwitchStep:
+        return SwitchStep(SwitchStepKind.CLAUDE_LOGIN, lambda: switcher.place(account, folder))
 
     def _env_files_step(self, shell_environment: ShellEnvironment) -> SwitchStep:
         sh, fish = self.paths.env_sh, self.paths.env_fish

@@ -141,7 +141,7 @@ class SwitchEngineTests(SafeTestCase):
 
     def test_switch_to_personal_applies_everything(self):
         result = self.engine().switch_profile(self.personal.id, self.config)
-        self.assertEqual(result.applied_steps, [K.GIT, K.GITHUB, K.SESSION, K.ENV_FILES, K.STATE])
+        self.assertEqual(result.applied_steps, [K.GIT, K.GITHUB, K.SESSION, K.CLAUDE_SETTINGS, K.ENV_FILES, K.STATE])
         self.assertEqual(self.system.gh_active, "dev-pessoal")
         self.assertEqual(self.system.claude, self.claude_personal)
         self.assertIn(f"CLAUDE_CONFIG_DIR={self.claude_personal}",

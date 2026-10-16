@@ -34,12 +34,22 @@ def session_bus_address() -> str | None:
 
 
 def make_real() -> SystemEnvironment:
-    """The real system: real processes, Secret Service, ~/.claude*/.credentials.json."""
+    """The real system: real processes, Secret Service, ~/.claude*/.credentials.json.
+
+    Building it touches nothing: the stores connect to D-Bus and read files only
+    when first used.
+    """
     from .secret_service import SecretServiceStore
     from .claude.credentials import FileClaudeCredentialStore
     name, home, shell = _account()
     return SystemEnvironment(mode="real", home=home, login_shell=shell, user_name=name, runner=ProcessRunner(),
                              secrets=SecretServiceStore(), claude_credentials=FileClaudeCredentialStore(home))
+
+
+def make_process_scanner(proc_root: Path = Path("/proc")):
+    """Counts this user's Claude Code sessions in the real /proc (read-only)."""
+    from .adapters.process_scanner import ProcScanner
+    return ProcScanner(proc_root, uid=os.getuid(), own_pid=os.getpid())
 
 
 def make_sandbox(sandbox_home: Path = DEFAULT_SANDBOX, responder=None) -> SystemEnvironment:

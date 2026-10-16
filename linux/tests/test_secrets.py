@@ -101,3 +101,17 @@ class RealSecretServiceTests(unittest.TestCase):
         self.assertEqual(backend.lookup(key), b'{"claudeAiOauth": {"accessToken": "a"}}')
         backend.clear(key)
         self.assertIsNone(backend.lookup(key))
+
+    def test_claude_credential_store_vault_lives_in_the_claude_login_service(self):
+        import gi
+        gi.require_version("Secret", "1")
+        from gi.repository import Secret
+        from multicred.core.claude.credentials import FileClaudeCredentialStore
+
+        store, key = FileClaudeCredentialStore(self.home), new_account()
+        store.write_vault(key, b'{"claudeAiOauth":{"accessToken":"v"}}')
+        self.assertEqual(store.read_vault(key), b'{"claudeAiOauth":{"accessToken":"v"}}')
+        found = Secret.password_lookup_sync(None, {"service": "app.multicred.claude-login", "account": key}, None)
+        self.assertEqual(found, '{"claudeAiOauth":{"accessToken":"v"}}')
+        store.delete_vault(key)
+        self.assertIsNone(store.read_vault(key))
