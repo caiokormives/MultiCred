@@ -33,6 +33,9 @@ class SystemEnvironment:
     # Claude Code's folder credentials and MultiCred's login vault (D39).
     claude_credentials: Any
     clock: Callable[[], datetime] = field(default=_utc_now)
+    # The user's $XDG_CONFIG_HOME, if set. git reads its global config from
+    # $XDG_CONFIG_HOME/git/config (or ~/.config/git/config when unset).
+    xdg_config_home: str | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "home", Path(self.home))

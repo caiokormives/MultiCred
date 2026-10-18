@@ -85,6 +85,62 @@ class AppModel:
 
         threading.Thread(target=work, name="multicred-switch", daemon=True).start()
 
+    # MARK: onboarding (S-05)
+
+    def detect_setup(self, on_done: Callable[[object | None, Exception | None], None]) -> None:
+        """Runs the setup detection off the UI thread (it spawns git/gh/claude --version)."""
+        from ..core.install.setup_detector import SetupDetector
+
+        def work():
+            try:
+                setup, error = SetupDetector(self.environment, self.tools).detect(), None
+            except Exception as failure:  # detection is best effort; the page shows the error
+                setup, error = None, failure
+            self.dispatch(_once, on_done, setup, error)
+
+        threading.Thread(target=work, name="multicred-detect", daemon=True).start()
+
+    def preview_install(self, options):
+        """The per-file diff of step 3. Reads a few small files; raises InstallError."""
+        from ..core.install.installer import Installer
+        return Installer(self.environment).preview(options)
+
+    def complete_onboarding(self, config: Config, options, initial_profile_id,
+                            on_done: Callable[[object | None, Exception | None], None]) -> None:
+        """Onboarding's last step: install, save the configuration, activate the initial profile.
+
+        The installer runs before the save (the Mac saves first): if it fails nothing
+        is configured and the onboarding can simply be run again.
+        """
+        from ..core.install.installer import Installer
+        from ..core.storage import InvalidConfig
+        from ..core.validation import issues_in
+
+        config.settings.enabled_shells = list(options.shells)
+
+        def work():
+            try:
+                issues = issues_in(config)
+                if issues:
+                    raise InvalidConfig(issues)
+                Installer(self.environment).apply(options)
+                self.repository.save(config)
+            except Exception as failure:
+                self.dispatch(_once, on_done, None, failure)
+                return
+            self.dispatch(_once, self._onboarding_saved, config, initial_profile_id, on_done)
+
+        threading.Thread(target=work, name="multicred-onboarding", daemon=True).start()
+
+    def _onboarding_saved(self, config, initial_profile_id, on_done) -> None:
+        self.config = config
+        self.load_error = None
+        self.notify()
+        if initial_profile_id is None or config.profile(initial_profile_id) is None:
+            on_done(None, None)
+            return
+        self.switch_profile(initial_profile_id, on_done)
+
     def _finish(self, result, error, on_done):
         self.switching = False
         if result is not None:
@@ -95,3 +151,9 @@ class AppModel:
         on_done(result, error)
         self.notify()
         return False  # GLib.idle_add: run once
+
+
+def _once(fn, *args):
+    """Runs `fn` and tells GLib.idle_add not to call it again."""
+    fn(*args)
+    return False

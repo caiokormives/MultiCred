@@ -60,6 +60,8 @@ class MultiCredApplication(Adw.Application):
     def open_page(self, page: str) -> None:
         self.requested_page = page
         self.present_window()
+        if page == "onboarding":
+            self.window.show_onboarding()
 
     def show_error(self, title: str, message: str) -> None:
         self.present_window()
@@ -107,7 +109,11 @@ class MainWindow(Adw.ApplicationWindow):
         self.model = app.model
         self.toasts = Adw.ToastOverlay()
         view = Adw.ToolbarView()
-        view.add_top_bar(Adw.HeaderBar())
+        self.view = view
+        self.header = Adw.HeaderBar()
+        view.add_top_bar(self.header)
+        # The 3-step onboarding (S-05) replaces the content while it runs, in this same window (D31).
+        self.onboarding = None
         if self.model.is_test_mode:
             banner = Adw.Banner(title="MODO DE TESTE — nada no sistema real muda", revealed=True)
             view.add_top_bar(banner)
@@ -124,6 +130,8 @@ class MainWindow(Adw.ApplicationWindow):
         self.model.add_listener(self.refresh)
         self.connect("close-request", self.on_close_request)
         self.refresh()
+        if self.model.config is None or app.requested_page == "onboarding":
+            self.show_onboarding()
 
     def on_close_request(self, _window):
         if self.get_application().tray_available:
@@ -152,6 +160,29 @@ class MainWindow(Adw.ApplicationWindow):
             row.connect("activated", self.on_profile, profile.id)
             self.group.add(row)
             self.rows.append(row)
+
+    def show_onboarding(self) -> None:
+        if self.onboarding is not None:
+            return
+        from .pages.onboarding import OnboardingPage
+
+        self.onboarding = OnboardingPage(self.model, on_finished=self._onboarding_finished)
+        self.view.set_content(self.onboarding)
+        self.header.set_title_widget(Adw.WindowTitle(title="Configurar MultiCred"))
+
+    def _onboarding_finished(self, error) -> None:
+        self.onboarding = None
+        self.get_application().requested_page = None
+        self.view.set_content(self.page)
+        self.header.set_title_widget(None)
+        self.refresh()
+        profile = self.model.active_profile
+        if error is not None:
+            self.show_toast(f"MultiCred configurado, mas não consegui ativar o perfil: {error}")
+        elif profile is not None:
+            self.show_toast(f"Perfil {profile.name} ativo")
+        else:
+            self.show_toast("MultiCred configurado")
 
     def show_toast(self, text: str) -> None:
         self.last_toast = text

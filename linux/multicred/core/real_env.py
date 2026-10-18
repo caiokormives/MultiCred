@@ -43,7 +43,8 @@ def make_real() -> SystemEnvironment:
     from .claude.credentials import FileClaudeCredentialStore
     name, home, shell = _account()
     return SystemEnvironment(mode="real", home=home, login_shell=shell, user_name=name, runner=ProcessRunner(),
-                             secrets=SecretServiceStore(), claude_credentials=FileClaudeCredentialStore(home))
+                             secrets=SecretServiceStore(), claude_credentials=FileClaudeCredentialStore(home),
+                             xdg_config_home=os.environ.get("XDG_CONFIG_HOME") or None)
 
 
 def make_process_scanner(proc_root: Path = Path("/proc")):
