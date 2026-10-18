@@ -68,8 +68,11 @@ class SystemEnvironment:
         return path
 
     def base_process_environment(self, path: list[str]) -> dict[str, str]:
-        """Minimal, explicit environment for child processes. Never the app's own."""
-        return {
+        """Minimal, explicit environment for child processes. Never the app's own.
+
+        XDG_CONFIG_HOME goes along when the user set it, so git, gh and claude read
+        the same config files the user's terminals do."""
+        env = {
             "HOME": str(self.home),
             "USER": self.user_name,
             "LOGNAME": self.user_name,
@@ -77,3 +80,6 @@ class SystemEnvironment:
             "PATH": ":".join(path),
             "LANG": "C.UTF-8",
         }
+        if self.xdg_config_home:
+            env["XDG_CONFIG_HOME"] = self.xdg_config_home
+        return env
