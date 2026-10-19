@@ -152,10 +152,11 @@ class ClaudeFolderOccupancy:
 
 
 class ClaudeLoginSwitcher:
-    def __init__(self, environment, store=None):
+    def __init__(self, environment, store=None, log: Callable[[str, str], None] | None = None):
         self.environment = environment
         self.store = store if store is not None else environment.claude_credentials
         self.occupancy_file = AppPaths(environment).claude_folders
+        self._log = log  # (level, message), e.g. SwitchEngine._log
 
     @staticmethod
     def own_login_key(config_dir: str | None) -> str:
@@ -256,13 +257,17 @@ class ClaudeLoginSwitcher:
         return undo_all
 
     def _save_back(self, config_dir: str | None, owner: uuid.UUID | None) -> Undo:
-        """Saves the folder's live login to its owner's vault entry (rotated tokens)."""
+        """Saves the folder's live login to its owner's vault entry (rotated tokens).
+
+        A folder on its own login with no live login (logged out with /logout) drops the
+        own login saved earlier, or going back to the folder's login later would bring
+        those old tokens back. An account's entry is never dropped: it is its only copy."""
         item = self.store.read_folder_item(config_dir)
-        if item is None:
-            return lambda: None
-        oauth = _object(item, "credentials").get("claudeAiOauth")
+        oauth = _object(item, "credentials").get("claudeAiOauth") if item is not None else None
         if not isinstance(oauth, dict):
-            return lambda: None
+            if owner is not None:
+                return lambda: None
+            return self._drop_own_login(config_dir)
         key = uuid_text(owner) if owner is not None else self.own_login_key(config_dir)
         previous = self.store.read_vault(key)
         record = ClaudeLoginRecord(_canonical(oauth), self._displayed_account(config_dir))
@@ -274,6 +279,14 @@ class ClaudeLoginSwitcher:
             else:
                 self.store.delete_vault(key)
         return undo
+
+    def _drop_own_login(self, config_dir: str | None) -> Undo:
+        key = self.own_login_key(config_dir)
+        previous = self.store.read_vault(key)
+        if previous is None:
+            return lambda: None
+        self.store.delete_vault(key)
+        return lambda: self.store.write_vault(key, previous)
 
     def _restore_own_login(self, config_dir: str | None) -> Undo:
         """Puts the folder's original login back. A folder that had no login of its own
@@ -362,6 +375,11 @@ class ClaudeLoginSwitcher:
         return AtomicFileWriter.resolve_target(path, follow_symlink=True)
 
     def _set_displayed_account(self, config_dir, account: dict):
+        """Returns (target, previous) for the undo, or (None, None) when nothing was written.
+        A `.claude.json` that exists but cannot be parsed (Claude Code may be writing it)
+        is left untouched: rewriting it with only `oauthAccount` would lose all of Claude
+        Code's state. Only the credentials change; Claude Code shows the old "logged in
+        as" until it rewrites the file."""
         target = self._state_target(config_dir)
         previous = read_bytes(target)
         state = {}
@@ -369,10 +387,15 @@ class ClaudeLoginSwitcher:
             try:
                 state = _object(previous)
             except Unreadable:
-                state = {}
+                self._warn(f"claude login: {target} is unreadable; left untouched (only the credentials changed)")
+                return None, None
         state["oauthAccount"] = account
         AtomicFileWriter.write(_state_bytes(state), target, permissions=0o600)
         return target, previous
+
+    def _warn(self, message: str) -> None:
+        if self._log is not None:
+            self._log("warning", message)
 
     def _remove_displayed_account(self, config_dir):
         target = self._state_target(config_dir)

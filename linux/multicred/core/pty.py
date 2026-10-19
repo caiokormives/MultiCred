@@ -2,9 +2,10 @@
 `claude setup-token` and `gh auth login --web`, which need a TTY for their prompts.
 
 Port of PseudoTerminalProcess.swift (D29). Linux specifics:
-- `os.openpty()` + subprocess with `start_new_session=True`; the child then makes
-  the terminal its controlling terminal (TIOCSCTTY), so /dev/tty, job control
-  and SIGWINCH work like in a real terminal emulator.
+- `os.openpty()` + subprocess running `/usr/bin/setsid --ctty <program>`: the
+  program gets its own session with the terminal as its controlling terminal, so
+  /dev/tty, job control and SIGWINCH work like in a real terminal emulator, without
+  a preexec_fn (not safe in a process with threads).
 - The environment is always the explicit one given; nothing is inherited.
 - The master side is read by a thread with `select` + `read(2)`: once the child
   side closes, Linux answers EIO, which ends the output.
@@ -23,6 +24,7 @@ import errno
 import fcntl
 import os
 import select
+import shutil
 import signal
 import struct
 import subprocess
@@ -44,13 +46,26 @@ class PTYError(Exception):
         self.kind, self.detail = kind, detail
 
 
-def _make_controlling_terminal() -> None:
-    """Runs in the child after setsid(): stdin (the terminal) becomes its controlling
-    terminal. Kept to one system call because it runs between fork and exec."""
-    try:
-        fcntl.ioctl(0, termios.TIOCSCTTY, 0)
-    except OSError:
-        pass  # the program still gets a TTY on stdin/stdout/stderr
+# util-linux setsid(1): `--ctty` makes stdin (the terminal) the controlling terminal
+# of the new session. The child Popen starts is not a process group leader, so
+# setsid does not fork: it becomes the session (and group) leader and execs the
+# program in place, so the pid stays the program's.
+SETSID = "/usr/bin/setsid"
+
+
+def _launch_failure(executable: str, environment: dict[str, str]) -> str | None:
+    """Why `executable` cannot run, checked here because a missing program would
+    otherwise only make setsid exit 1 instead of failing the launch."""
+    if "/" not in executable:
+        found = shutil.which(executable, path=environment.get("PATH", os.defpath))
+        if found is None:
+            return f"{executable}: No such file or directory"
+        executable = found
+    if not os.path.isfile(executable):
+        return f"{executable}: No such file or directory"
+    if not os.access(executable, os.X_OK):
+        return f"{executable}: Permission denied"
+    return None
 
 
 class PseudoTerminalProcess:
@@ -80,16 +95,19 @@ class PseudoTerminalProcess:
         with self._lock:
             if self._process is not None:
                 raise PTYError("alreadyStarted")
+        failure = _launch_failure(executable, environment)
+        if failure is not None:
+            raise PTYError("launchFailed", failure)
         try:
             master, slave = os.openpty()
         except OSError as error:
             raise PTYError("openFailed", error.strerror or str(error)) from error
         try:
             fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, columns, 0, 0))
+            # No preexec_fn (unsafe with threads): setsid does setsid() + TIOCSCTTY.
             process = subprocess.Popen(
-                [executable, *arguments], env=dict(environment), cwd=cwd,
-                stdin=slave, stdout=slave, stderr=slave, close_fds=True,
-                start_new_session=True, preexec_fn=_make_controlling_terminal,
+                [SETSID, "--ctty", executable, *arguments], env=dict(environment), cwd=cwd,
+                stdin=slave, stdout=slave, stderr=slave, close_fds=True, start_new_session=False,
             )
         except (OSError, subprocess.SubprocessError) as error:
             os.close(slave)

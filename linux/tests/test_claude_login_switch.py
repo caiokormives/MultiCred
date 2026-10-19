@@ -36,6 +36,14 @@ def as_json(obj):
     return json.dumps(obj, sort_keys=True).encode()
 
 
+class RecordingLog:
+    def __init__(self):
+        self.entries = []
+
+    def log(self, level, message, redacting=()):
+        self.entries.append((level, message))
+
+
 class LoginSwitchCases:
     """The Swift cases; subclasses choose the credential store."""
 
@@ -258,6 +266,87 @@ class LoginSwitchCases:
         self.assertEqual(self.folder_access_token(self.personal_dir), "sk-ant-oat01-dev-new")
         self.assertEqual(self.displayed_email(self.personal_dir), "dev2@x.com")
         self.assertIn("mcpOAuth", self.item(self.personal_dir))
+
+    # MARK: S-21: an unreadable .claude.json is never overwritten
+
+    def test_an_unreadable_claude_json_is_left_byte_for_byte_and_only_the_login_changes(self):
+        state_file = Path(f"{self.personal_dir}/.claude.json")
+        broken = b'{"numStartups": 7, "projects": {'  # e.g. Claude Code writing it right now
+        state_file.write_bytes(broken)
+        log = RecordingLog()
+        engine = SwitchEngine(self.environment, base.FakeTools(), log)
+        engine.switch_profile(self.personal.id, self.config)
+        engine.switch_claude_only(self.dev.id, self.config)
+
+        self.assertEqual(self.folder_access_token(self.personal_dir), "sk-ant-oat01-dev", "the login is switched")
+        self.assertEqual(state_file.read_bytes(), broken, ".claude.json is untouched")
+        self.assertTrue(any(level == "warning" and str(state_file) in message for level, message in log.entries),
+                        log.entries)
+
+    def test_undoing_a_switch_with_an_unreadable_claude_json_keeps_it_as_it_was(self):
+        state_file = Path(f"{self.personal_dir}/.claude.json")
+        broken = b"not json at all"
+        state_file.write_bytes(broken)
+        engine = self.engine()
+        engine.switch_profile(self.personal.id, self.config)
+        item_before = self.store.read_folder_item(self.personal_dir)
+        env_sh = AppPaths(self.environment).env_sh
+        env_sh.unlink()
+        env_sh.mkdir()
+        with self.assertRaises(StepFailed) as raised:
+            engine.switch_claude_only(self.dev.id, self.config)
+        self.assertTrue(raised.exception.rollback.complete)
+        self.assertEqual(self.store.read_folder_item(self.personal_dir), item_before)
+        self.assertEqual(state_file.read_bytes(), broken)
+
+    # MARK: S-26: a logged-out own login does not come back
+
+    def logged_out_on_its_own_login(self, logout):
+        """The folder went back to its own login (kept in the vault), then /logout ran in it."""
+        engine = self.engine()
+        engine.switch_profile(self.personal.id, self.config)
+        engine.switch_claude_only(self.dev.id, self.config)
+        engine.switch_claude_only(ClaudeFolder.override_for(None, self.personal), self.config)
+        own_key = ClaudeLoginSwitcher.own_login_key(self.personal_dir)
+        self.assertIsNotNone(self.store.read_vault(own_key))
+        logout()
+        return engine, own_key
+
+    def test_after_a_logout_the_old_own_login_is_dropped_and_never_put_back(self):
+        for name, logout in (
+                ("credentials without claudeAiOauth",
+                 lambda: self.store.write_folder_item(self.personal_dir, as_json({"mcpOAuth": {}}))),
+                ("no credentials at all", lambda: self.store.delete_folder_item(self.personal_dir))):
+            with self.subTest(name):
+                self.setUp()
+                engine, own_key = self.logged_out_on_its_own_login(logout)
+                engine.switch_claude_only(self.dev.id, self.config)
+                self.assertIsNone(self.store.read_vault(own_key), "the stale own login is deleted")
+                engine.switch_claude_only(ClaudeFolder.override_for(None, self.personal), self.config)
+                self.assertIsNone(self.folder_access_token(self.personal_dir),
+                                  "the folder is logged out again, no old tokens resurrected")
+
+    def test_dropping_the_stale_own_login_is_undone_with_a_failed_switch(self):
+        engine, own_key = self.logged_out_on_its_own_login(
+            lambda: self.store.write_folder_item(self.personal_dir, as_json({"mcpOAuth": {}})))
+        saved = self.store.read_vault(own_key)
+        env_sh = AppPaths(self.environment).env_sh
+        env_sh.unlink()
+        env_sh.mkdir()
+        with self.assertRaises(StepFailed) as raised:
+            engine.switch_claude_only(self.dev.id, self.config)
+        self.assertTrue(raised.exception.rollback.complete)
+        self.assertEqual(self.store.read_vault(own_key), saved)
+
+    def test_a_folder_without_login_holding_an_account_never_deletes_that_account(self):
+        """The owner is an account: its vault entry is its only copy, a missing live login
+        in the folder does not delete it."""
+        engine = self.engine()
+        engine.switch_profile(self.personal.id, self.config)
+        engine.switch_claude_only(self.dev.id, self.config)
+        self.store.write_folder_item(self.personal_dir, as_json({"mcpOAuth": {}}))  # /logout while dev is live
+        engine.switch_claude_only(self.arvor.id, self.config)
+        self.assertIsNotNone(self.store.read_vault(uuid_text(self.dev.id)))
 
     def test_capture_reads_a_new_login_from_a_throwaway_folder(self):
         scratch = f"{self.home}/scratch-login"

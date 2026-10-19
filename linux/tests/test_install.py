@@ -117,6 +117,28 @@ class InstallerTests(RealToolTestCase):
     def snapshot(self, *files):
         return [Path(f).read_bytes() if os.path.lexists(f) else None for f in files]
 
+    def test_fish_and_environment_d_follow_xdg_config_home(self):
+        """S-28: fish reads conf.d and systemd reads environment.d under $XDG_CONFIG_HOME;
+        MultiCred's own folder stays ~/.config/multicred (the hooks name it)."""
+        from multicred.core.adapters.session_env import environment_d_file
+        from multicred.core.install.autostart import Autostart
+        xdg = self.home / "xdg"
+        object.__setattr__(self.environment, "xdg_config_home", str(xdg))
+        self.assertEqual(self.environment.config_home, xdg)
+        self.assertEqual(Integrations.fish_conf_file(self.environment), xdg / "fish/conf.d/multicred.fish")
+        self.assertEqual(environment_d_file(self.environment), xdg / "environment.d/90-multicred.conf")
+        self.assertEqual(Autostart(self.environment).file.parent, xdg / "autostart")
+        self.assertEqual(self.paths.root, self.home / ".config/multicred")
+
+        Installer(self.environment).apply(self.options(F))
+        self.assertTrue((xdg / "fish/conf.d/multicred.fish").is_file())
+        self.assertFalse((self.home / ".config/fish").exists())
+
+        object.__setattr__(self.environment, "xdg_config_home", None)
+        self.assertEqual(self.environment.config_home, self.home / ".config")
+        self.assertEqual(Integrations.fish_conf_file(self.environment), self.home / ".config/fish/conf.d/multicred.fish")
+        self.assertEqual(environment_d_file(self.environment), self.home / ".config/environment.d/90-multicred.conf")
+
     def test_fresh_install_writes_blocks_backups_and_manifest(self):
         self.write("export A=1\n", self.bashrc)
         preview = self.installer.preview(self.options(B))

@@ -176,6 +176,45 @@ class LoginDialogTests(unittest.TestCase):
         self.assertFalse(self.results[0].success)
         self.assertEqual(self.environment.claude_credentials.vault, {})
 
+    def test_signing_in_again_during_a_switch_shows_the_busy_message_and_keeps_the_old_login(self):
+        """S-23: the save of an existing account runs under the switch lock."""
+        from multicred.core.claude.login_vault import ClaudeLoginRecord, ClaudeLoginSwitcher
+        from multicred.core.models import ClaudeAccount, ClaudeAccountKind, ProfileColor, uuid_text
+        from multicred.ui.pages.login import LoginDialog, LoginKind
+
+        account = ClaudeAccount(nickname="Dev", email="dev@x.com", color=ProfileColor.BLUE,
+                                kind=ClaudeAccountKind.LOGIN)
+        config = self.model.config
+        config.claude_accounts.append(account)
+        self.model.save(config)
+        ClaudeLoginSwitcher(self.environment).store_new_account(
+            account.id, ClaudeLoginRecord(b'{"accessToken":"old"}', None))
+        old = self.environment.claude_credentials.vault[uuid_text(account.id)]
+        held = self.model.engine.exclusive()  # a switch is running
+        held.__enter__()
+        self.addCleanup(held.__exit__, None, None, None)
+
+        def make():
+            return LoginDialog(self.model, LoginKind.CLAUDE_LOGIN, self.results.append, target=account)
+
+        def drive(app, dialog, seen):
+            def type_code():
+                dialog.code_row.set_text("abcdefghijklmnopqrstuvwxyz012345#ABCDEFGHIJKLMNOP")
+                dialog.connect_button.emit("clicked")
+                self.poll(lambda: dialog.session.phase.is_finished, failed)
+
+            def failed():
+                seen["error_text"] = dialog.error_label.get_label()
+                GLib.timeout_add(100, app.quit)
+
+            self.poll(lambda: dialog.session is not None and dialog.session.phase.accepts_code
+                      and "Paste code" in dialog.session.output, type_code)
+            return False
+
+        seen = self.run_dialog(make, drive)
+        self.assertIn("Uma troca já está em andamento.", seen.get("error_text", ""))
+        self.assertEqual(self.environment.claude_credentials.vault[uuid_text(account.id)], old)
+
     def test_setup_token_stores_the_token(self):
         from multicred.core.claude.login_flow import NewClaudeAccount
         from multicred.core.claude.login_simulator import SetupTokenSimulator

@@ -39,6 +39,16 @@ class BrokenSecretStore:
         return []
 
 
+def wait_for(condition, seconds=10):
+    import time
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(0.01)
+    return condition()
+
+
 def kinds(error):
     return [issue.kind for issue in error.issues]
 
@@ -56,9 +66,12 @@ class ConfigEditorTests(SafeTestCase):
         self.assertEqual(self.secrets.stored_value(key.secret_account), b"sk-456")
 
         config.profiles.append(Profile(name="P", color=ProfileColor.INDIGO, api_key_ids=[key.id]))
-        removed = ConfigEditor.remove_api_key(key.id, config, self.secrets)
+        removed = ConfigEditor.remove_api_key(key.id, config)
         self.assertEqual(removed.api_keys, [])
         self.assertEqual(removed.profiles[0].api_key_ids, [])
+        self.assertEqual(self.secrets.stored_value(key.secret_account), b"sk-456",
+                         "S-24: pure; the secret stays until the caller has saved")
+        self.assertTrue(ConfigEditor.discard_removed_key(key, self.secrets))
         self.assertIsNone(self.secrets.stored_value(key.secret_account))
 
     def test_invalid_key_is_not_stored(self):
@@ -198,9 +211,10 @@ class ConfigEditorTests(SafeTestCase):
         self.assertNotIn("sk", str(caught.exception).replace("secrets", ""))
         key = APIKeyAccount(nickname="K", provider=APIProvider.OPENAI, color=ProfileColor.RED)
         config = Config(api_keys=[key])
-        with self.assertRaises(EditorError) as caught:
-            ConfigEditor.remove_api_key(key.id, config, broken)
-        self.assertEqual(caught.exception.kind, "secrets")
+        # Removing is pure; a store that refuses the delete afterwards leaves a harmless
+        # orphan (no configuration points at it), it does not undo the saved removal.
+        self.assertEqual(ConfigEditor.remove_api_key(key.id, config).api_keys, [])
+        self.assertFalse(ConfigEditor.discard_removed_key(key, broken))
         with self.assertRaises(EditorError) as caught:
             ConfigEditor.replace_secret(key, " \n", self.secrets)
         self.assertEqual(caught.exception.kind, "emptySecret")
@@ -208,7 +222,7 @@ class ConfigEditorTests(SafeTestCase):
     def test_removing_an_unknown_key_changes_nothing(self):
         config = Config()
         self.assertIs(ConfigEditor.remove_api_key(APIKeyAccount(nickname="x", provider=APIProvider.OPENAI,
-                                                                color=ProfileColor.RED).id, config, self.secrets),
+                                                                color=ProfileColor.RED).id, config),
                       config)
 
 
@@ -282,6 +296,65 @@ class AppModelEditTests(SafeTestCase):
         self.repository.save(config)
         self.model.remove_api_key(other.id)
         self.assertEqual(reapplied, [True], "a key no profile in use exported needs no re-apply")
+
+    def test_removing_a_key_during_a_switch_reapplies_once_when_the_switch_ends(self):
+        """S-27: the re-apply is not skipped while a switch runs: it waits for it."""
+        from multicred.core.engine.types import ClaudeTarget, SwitchResult
+        from multicred.core.models import APIKeyAccount, APIProvider, ActiveState
+        key = APIKeyAccount(nickname="O", provider=APIProvider.OPENAI, color=ProfileColor.INDIGO)
+        self.secrets.set_secret(b"sk", key.secret_account)
+        config = self.model.config
+        config.api_keys.append(key)
+        config.profiles[0].api_key_ids.append(key.id)
+        self.repository.save(config)
+        state = ActiveState(profile_id=self.profile.id, generation=1)
+        self.model.state = state
+        entered, release, done = threading.Event(), threading.Event(), threading.Event()
+
+        class SlowEngine:
+            def switch_profile(self, _profile_id, _config):
+                entered.set()
+                release.wait(10)
+                return SwitchResult(state=state, claude_target=ClaudeTarget("unchanged"))
+        self.model.engine = SlowEngine()
+        reapplied = []
+        # Like the real one: refuses (False) while a switch runs, else starts a re-apply.
+        self.model.reapply_active_profile = (
+            lambda on_done=None: False if self.model.switching else (reapplied.append(True) or True))
+        self.model.switch_profile(self.profile.id, lambda _result, _error: done.set())
+        self.assertTrue(entered.wait(10))
+
+        self.model.remove_api_key(key.id)
+        self.assertEqual(reapplied, [], "not while the switch runs")
+        release.set()
+        self.assertTrue(done.wait(10))
+        self.assertEqual(reapplied, [True], "once the switch ended")
+
+        self.model.switch_profile(self.profile.id, lambda _result, _error: None)
+        self.assertTrue(wait_for(lambda: not self.model.switching))
+        self.assertEqual(reapplied, [True], "only once")
+
+    def test_removing_a_key_whose_save_fails_keeps_its_secret(self):
+        """S-24: the secret is deleted only after the configuration without the key is saved."""
+        from multicred.core.models import APIKeyAccount, APIProvider
+        key = APIKeyAccount(nickname="O", provider=APIProvider.OPENAI, color=ProfileColor.INDIGO)
+        self.secrets.set_secret(b"sk", key.secret_account)
+        config = self.model.config
+        config.api_keys.append(key)
+        self.repository.save(config)
+        self.model.load()
+        self.repository.path.unlink()
+        self.repository.path.mkdir()  # config.json is now a directory: the atomic write refuses it
+        with self.assertRaises(OSError):
+            self.model.remove_api_key(key.id)
+        self.assertEqual(self.secrets.stored_value(key.secret_account), b"sk", "the secret is still there")
+        self.assertIsNotNone(self.model.config.api_key(key.id), "and the configuration still points to it")
+
+        self.repository.path.rmdir()
+        self.repository.save(self.model.config)
+        self.model.remove_api_key(key.id)
+        self.assertIsNone(self.secrets.stored_value(key.secret_account), "deleted after the save")
+        self.assertEqual(self.saved()["apiKeys"], [])
 
     def test_failed_edit_keeps_config_and_file(self):
         before = self.repository.path.read_bytes()

@@ -86,6 +86,14 @@ class FakeSystem:
             return self.session.get("CLAUDE_CONFIG_DIR")
 
 
+class RecordingLog:
+    def __init__(self):
+        self.entries = []
+
+    def log(self, level, message, redacting=()):
+        self.entries.append((level, message))
+
+
 class FakeTools:
     def __init__(self, installed=(Tool.GIT, Tool.GH, Tool.CLAUDE)):
         self.installed = set(installed)
@@ -220,6 +228,26 @@ class SwitchEngineTests(SafeTestCase):
     def test_reapply_without_active_profile_does_nothing(self):
         self.assertIsNone(self.engine().reapply_active_profile(self.config))
         self.assertEqual(self.runner.requests, [])
+
+    def test_reapply_when_the_active_profile_was_deleted_does_nothing_and_logs(self):
+        """S-22: the profile in the state is gone from the configuration (deleted while
+        active): re-applying at session start does nothing instead of failing every time."""
+        log = RecordingLog()
+        engine = SwitchEngine(self.environment, FakeTools(), log)
+        engine.switch_profile(self.work.id, self.config)
+        state_before = self.paths.state.read_bytes()
+        requests_before = len(self.runner.requests)
+        self.config.profiles.remove(self.work)
+
+        self.assertIsNone(engine.reapply_active_profile(self.config))
+        self.assertEqual(self.paths.state.read_bytes(), state_before, "the state is not touched")
+        self.assertEqual(len(self.runner.requests), requests_before, "nothing is run")
+        self.assertTrue(any("no longer exists" in message for _, message in log.entries), log.entries)
+
+    def test_switching_to_an_unknown_profile_is_still_profile_not_found(self):
+        with self.assertRaises(Preflight) as raised:
+            self.engine().switch_profile(uuid.uuid4(), self.config)
+        self.assertEqual(raised.exception.failure.kind, "profileNotFound")
 
     # MARK: preflight
 

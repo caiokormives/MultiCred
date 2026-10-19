@@ -161,6 +161,25 @@ class UninstallerTests(SafeTestCase):
         self.uninstaller().apply()
         self.assertFalse(fish.exists())
 
+    def test_fish_and_environment_d_under_xdg_config_home_are_removed(self):
+        """S-28: uninstall looks where install and the switch wrote."""
+        xdg = self.home / "xdg"
+        object.__setattr__(self.environment, "xdg_config_home", str(xdg))
+        self.install([F])
+        self.activate_profile()
+        fish, env_d = xdg / "fish/conf.d/multicred.fish", xdg / "environment.d/90-multicred.conf"
+        self.assertTrue(fish.is_file())
+        self.assertTrue(env_d.is_file())
+        paths = [i.path for i in self.uninstaller().preview()]
+        self.assertIn("~/xdg/fish/conf.d/multicred.fish", paths)
+        self.assertIn("~/xdg/environment.d/90-multicred.conf", paths)
+        report = self.uninstaller().apply()
+        self.assertEqual(report.problems, [])
+        self.assertFalse(fish.exists())
+        self.assertFalse(env_d.exists())
+        self.assertIn(["--user", "unset-environment", "CLAUDE_CONFIG_DIR"],
+                      [r.arguments for r in self.runner.requests])
+
     def test_session_variable_is_left_alone_when_multicred_never_set_it(self):
         self.install([B])
         self.system.session["CLAUDE_CONFIG_DIR"] = "/somewhere/else"
@@ -277,6 +296,28 @@ class UninstallerTests(SafeTestCase):
         settings = Path(self.claude_dir, "settings.json")
         self.assertEqual(json.loads(settings.read_text())["attribution"], {"commit": "", "pr": ""})
         self.uninstaller().apply()
+        self.assertNotIn("attribution", json.loads(settings.read_text()))
+
+    def test_a_folder_no_profile_uses_any_more_that_held_a_login_is_cleaned_too(self):
+        """S-25: the folders are listed before the own logins are given back (that empties
+        the occupancy), so a folder that left the profiles but still held a MultiCred
+        login gets its own-login vault entry deleted and its co-author opt-out undone."""
+        self.install([B])
+        self.activate_profile()
+        settings = Path(self.claude_dir, "settings.json")
+        self.assertEqual(json.loads(settings.read_text())["attribution"], {"commit": "", "pr": ""})
+        # The profile now points to another folder (saved, not switched yet).
+        other_dir = f"{self.home}/.claude-outra"
+        os.makedirs(other_dir)
+        self.profile.claude_config_dir = other_dir
+        ConfigRepository(self.environment).save(self.config)
+
+        report = self.uninstaller().apply()
+
+        self.assertEqual(report.problems, [])
+        restored = json.loads(self.claude_store.read_folder_item(self.claude_dir))
+        self.assertEqual(restored["claudeAiOauth"]["accessToken"], "sk-ant-oat01-own")
+        self.assertEqual(self.claude_store.vault, {}, "its own login left the vault too")
         self.assertNotIn("attribution", json.loads(settings.read_text()))
 
     def test_gh_accounts_are_never_touched(self):

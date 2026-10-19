@@ -204,6 +204,23 @@ class VerifierTests(VerifierTestCase):
         self.assertIn(f"CLAUDE_CONFIG_DIR={self.claude_dir}",
                       (self.home / ".config/environment.d/90-multicred.conf").read_text())
 
+    def test_environment_d_is_checked_and_fixed_under_xdg_config_home(self):
+        """S-28: the check reads the file where the switch writes it."""
+        xdg = self.home / "xdg"
+        object.__setattr__(self.environment, "xdg_config_home", str(xdg))
+        SwitchEngine(self.environment, FakeTools()).switch_profile(self.profile.id, self.config)
+        env_d = xdg / "environment.d/90-multicred.conf"
+        self.assertTrue(env_d.is_file())
+        (self.home / ".config/environment.d/90-multicred.conf").unlink()  # the old place is not used
+        self.assertEqual(self.check(self.verify(), "claude.session").status, CheckStatus.OK)
+
+        env_d.unlink()
+        item = self.check(self.verify(), "claude.session")
+        self.assertEqual(item.status, CheckStatus.PROBLEM)
+        self.assertIn("environment.d: sem o arquivo", item.found)
+        self.assertTrue(self.verifier.fix(item).is_consistent)
+        self.assertIn(f"CLAUDE_CONFIG_DIR={self.claude_dir}", env_d.read_text())
+
     def test_a_folder_environment_d_cannot_hold_is_a_problem_without_automatic_fix(self):
         """S-19: offering "Corrigir" would never help: systemd drops the variable at the
         next login whatever MultiCred does. The user must rename the folder."""

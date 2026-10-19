@@ -5,6 +5,7 @@ LoginEndToEndTests.swift. The session runs the LoginSimulator (or a fake
 `claude` script inside the temporary HOME), never the real Claude Code.
 """
 
+import contextlib
 import json
 import shutil
 import tempfile
@@ -428,6 +429,73 @@ class ClaudeAccountSaverTests(SafeTestCase):
         converted = self.saver.save_login(account, self.record())
         self.assertEqual(converted.kind.value, "login")
         self.assertIsNone(self.secrets.stored_value(account.secret_account), "deleted once the save succeeded")
+
+    # MARK: S-23: signing an existing account in again runs under the switch lock
+
+    def login_account(self):
+        account = ClaudeAccount(nickname="Dev", email="dev@x.com", color=ProfileColor.BLUE,
+                                kind=ClaudeAccountKind.LOGIN)
+        self.repository.save(Config(claude_accounts=[account]))
+        self.saver.switcher.store_new_account(account.id, ClaudeLoginRecord(b'{"accessToken":"old"}', None))
+        return account
+
+    def test_replacing_a_login_while_a_switch_runs_is_busy_and_changes_nothing(self):
+        from multicred.core.engine.types import Busy
+
+        @contextlib.contextmanager
+        def busy():
+            raise Busy()
+            yield
+        account = self.login_account()
+        vault = dict(self.claude_store.vault)
+        saver = ClaudeAccountSaver(self.environment, self.repository.load, self.repository.save, exclusive=busy)
+        with self.assertRaises(Busy):
+            saver.save_login(account, self.record())
+        self.assertEqual(self.claude_store.vault, vault, "the saved login is not replaced")
+
+    def test_replacing_a_login_runs_inside_the_lock(self):
+        held = []
+
+        @contextlib.contextmanager
+        def exclusive():
+            held.append("enter")
+            yield
+            held.append("exit")
+        account = self.login_account()
+        saver = ClaudeAccountSaver(self.environment, self.repository.load,
+                                   lambda config: (held.append("save"), self.repository.save(config)),
+                                   exclusive=exclusive)
+        original = saver.switcher.replace_login
+        saver.switcher.replace_login = lambda *args: (held.append("replace"), original(*args))
+        saver.save_login(account, self.record())
+        self.assertEqual(held, ["enter", "replace", "exit"])
+
+    def test_a_new_account_does_not_need_the_lock(self):
+        @contextlib.contextmanager
+        def busy():
+            raise AssertionError("a new account goes into no folder")
+            yield
+        saver = ClaudeAccountSaver(self.environment, self.repository.load, self.repository.save, exclusive=busy)
+        saver.save_login(NewClaudeAccount("Marco", None, ProfileColor.TEAL), self.record())
+
+    def test_a_busy_save_keeps_the_error_for_the_dialog(self):
+        from multicred.core.engine.types import Busy
+
+        @contextlib.contextmanager
+        def busy():
+            raise Busy()
+            yield
+        account = self.login_account()
+        saver = ClaudeAccountSaver(self.environment, self.repository.load, self.repository.save, exclusive=busy)
+        scratch = self.home / "scratch-busy"
+        scratch.mkdir()
+        FileClaudeCredentialStore(self.home).write_folder_item(str(scratch), b'{"claudeAiOauth":{"accessToken":"n"}}')
+        session = ClaudeLoginSession(self.environment, ToolsAt(), LoginMode.LOGIN, account, saver,
+                                     dispatch=SerialDispatcher())
+        session._scratch = str(scratch)
+        session._finish_login(0)
+        self.assertTrue(session.phase.is_failure)
+        self.assertIsInstance(session.save_error, Busy)
 
     def test_unconfigured_app_is_refused(self):
         saver = ClaudeAccountSaver(self.environment, lambda: None, self.repository.save)

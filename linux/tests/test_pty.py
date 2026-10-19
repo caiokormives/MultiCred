@@ -79,6 +79,33 @@ class PseudoTerminalProcessTests(unittest.TestCase):
         self.assertIn("leader-ok", text)
         self.assertIn("ctty-ok", text, "/dev/tty opens only with a controlling terminal")
 
+    def test_no_preexec_fn_setsid_makes_the_session_and_the_controlling_terminal(self):
+        """S-29: preexec_fn is not safe with threads (the reader/waiter threads, GTK);
+        `setsid --ctty` does the same in the child."""
+        from unittest import mock
+        import multicred.core.pty as pty_module
+        calls = []
+        real_popen = pty_module.subprocess.Popen
+
+        def recording(*args, **kwargs):
+            calls.append((args, kwargs))
+            return real_popen(*args, **kwargs)
+        with mock.patch.object(pty_module.subprocess, "Popen", recording):
+            self.run_script("exit 0")
+        (argv,), kwargs = calls[0]
+        self.assertIsNone(kwargs.get("preexec_fn"))
+        self.assertFalse(kwargs.get("start_new_session"))
+        self.assertEqual(argv[:2], ["/usr/bin/setsid", "--ctty"])
+        self.assertEqual(argv[2:], ["/bin/sh", "-c", "exit 0"])
+
+    def test_the_pid_is_the_program_itself_not_a_wrapper(self):
+        pty, output, exited, _ = self.start("echo pid:$$; read line")
+        self.assertTrue(wait_until(lambda: "pid:" in output.text and "\n" in output.text.split("pid:")[1]))
+        self.assertEqual(int(output.text.split("pid:")[1].split()[0]), pty.pid)
+        self.assertEqual(os.getpgid(pty.pid), pty.pid, "group leader: terminate() signals its group")
+        pty.write(b"\r")
+        self.assertTrue(exited.wait(5))
+
     def test_input_is_delivered_like_typing(self):
         text, code = self.run_script(
             "printf 'Paste code here if prompted > '; IFS= read -r code; printf 'got:%s\\n' \"$code\"",

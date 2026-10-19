@@ -24,7 +24,7 @@ import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ..adapters.session_env import ENVIRONMENT_D_FILE, SYSTEMCTL
+from ..adapters.session_env import SYSTEMCTL, environment_d_file
 from ..claude import attribution
 from ..claude.login_vault import ClaudeFolderOccupancy, ClaudeLoginSwitcher, OccupancyUnreadable
 from ..models import ClaudeAccount, ClaudeAccountKind, Config, uuid_text
@@ -142,7 +142,7 @@ class Uninstaller:
 
     @property
     def environment_d_file(self) -> Path:
-        return self.environment.home / ENVIRONMENT_D_FILE
+        return environment_d_file(self.environment)
 
     def _multicred_set_session(self) -> bool:
         """MultiCred only ever sets CLAUDE_CONFIG_DIR in a switch: a state with a
@@ -283,6 +283,9 @@ class Uninstaller:
             report.problems.append(
                 f"{error} Os logins do Claude guardados pelo MultiCred foram mantidos no chaveiro do sistema "
                 "(serviço app.multicred.claude-login), e as pastas do Claude ficaram como estão.")
+        # Listed before the own logins go back: that empties the occupancy, and a folder
+        # no profile uses any more is known only from it.
+        folders = self._claude_folders()
         # A folder holding a MultiCred login gets its own login back first: the own
         # login lives in the vault that is emptied right after. A folder whose restore
         # fails keeps both vault entries it still needs: its own login (the only copy)
@@ -298,7 +301,6 @@ class Uninstaller:
                     f"{self._folder_name(folder)}: não foi possível devolver o login próprio da pasta ({error}). "
                     f"Ela continua logada na conta {self._account_name(account)}; o login original dela e o "
                     "dessa conta foram mantidos no chaveiro do sistema, nada foi perdido.")
-        folders = self._claude_folders()
         # Undo the co-author opt-out MultiCred wrote (only that exact value, D38).
         for folder in folders:
             path = attribution.settings_file(folder, self.environment)

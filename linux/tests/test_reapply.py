@@ -115,6 +115,20 @@ class ReapplyTests(SafeTestCase):
         self.assertTrue(self.model.inconsistent)
         self.assertEqual(len(self.calls), 1)
 
+    def test_a_deleted_active_profile_is_nothing_to_reapply_not_an_inconsistency(self):
+        """S-22: the active profile was removed from the configuration."""
+        self.activate()
+        self.model.load()
+        self.model.config.profiles.clear()
+        failures = []
+        self.model.reapply_listeners.append(failures.append)
+        started, seen = self.reapply()
+        self.assertTrue(started)
+        self.assertEqual((seen["result"], seen["error"]), (None, None))
+        self.assertFalse(self.model.inconsistent)
+        self.assertFalse(self.model.switching)
+        self.assertEqual(failures, [])
+
     def test_reapply_is_silent_no_switch_feedback(self):
         self.activate()
         self.model.load()

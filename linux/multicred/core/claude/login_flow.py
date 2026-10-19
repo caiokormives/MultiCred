@@ -23,6 +23,7 @@ visible output and the copied log show it (and any token) masked.
 from __future__ import annotations
 
 import codecs
+import contextlib
 import os
 import re
 import shutil
@@ -376,11 +377,15 @@ class ClaudeAccountSaver:
     """
 
     def __init__(self, environment, load: Callable[[], Config | None], save: Callable[[Config], None],
-                 switcher: ClaudeLoginSwitcher | None = None):
+                 switcher: ClaudeLoginSwitcher | None = None,
+                 exclusive: Callable[[], contextlib.AbstractContextManager] | None = None):
         self.environment = environment
         self._load = load
         self._save = save
         self.switcher = switcher or ClaudeLoginSwitcher(environment)
+        # SwitchEngine.exclusive: signing an existing account in again may write into the
+        # folder it is live in, so it waits for no switch (Busy instead, nothing changed).
+        self._exclusive = exclusive or contextlib.nullcontext
 
     def _scratch_store(self) -> FileClaudeCredentialStore:
         # The throwaway folder is a real folder Claude Code (or the simulator) wrote
@@ -408,10 +413,12 @@ class ClaudeAccountSaver:
     def save_login(self, target, record: ClaudeLoginRecord) -> ClaudeAccount:
         config = self._config()
         if isinstance(target, ClaudeAccount):
-            updated = account_editor.replace_login(target, record, config, self.switcher, self.environment.secrets)
-            if updated is not config:
-                self._save(updated)
-                account_editor.discard_replaced_token(target, self.environment.secrets)
+            with self._exclusive():
+                updated = account_editor.replace_login(target, record, config, self.switcher,
+                                                       self.environment.secrets)
+                if updated is not config:
+                    self._save(updated)
+                    account_editor.discard_replaced_token(target, self.environment.secrets)
             return updated.claude_account(target.id) or target
         updated, account = account_editor.add_login_account(target.nickname, target.email, target.color, record,
                                                             config, self.switcher)
@@ -523,6 +530,9 @@ class ClaudeLoginSession:
         self._logged = False
         self.command: LoginCommand | None = None
         self.launch_error: str | None = None
+        # Why storing the captured login failed (e.g. Busy: a switch was running), for the
+        # dialog to describe in its own words.
+        self.save_error: Exception | None = None
         # What was stored: the ClaudeAccount (new or updated).
         self.result: ClaudeAccount | None = None
 
@@ -708,6 +718,7 @@ class ClaudeLoginSession:
         except NoLoginInFolder:
             self.launch_error = NO_LOGIN_FOUND
         except Exception as error:
+            self.save_error = error
             self.launch_error = f"Não consegui guardar o login: {error}"
         if self.result is None:
             self._update(lambda: self._machine.process_exited(1))

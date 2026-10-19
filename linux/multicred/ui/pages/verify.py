@@ -22,9 +22,9 @@ gi.require_version("Adw", "1")
 gi.require_version("Pango", "1.0")
 from gi.repository import Adw, Gdk, GLib, Gtk, Pango  # noqa: E402
 
-from ...core.adapters.process_scanner import FixedProcessScanner  # noqa: E402
 from ...core.engine.verifier import Check, CheckStatus, Verifier, VerifyReport  # noqa: E402
 from ...core.models import ProfileColor  # noqa: E402
+from ..model import _default_scanner  # noqa: E402
 
 STATUS_GLYPH = {CheckStatus.OK: "✓", CheckStatus.PROBLEM: "!", CheckStatus.INFO: "i"}
 STATUS_NAME = {CheckStatus.OK: "ok", CheckStatus.PROBLEM: "problema", CheckStatus.INFO: "informativo"}
@@ -111,7 +111,8 @@ class VerifyPage(Adw.NavigationPage):
         self.last_report: VerifyReport | None = None
         self.busy = False
         if processes is None:
-            processes = self._default_scanner(model.environment)
+            # The same scanner as the model (one place decides real /proc vs. test mode).
+            processes = getattr(model, "processes", None) or _default_scanner(model.environment)
         self.verifier = verifier or Verifier(model.environment, model.tools, processes,
                                              engine=getattr(model, "engine", None), log=getattr(model, "log", None))
         self.rows: dict[str, VerifyRow] = {}
@@ -142,13 +143,6 @@ class VerifyPage(Adw.NavigationPage):
         self.refresh()
 
     # MARK: building
-
-    @staticmethod
-    def _default_scanner(environment):
-        if environment.mode == "real":
-            from ...core import real_env
-            return real_env.make_process_scanner()
-        return FixedProcessScanner(0)  # test mode: the real /proc is not the sandbox's
 
     def _build_header(self) -> Gtk.Widget:
         box = Gtk.Box(spacing=14)

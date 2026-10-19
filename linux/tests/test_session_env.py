@@ -97,6 +97,15 @@ class SessionEnvironmentTests(SafeTestCase):
         self.session = SessionEnvironment(self.environment, base_environment={"HOME": str(self.home)})
         self.file = self.home / ENVIRONMENT_D_FILE
 
+    def test_environment_d_follows_xdg_config_home(self):
+        """S-28: systemd reads $XDG_CONFIG_HOME/environment.d when it is set."""
+        xdg = self.home / "xdg"
+        object.__setattr__(self.environment, "xdg_config_home", str(xdg))
+        session = SessionEnvironment(self.environment, base_environment={"HOME": str(self.home)})
+        session.apply("CLAUDE_CONFIG_DIR", "/h/.claude-w")
+        self.assertIn("CLAUDE_CONFIG_DIR=/h/.claude-w", self.read(xdg / "environment.d/90-multicred.conf"))
+        self.assertFalse(self.file.exists())
+
     def test_get_reads_the_user_manager(self):
         self.assertIsNone(self.session.get("CLAUDE_CONFIG_DIR"))
         self.systemd.values["CLAUDE_CONFIG_DIR"] = "/h/a b"

@@ -29,7 +29,9 @@ from ...core.adapters.github_login_flow import GitHubLoginSession  # noqa: E402
 from ...core.claude.login_flow import (  # noqa: E402
     ClaudeAccountSaver, ClaudeLoginSession, LoginMode, LoginPhase, NewClaudeAccount,
 )
+from ...core.engine.types import SwitchError  # noqa: E402
 from ...core.models import ClaudeAccount, ClaudeAccountKind, ProfileColor  # noqa: E402
+from ..messages import describe_switch_error  # noqa: E402
 
 
 class LoginKind(str, Enum):
@@ -333,7 +335,9 @@ class LoginDialog(Adw.Dialog):
                                                      on_finished=self._session_finished, log=log)
             self.github_session.start()
         else:
-            saver = ClaudeAccountSaver(environment, lambda: self.model.config, self.model.save)
+            engine = getattr(self.model, "engine", None)
+            saver = ClaudeAccountSaver(environment, lambda: self.model.config, self.model.save,
+                                       exclusive=engine.exclusive if engine is not None else None)
             mode = LoginMode.LOGIN if self.kind == LoginKind.CLAUDE_LOGIN else LoginMode.SETUP_TOKEN
             self.session = ClaudeLoginSession(environment, tools, mode, self.target, saver, dispatch=_idle,
                                               on_change=self._session_changed, on_finished=self._session_finished,
@@ -486,6 +490,9 @@ class LoginDialog(Adw.Dialog):
         session = self.session or self.github_session
         if session is None or not session.phase.is_failure:
             return None
+        save_error = getattr(session, "save_error", None)
+        if isinstance(save_error, SwitchError):  # e.g. Busy: a switch was running, nothing changed
+            return f"Não consegui guardar o login: {describe_switch_error(save_error)}"
         if session.launch_error:
             return session.launch_error
         reason = session.phase.message if self.session is not None else session.phase.value

@@ -41,6 +41,16 @@ class SystemEnvironment:
         object.__setattr__(self, "home", Path(self.home))
 
     @property
+    def config_home(self) -> Path:
+        """The user's config home: $XDG_CONFIG_HOME, or ~/.config when unset (or not an
+        absolute path, which the XDG spec says to ignore). fish conf.d, environment.d,
+        autostart and git's XDG config live under it. MultiCred's own folder does not
+        (`app_support_directory`): the shell hooks name it as $HOME/.config/multicred."""
+        if self.xdg_config_home and self.xdg_config_home.startswith("/"):
+            return Path(self.xdg_config_home)
+        return self.home / ".config"
+
+    @property
     def app_support_directory(self) -> Path:
         """~/.config/multicred (the macOS app uses ~/Library/Application Support/MultiCred)."""
         return self.home / ".config" / "multicred"

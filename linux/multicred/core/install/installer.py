@@ -55,8 +55,9 @@ class Integrations:
 
     @staticmethod
     def fish_conf_file(environment) -> Path:
-        """fish loads every file in conf.d; MultiCred owns this one entirely."""
-        return Path(environment.home) / ".config/fish/conf.d/multicred.fish"
+        """fish loads every file in `$XDG_CONFIG_HOME/fish/conf.d` (~/.config when unset);
+        MultiCred owns this one entirely."""
+        return environment.config_home / "fish" / "conf.d" / "multicred.fish"
 
     @staticmethod
     def rc_block(shell: ShellKind) -> str:
@@ -82,8 +83,7 @@ class Integrations:
         primary = home / ".gitconfig"
         if os.path.lexists(primary):
             return primary
-        base = Path(environment.xdg_config_home) if environment.xdg_config_home else home / ".config"
-        xdg = base / "git" / "config"
+        xdg = environment.config_home / "git" / "config"
         if xdg.exists():
             return xdg
         return primary

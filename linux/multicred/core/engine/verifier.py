@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Callable
 
 from ..adapters.github_cli import GitHubCLI
-from ..adapters.session_env import ENVIRONMENT_D_FILE, SessionEnvironment, environment_d_line, representable
+from ..adapters.session_env import SessionEnvironment, environment_d_file, environment_d_line, representable
 from ..install import managed_block
 from ..install.installer import Installer, InstallOptions, Integrations
 from ..install.legacy import LegacyMigration
@@ -466,7 +466,7 @@ class Verifier:
             manager = session.get(CLAUDE_VARIABLE)
         except Exception as failure:  # no user manager, systemctl missing…
             manager, error = None, str(failure)
-        file = self.environment.home / ENVIRONMENT_D_FILE
+        file = environment_d_file(self.environment)
         text = _read_text(file)
         file_value = None if text is None else _env_line_value(text, f"{CLAUDE_VARIABLE}=")
         wanted_file = folder if folder is not None and environment_d_line(CLAUDE_VARIABLE, folder) else None

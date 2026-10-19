@@ -41,6 +41,9 @@ class AppModel:
         # A switch failed and could not undo everything: the machine is half switched.
         # Cleared by the next successful switch (the tray shows the orange dot meanwhile).
         self.inconsistent = False
+        # S-27: a re-apply asked for while a switch ran (UI thread only); it runs once that
+        # switch ends.
+        self._reapply_pending = False
         self._listeners: list[Callable[[], None]] = []
         # Filled off the UI thread by refresh_github_logins / refresh_claude_statuses /
         # load_folder_summaries (S-06); empty means "not known yet", never "logged out".
@@ -175,8 +178,10 @@ class AppModel:
         if error is None:
             if result is not None:
                 self.state = result.state
+                self._log("info", "reapplied active profile at session start")
+            else:
+                self._log("info", "nothing to re-apply at session start")
             self.inconsistent = False
-            self._log("info", "reapplied active profile at session start")
         else:
             self.inconsistent = True
             self._log("error", f"reapply failed: {error}")
@@ -185,6 +190,13 @@ class AppModel:
         if on_done is not None:
             on_done(result, error)
         self.notify()
+        self._run_pending_reapply()
+
+    def _run_pending_reapply(self) -> None:
+        """Runs the re-apply a removal asked for during a switch, once no switch runs."""
+        if self._reapply_pending and not self.switching:
+            self._reapply_pending = False
+            self.reapply_active_profile()
 
     def _log(self, level: str, message: str) -> None:
         if self.log is not None:
@@ -403,11 +415,20 @@ class AppModel:
         is applied again at once: the next env files unset the variable only for one
         generation, so a terminal idle across two later switches would keep it otherwise."""
         from ..core.editors import ConfigEditor
+        key = self.config.api_key(key_id) if self.config is not None else None
+        if key is None:
+            return
         active = self.active_profile
         exported = active is not None and key_id in active.api_key_ids
-        self.edit(lambda config: ConfigEditor.remove_api_key(key_id, config, self.environment.secrets))
+        # The secret goes only after the save: a failed save keeps both.
+        self.edit(lambda config: ConfigEditor.remove_api_key(key_id, config))
+        if not ConfigEditor.discard_removed_key(key, self.environment.secrets):
+            self._log("warning", f"removed API key {key.nickname}: its secret could not be deleted")
         if exported:
-            self.reapply_active_profile()
+            if self.switching:
+                self._reapply_pending = True  # after the running switch, which used the old config
+            else:
+                self.reapply_active_profile()
 
     def remove_claude_account(self, account_id) -> None:
         """Removes the account and its secret, as a transaction: (1) a login account live
@@ -415,7 +436,8 @@ class AppModel:
         the account, (3) only then its saved login and token are deleted. A failed save
         puts the account back in its folder and loses nothing. Shells stop exporting a
         removed token that was in use (Claude-only switch back to the folder login),
-        like the Mac."""
+        like the Mac. It runs under the switch lock (Busy while a switch runs, nothing
+        changed): a switch moving logins at the same time could save over them."""
         from ..core.claude import account_editor
         from ..core.claude.login_vault import ClaudeLoginSwitcher
 
@@ -424,16 +446,17 @@ class AppModel:
             return
         was_applied = self.state.applied_claude_account_id == account_id
         switcher = ClaudeLoginSwitcher(self.environment)
-        undo = account_editor.release_login(account, switcher)
-        try:
-            self.edit(lambda config: account_editor.remove(account_id, config))
-        except Exception:
+        with self.engine.exclusive():
+            undo = account_editor.release_login(account, switcher)
             try:
-                undo()
-            except Exception as error:
-                self._log("error", f"could not put the Claude account back in its folder: {error!r}")
-            raise
-        account_editor.discard_removed_account(account, self.environment.secrets, switcher)
+                self.edit(lambda config: account_editor.remove(account_id, config))
+            except Exception:
+                try:
+                    undo()
+                except Exception as error:
+                    self._log("error", f"could not put the Claude account back in its folder: {error!r}")
+                raise
+            account_editor.discard_removed_account(account, self.environment.secrets, switcher)
         if was_applied and self.active_profile is not None and not self.switching:
             self.switch_claude_only(None, lambda _result, _error: None)
 
@@ -567,15 +590,14 @@ class AppModel:
         """Runs the checklist off the UI thread and keeps the report in `verification`
         (the sidebar badge, the Perfis footer and the tray read it)."""
         from ..core.engine.verifier import Verifier
-        from .pages.verify import VerifyPage
 
         config, state = self.config, self.state
         if config is None:
             if on_done is not None:
                 on_done(None, None)
             return
-        verifier = Verifier(self.environment, self.tools, VerifyPage._default_scanner(self.environment),
-                            engine=self.engine, log=self.log)
+        # The model's scanner (no GTK here: the tray runs this too).
+        verifier = Verifier(self.environment, self.tools, self.processes, engine=self.engine, log=self.log)
 
         def finished(report, error):
             if report is not None:
@@ -596,6 +618,7 @@ class AppModel:
             if self._switches_in_flight == 0 and self.switching:
                 self.switching = False
                 self.notify()
+            self._run_pending_reapply()
             return False
         self.switching = self._switches_in_flight > 0
         if result is not None:
@@ -608,6 +631,7 @@ class AppModel:
             for listener in list(self.switch_listeners):
                 listener(outcome)
         self.notify()
+        self._run_pending_reapply()
         return False  # GLib.idle_add: run once
 
 

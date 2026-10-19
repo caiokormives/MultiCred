@@ -165,21 +165,27 @@ class ConfigEditor:
             raise EditorError.secrets(type(error).__name__ + ": " + str(error)) from None
 
     @staticmethod
-    def remove_api_key(key_id: uuid.UUID, config: Config, secrets) -> Config:
-        """Removes the key, its secret and its use in profiles. The secret goes first:
-        if the store refuses, the configuration still points to it and nothing changes."""
-        account = config.api_key(key_id)
-        if account is None:
+    def remove_api_key(key_id: uuid.UUID, config: Config) -> Config:
+        """The configuration without the key and its use in profiles. Pure: the secret
+        stays until the caller has saved this config and calls `discard_removed_key`, so
+        a failed save leaves the configuration still pointing at a secret that exists."""
+        if config.api_key(key_id) is None:
             return config
-        try:
-            secrets.delete_item(account.secret_account)
-        except Exception as error:
-            raise EditorError.secrets(type(error).__name__ + ": " + str(error)) from None
         updated = copy.deepcopy(config)
         updated.api_keys = [k for k in updated.api_keys if k.id != key_id]
         for profile in updated.profiles:
             profile.api_key_ids = [k for k in profile.api_key_ids if k != key_id]
         return updated
+
+    @staticmethod
+    def discard_removed_key(account: APIKeyAccount, secrets) -> bool:
+        """After the save: deletes the removed key's secret. False when the store refused;
+        the leftover is harmless, no account in the configuration points at it any more."""
+        try:
+            secrets.delete_item(account.secret_account)
+        except Exception:
+            return False
+        return True
 
     # MARK: profiles
 

@@ -48,9 +48,7 @@ class Autostart:
 
     @property
     def file(self) -> Path:
-        base = Path(self.environment.xdg_config_home) if self.environment.xdg_config_home \
-            else self.environment.home / ".config"
-        return base / "autostart" / AUTOSTART_NAME
+        return self.environment.config_home / "autostart" / AUTOSTART_NAME
 
     def is_available(self) -> bool:
         return os.path.isfile(self.command_path) and os.access(self.command_path, os.X_OK)

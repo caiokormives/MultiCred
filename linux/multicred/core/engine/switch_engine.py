@@ -10,6 +10,7 @@ while one runs gets Busy instead of queueing behind it.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import threading
 import uuid
@@ -66,7 +67,9 @@ class SwitchEngine:
         return self._perform(config, _Operation("claudeOnly", account_id))
 
     def reapply_active_profile(self, config: Config) -> SwitchResult | None:
-        """Re-applies the active profile (at session start). None when none was ever activated."""
+        """Re-applies the active profile (at session start). None when none was ever
+        activated, or when the active profile no longer exists in the configuration
+        (deleted while active): nothing to re-apply, logged, not a failure at every login."""
         if self._load_state().profile_id is None:
             return None
         return self._perform(config, _Operation("reapply"))
@@ -74,9 +77,22 @@ class SwitchEngine:
     def current_state(self) -> ActiveState:
         return self._load_state()
 
+    @contextlib.contextmanager
+    def exclusive(self):
+        """Holds the switch lock for another change to the folders' Claude logins
+        (removing an account, signing one in again): two place() at once could save one
+        folder's login over another's. Raises Busy, before anything runs, while a
+        switch is running; a switch requested meanwhile gets Busy too."""
+        if not self._lock.acquire(blocking=False):
+            raise Busy()
+        try:
+            yield
+        finally:
+            self._lock.release()
+
     # MARK: transaction
 
-    def _perform(self, config: Config, operation: _Operation) -> SwitchResult:
+    def _perform(self, config: Config, operation: _Operation) -> SwitchResult | None:
         if not self._lock.acquire(blocking=False):
             raise Busy()
         try:
@@ -84,7 +100,7 @@ class SwitchEngine:
         finally:
             self._lock.release()
 
-    def _transaction(self, config: Config, operation: _Operation) -> SwitchResult:
+    def _transaction(self, config: Config, operation: _Operation) -> SwitchResult | None:
         transaction = uuid.uuid4().hex[:8]
         issues = issues_in(config)
         if issues:
@@ -102,6 +118,10 @@ class SwitchEngine:
             if kept is not None and kept != ClaudeFolder.OWN_LOGIN_OVERRIDE and config.claude_account(kept) is None:
                 kept = None
             profile_id, override, touches_git_and_github = previous.profile_id, kept, True
+            if profile_id is not None and config.profile(profile_id) is None:
+                self._log("warning", f"switch {transaction}: active profile {uuid_text(profile_id)} no longer "
+                                     "exists; nothing re-applied")
+                return None
 
         profile = config.profile(profile_id)
         if profile_id is not None and profile is None:
@@ -132,7 +152,7 @@ class SwitchEngine:
         # no folder, so it could never be applied (a token account still can: shells).
         if login_account is not None and profile is None:
             raise Preflight(PreflightFailure("noActiveProfile", login_account.nickname))
-        login_switcher = ClaudeLoginSwitcher(self.environment)
+        login_switcher = ClaudeLoginSwitcher(self.environment, log=self._log)
 
         now = self.environment.clock()
         new_state = ActiveState(
