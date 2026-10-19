@@ -1,4 +1,5 @@
 """S-03: tray icon (StatusNotifierItem) with the profile menu (com.canonical.dbusmenu).
+S-08 (R-08): the menu follows the Mac's (AppDelegate.swift:71-194, MenuHeaderView.swift).
 
 The menu tree and the icon are pure and always run. The D-Bus tests need a private
 bus with nothing else on it and run only under tests/run-ui-tests.sh
@@ -40,14 +41,18 @@ SNI = "org.kde.StatusNotifierItem"
 MENU = "com.canonical.dbusmenu"
 
 
+WORK_FOLDER = "/home/dev/.claude-trabalho"
+
+
 def sample_world():
-    """Three profiles, two Claude accounts; Trabalho is active with its own account."""
+    """Three profiles, two Claude accounts; Trabalho is active with its own account and folder."""
     work_git = GitIdentity(nickname="Trabalho", name="Dev", email="dev@empresa.com.br", color=ProfileColor.INDIGO)
     work_gh = GitHubAccount(nickname="Empresa", username="dev-empresa", color=ProfileColor.INDIGO)
-    empresa = ClaudeAccount(nickname="Empresa", color=ProfileColor.INDIGO, kind=ClaudeAccountKind.LOGIN)
+    empresa = ClaudeAccount(nickname="Empresa", color=ProfileColor.INDIGO, email="dev@empresa.com.br",
+                            kind=ClaudeAccountKind.LOGIN)
     pessoal_claude = ClaudeAccount(nickname="Pessoal", color=ProfileColor.ORANGE)
     work = Profile(name="Trabalho", color=ProfileColor.INDIGO, git_identity_id=work_git.id,
-                   github_account_id=work_gh.id, claude_account_id=empresa.id)
+                   github_account_id=work_gh.id, claude_account_id=empresa.id, claude_config_dir=WORK_FOLDER)
     personal = Profile(name="Pessoal", color=ProfileColor.ORANGE)
     client = Profile(name="Cliente X", color=ProfileColor.TEAL, icon=ProfileIcon("letter", "X"))
     config = Config(git_identities=[work_git], github_accounts=[work_gh], claude_accounts=[empresa, pessoal_claude],
@@ -55,6 +60,29 @@ def sample_world():
     state = ActiveState(profile_id=work.id, applied_claude_account_id=empresa.id, activated_at=FIXED_NOW,
                         generation=3)
     return config, state
+
+
+def abbreviate(config_dir):
+    return "~/" + config_dir.removeprefix("/home/dev/") if config_dir else "~/.claude"
+
+
+def report(*statuses, checked_at=FIXED_NOW):
+    from multicred.core.engine.verifier import Check, CheckStatus, VerifyReport
+    titles = {CheckStatus.ERROR: "Identidade do git sobrescrita", CheckStatus.WARNING: "Claude Code · conta",
+              CheckStatus.OK: "git", CheckStatus.INFO: "1 sessão do Claude Code aberta"}
+    checks = [Check(f"c{n}", f"{titles[s]} {n}" if s == CheckStatus.ERROR else titles[s], s)
+              for n, s in enumerate(map(CheckStatus, statuses), start=1)]
+    return VerifyReport(checks=checks, checked_at=checked_at)
+
+
+def logged_in(email=None):
+    from multicred.core.claude.status import ClaudeLoginStatus
+    return ClaudeLoginStatus.logged_in(email)
+
+
+def logged_out():
+    from multicred.core.claude.status import ClaudeLoginStatus
+    return ClaudeLoginStatus.logged_out()
 
 
 def visible(items):
@@ -65,110 +93,262 @@ def labels(items):
     return [item.label for item in visible(items)]
 
 
+def find(items, label):
+    return next(i for i in items if i.label == label)
+
+
+def claude_submenu(items):
+    return find(items, "Trocar só a conta Claude").children
+
+
 class MenuModelTests(unittest.TestCase):
+    """The menu of AppDelegate.swift:71-194 as dbusmenu lines (R-08)."""
+
     def build(self, config, state, **flags):
         from multicred.tray.menu_model import build_menu
         flags.setdefault("tz", BRT)
+        flags.setdefault("folder_name", abbreviate)
         return build_menu(config, state, **flags)
 
-    def test_header_lines_are_disabled_text(self):
-        config, state = sample_world()
-        items = self.build(config, state)
-        since = FIXED_NOW.astimezone(BRT).strftime("%H:%M")
-        self.assertEqual([i.label for i in items[:3]], [
-            f"Trabalho · ativo desde {since}",
-            "git dev@empresa.com.br",
-            "GitHub dev-empresa · Claude Empresa",
-        ])
-        self.assertTrue(all(not i.enabled and i.action is None for i in items[:3]))
-        self.assertTrue(items[3].separator)
+    # MARK: header (MenuHeaderView.swift)
 
-    def test_header_without_github_and_with_override_and_folder_login(self):
+    def test_header_lines_have_icons_and_the_verify_status(self):
+        config, state = sample_world()
+        items = self.build(config, state, icon=lambda profile: b"png:" + profile.name.encode())
+        since = FIXED_NOW.astimezone(BRT).strftime("%H:%M")
+        self.assertEqual([i.label for i in items[:5]], [
+            f"Trabalho · Ativo desde {since}",
+            "Não verificado",
+            "dev@empresa.com.br",
+            "dev-empresa",
+            "Claude · ~/.claude-trabalho · Empresa",
+        ])
+        self.assertEqual(items[0].icon_png, b"png:Trabalho")
+        self.assertEqual([i.icon_name for i in items[1:5]], [
+            "dialog-question-symbolic", "multicred-branch-symbolic", "multicred-code-symbolic",
+            "multicred-sparkle-symbolic"])
+        self.assertTrue(all(not i.enabled and i.action is None for i in items[:5]))
+        self.assertTrue(items[5].separator)
+
+    def test_status_line_follows_the_last_verification(self):
+        config, state = sample_world()
+        cases = [
+            (dict(verification=report("ok", "warning", "info")), "Tudo certo", "emblem-ok-symbolic"),
+            (dict(verification=report("ok", "error")), "Inconsistente", "dialog-warning-symbolic"),
+            (dict(verifying=True), "Verificando", "emblem-synchronizing-symbolic"),
+            (dict(), "Não verificado", "dialog-question-symbolic"),
+            # The Linux half-switched state (failed rollback) is inconsistent too.
+            (dict(inconsistent=True, verification=report("ok")), "Inconsistente", "dialog-warning-symbolic"),
+        ]
+        for flags, label, icon in cases:
+            with self.subTest(label=label, flags=list(flags)):
+                status = self.build(config, state, **flags)[1]
+                self.assertEqual((status.label, status.icon_name, status.enabled), (label, icon, False))
+
+    def test_header_credential_is_the_folder_login_with_its_email_and_override(self):
         config, state = sample_world()
         state.profile_id = config.profiles[1].id
         state.applied_claude_account_id = None
         state.claude_override_id = ClaudeFolder.OWN_LOGIN_OVERRIDE
-        items = self.build(config, state)
-        self.assertEqual(items[1].label, "Claude login da pasta (só Claude)")
+        items = self.build(config, state, folder_status=lambda d: logged_in("eu@pessoal.com") if d is None else None)
+        self.assertEqual(labels(items)[:3], ["Pessoal · Ativo desde " + FIXED_NOW.astimezone(BRT).strftime("%H:%M"),
+                                             "Não verificado",
+                                             "Claude · ~/.claude · login da pasta (eu@pessoal.com) (só Claude)"])
+        plain = self.build(config, state, folder_status=lambda d: logged_in(None))
+        self.assertEqual(plain[2].label, "Claude · ~/.claude · login da pasta (só Claude)")
 
     def test_no_active_profile_header(self):
         config, _ = sample_world()
         items = self.build(config, ActiveState())
-        self.assertEqual(items[0].label, "Nenhum perfil ativo")
-        self.assertFalse(items[0].enabled)
+        self.assertEqual([i.label for i in items[:2]], ["Nenhum perfil ativo", "Escolha um perfil abaixo."])
+        self.assertFalse(items[0].enabled or items[1].enabled)
+        self.assertTrue(items[2].separator)
 
-    def test_profiles_in_config_order_with_radio_on_the_active_one_and_icons(self):
+    # MARK: problems (MenuHeaderView.swift:40-52, AppDelegate.swift:94-97)
+
+    def test_first_problem_and_count_then_corrigir(self):
+        config, state = sample_world()
+        items = self.build(config, state, verification=report("ok", "error", "warning", "error", "error"))
+        first_separator = next(n for n, i in enumerate(items) if i.separator)
+        problem, more, fix = items[first_separator - 3:first_separator]
+        self.assertEqual((problem.label, problem.icon_name, problem.enabled),
+                         ("Identidade do git sobrescrita 2", "dialog-warning-symbolic", False))
+        self.assertEqual((more.label, more.enabled), ("e mais 2", False))
+        self.assertEqual((fix.label, fix.action, fix.icon_name, fix.enabled),
+                         ("Corrigir…", ("open", "verify"), "dialog-warning-symbolic", True))
+
+    def test_one_problem_has_no_count(self):
+        config, state = sample_world()
+        items = self.build(config, state, verification=report("error"))
+        self.assertNotIn("e mais 0", labels(items))
+        fix = items.index(find(items, "Corrigir…"))
+        self.assertEqual(items[fix - 1].label, "Identidade do git sobrescrita 1")
+
+    def test_no_corrigir_without_problems(self):
+        config, state = sample_world()
+        for flags in (dict(), dict(verification=report("ok", "warning", "info"))):
+            with self.subTest(flags=list(flags)):
+                self.assertNotIn("Corrigir…", labels(self.build(config, state, **flags)))
+
+    def test_half_switched_state_offers_corrigir_without_a_problem_line(self):
+        config, state = sample_world()
+        items = self.build(config, state, inconsistent=True)
+        fix = items.index(find(items, "Corrigir…"))
+        self.assertEqual(items[fix - 1].label, "Claude · ~/.claude-trabalho · Empresa")
+
+    def test_problems_show_without_an_active_profile(self):
+        config, _ = sample_world()
+        items = self.build(config, ActiveState(), verification=report("error"))
+        self.assertEqual(labels(items)[:4], ["Nenhum perfil ativo", "Escolha um perfil abaixo.",
+                                             "Identidade do git sobrescrita 1", "Corrigir…"])
+
+    # MARK: profiles (AppDelegate.swift:100-120)
+
+    def test_perfis_label_before_the_profiles(self):
+        config, state = sample_world()
+        items = self.build(config, state)
+        label = find(items, "Perfis")
+        self.assertFalse(label.enabled)
+        self.assertTrue(items[items.index(label) - 1].separator)
+        self.assertEqual(items[items.index(label) + 1].action, ("profile", config.profiles[0].id))
+
+    def test_profiles_with_icon_check_and_ctrl_number(self):
         config, state = sample_world()
         items = self.build(config, state, icon=lambda profile: b"png:" + profile.name.encode())
         profiles = [i for i in items if i.action and i.action[0] == "profile"]
         self.assertEqual([p.label for p in profiles], ["Trabalho", "Pessoal", "Cliente X"])
         self.assertEqual([p.action[1] for p in profiles], [p.id for p in config.profiles])
-        self.assertTrue(all(p.toggle == "radio" for p in profiles))
+        self.assertTrue(all(p.toggle == "checkmark" for p in profiles))
         self.assertEqual([p.toggled for p in profiles], [True, False, False])
         self.assertEqual(profiles[2].icon_png, b"png:Cliente X")
+        self.assertEqual([p.shortcut for p in profiles], [("Control", "1"), ("Control", "2"), ("Control", "3")])
         self.assertTrue(all(p.enabled for p in profiles))
+
+    def test_only_the_first_nine_profiles_have_a_shortcut(self):
+        config, state = sample_world()
+        config.profiles = [Profile(name=f"P{n}", color=ProfileColor.BLUE) for n in range(1, 12)]
+        profiles = [i for i in self.build(config, state) if i.action and i.action[0] == "profile"]
+        self.assertEqual([p.shortcut for p in profiles],
+                         [("Control", str(n)) for n in range(1, 10)] + [None, None])
+
+    def test_profile_that_needs_claude_login_says_so(self):
+        config, state = sample_world()
+        token_profile = Profile(name="Token", color=ProfileColor.BLUE, claude_account_id=config.claude_accounts[1].id)
+        config.profiles.append(token_profile)
+        items = self.build(config, state, folder_status=lambda d: logged_out() if d is None else logged_in(),
+                           has_token=lambda account: account.nickname != "Pessoal")
+        profiles = [i.label for i in items if i.action and i.action[0] == "profile"]
+        self.assertEqual(profiles, ["Trabalho", "Pessoal  ⚠︎ Claude precisa entrar",
+                                    "Cliente X  ⚠︎ Claude precisa entrar", "Token  ⚠︎ Claude precisa entrar"])
+        # Unknown status is never "logged out".
+        unknown = self.build(config, state, has_token=lambda account: True)
+        self.assertNotIn("⚠︎", " ".join(labels(unknown)))
 
     def test_profiles_are_disabled_while_switching(self):
         config, state = sample_world()
         profiles = [i for i in self.build(config, state, switching=True) if i.action and i.action[0] == "profile"]
         self.assertTrue(profiles and not any(p.enabled for p in profiles))
 
-    def test_inconsistent_item_only_when_inconsistent(self):
+    def test_without_profiles_criar_um_perfil(self):
         config, state = sample_world()
-        self.assertNotIn("⚠ Inconsistente — Corrigir", labels(self.build(config, state)))
-        items = self.build(config, state, inconsistent=True)
-        fix = next(i for i in items if i.label == "⚠ Inconsistente — Corrigir")
-        self.assertEqual(fix.action, ("open", "verify"))
-        self.assertTrue(fix.enabled)
-        self.assertLess(items.index(fix), next(n for n, i in enumerate(items) if i.separator))
+        config.profiles = []
+        items = self.build(config, ActiveState())
+        create = find(items, "Criar um perfil…")
+        self.assertEqual((create.action, create.icon_name), (("open", "new-profile"), "list-add-symbolic"))
+        self.assertEqual(items[items.index(create) - 1].label, "Perfis")
 
-    def test_claude_submenu_marks_applied_account_and_profile_default(self):
+    # MARK: "Trocar só a conta Claude" (AppDelegate.swift:142-194)
+
+    def test_claude_submenu_like_the_mac(self):
         config, state = sample_world()
-        items = self.build(config, state)
-        submenu = next(i for i in items if i.label == "Trocar só a conta Claude")
-        self.assertEqual(labels(submenu.children),
-                         ["Login da pasta", "Empresa · do perfil", "Pessoal", "Adicionar conta Claude…"])
-        own, empresa, pessoal, add = visible(submenu.children)
-        self.assertEqual(own.action, ("claude", None))
-        self.assertEqual(empresa.action, ("claude", config.claude_accounts[0].id))
-        self.assertEqual([own.toggled, empresa.toggled, pessoal.toggled], [False, True, False])
-        self.assertTrue(all(i.toggle == "radio" for i in (own, empresa, pessoal)))
-        self.assertEqual(add.action, ("open", "add-claude"))
-        self.assertTrue(submenu.children[-2].separator)
+        items = self.build(config, state, folder_status=lambda d: logged_in("dev@pasta.com"),
+                           has_token=lambda account: account.nickname != "Pessoal",
+                           account_icon=lambda account: b"png:" + account.nickname.encode())
+        entry = find(items, "Trocar só a conta Claude")
+        self.assertEqual(entry.icon_name, "multicred-sparkle-symbolic")
+        submenu = entry.children
+        self.assertEqual(labels(submenu), [
+            "Conta Claude · pasta ~/.claude-trabalho (Trabalho) fica",
+            "Login da pasta · dev@pasta.com",
+            "Empresa · dev@empresa.com.br · do perfil",
+            "Pessoal · sem token · conta Claude",
+            "Adicionar conta Claude…",
+            "Agents, skills e conversas não mudam.",
+            "Vale para novos terminais; sessões abertas continuam.",
+        ])
+        header, own, empresa, pessoal, add, note1, note2 = visible(submenu)
+        self.assertFalse(header.enabled or note1.enabled or note2.enabled)
+        self.assertEqual((own.action, own.icon_name, own.toggle, own.toggled, own.enabled),
+                         (("claude", None), "folder-symbolic", "checkmark", False, True))
+        self.assertEqual((empresa.action, empresa.icon_png, empresa.toggle, empresa.toggled, empresa.enabled),
+                         (("claude", config.claude_accounts[0].id), b"png:Empresa", "checkmark", True, True))
+        self.assertFalse(pessoal.enabled)  # no token
+        self.assertEqual((add.action, add.icon_name), (("open", "add-claude"), "list-add-symbolic"))
+        separators = [n for n, i in enumerate(submenu) if i.separator]
+        self.assertEqual(separators, [submenu.index(pessoal) + 1, submenu.index(add) + 1])
 
-    def test_claude_submenu_folder_login_is_the_profile_default(self):
+    def test_claude_submenu_folder_login_states(self):
         config, state = sample_world()
         state.profile_id, state.applied_claude_account_id = config.profiles[1].id, None
-        submenu = next(i for i in self.build(config, state) if i.label == "Trocar só a conta Claude")
-        own = submenu.children[0]
-        self.assertEqual(own.label, "Login da pasta · do perfil")
-        self.assertTrue(own.toggled)
+        cases = [
+            (logged_in("eu@pessoal.com"), "Login da pasta · eu@pessoal.com · do perfil", ("claude", None)),
+            (logged_in(None), "Login da pasta · Logada · do perfil", ("claude", None)),
+            (logged_out(), "Login da pasta · Entrar…", ("folder-login", None)),
+            (None, "Login da pasta · do perfil", ("claude", None)),
+        ]
+        for status, label, action in cases:
+            with self.subTest(label=label):
+                own = visible(claude_submenu(self.build(config, state, folder_status=lambda d: status)))[1]
+                self.assertEqual((own.label, own.action, own.toggled), (label, action, True))
+        from multicred.core.claude.status import ClaudeLoginStatus
+        own = visible(claude_submenu(self.build(config, state,
+                                                folder_status=lambda d: ClaudeLoginStatus.unknown("x"))))[1]
+        self.assertEqual(own.label, "Login da pasta · Status indisponível · do perfil")
+
+    def test_claude_submenu_folder_login_of_another_folder_asks_for_that_folder(self):
+        config, state = sample_world()
+        own = visible(claude_submenu(self.build(config, state, folder_status=lambda d: logged_out())))[1]
+        self.assertEqual(own.action, ("folder-login", WORK_FOLDER))
+
+    def test_claude_submenu_is_disabled_while_switching(self):
+        config, state = sample_world()
+        submenu = claude_submenu(self.build(config, state, switching=True))
+        self.assertFalse(any(i.enabled for i in submenu if i.action and i.action[0] == "claude"))
 
     def test_claude_submenu_without_active_profile(self):
         config, _ = sample_world()
-        submenu = next(i for i in self.build(config, ActiveState()) if i.label == "Trocar só a conta Claude")
-        self.assertEqual(labels(submenu.children), ["Ative um perfil primeiro"])
-        self.assertFalse(submenu.children[0].enabled)
+        submenu = claude_submenu(self.build(config, ActiveState()))
+        self.assertEqual(labels(submenu), ["Conta Claude", "Ative um perfil primeiro"])
+        self.assertFalse(any(i.enabled for i in submenu))
 
-    def test_tail_actions_and_quit(self):
+    # MARK: tail, unconfigured, test mode
+
+    def test_tail_actions_icons_and_shortcuts(self):
         config, state = sample_world()
         items = self.build(config, state)
-        tail = items[items.index(next(i for i in items if i.label == "Trocar só a conta Claude")) + 1:]
-        self.assertEqual(labels(tail), ["Verificar…", "Abrir MultiCred", "Contas…", "Ajustes…", "Sair do MultiCred"])
-        self.assertEqual([i.action for i in visible(tail)], [
-            ("open", "verify"), ("open", "main"), ("open", "accounts"), ("open", "settings"), ("quit", None)])
-        self.assertTrue(tail[-2].separator)
+        tail = items[items.index(find(items, "Trocar só a conta Claude")) + 1:]
+        self.assertTrue(tail[0].separator and tail[-2].separator)
+        self.assertEqual([(i.label, i.action, i.icon_name, i.shortcut) for i in visible(tail)], [
+            ("Verificar…", ("open", "verify"), "security-high-symbolic", ("Control", "r")),
+            ("Contas…", ("open", "claude"), "avatar-default-symbolic", None),
+            ("Ajustes…", ("open", "settings"), "emblem-system-symbolic", ("Control", "comma")),
+            ("Abrir MultiCred", ("open", "main"), None, None),
+            ("Sair do MultiCred", ("quit", None), None, ("Control", "q")),
+        ])
 
     def test_unconfigured_menu(self):
         items = self.build(None, ActiveState())
         self.assertEqual(labels(items), ["Configurar MultiCred…", "Sair do MultiCred"])
-        self.assertEqual([i.action for i in visible(items)], [("open", "onboarding"), ("quit", None)])
+        configure, quit_item = visible(items)
+        self.assertEqual((configure.action, configure.icon_name), (("open", "onboarding"), "system-run-symbolic"))
+        self.assertEqual((quit_item.action, quit_item.shortcut), (("quit", None), ("Control", "q")))
 
     def test_test_mode_line_on_top(self):
         config, state = sample_world()
         items = self.build(config, state, test_mode=True)
         self.assertEqual(items[0].label, "MODO DE TESTE · nada no sistema real muda")
         self.assertFalse(items[0].enabled)
+        self.assertTrue(items[1].separator)
 
 
 class DBusMenuPropertiesTests(unittest.TestCase):
@@ -179,10 +359,26 @@ class DBusMenuPropertiesTests(unittest.TestCase):
         self.assertEqual(properties(MenuItem(separator=True)), {"type": "separator"})
         self.assertEqual(properties(MenuItem("git dev_x@empresa.com.br", enabled=False)),
                          {"label": "git dev__x@empresa.com.br", "enabled": False})
-        self.assertEqual(properties(MenuItem("Pessoal", ("profile", 1), toggle="radio", toggled=True,
+        self.assertEqual(properties(MenuItem("Pessoal", ("profile", 1), toggle="checkmark", toggled=True,
                                              icon_png=b"png")),
-                         {"label": "Pessoal", "toggle-type": "radio", "toggle-state": 1, "icon-data": b"png"})
+                         {"label": "Pessoal", "toggle-type": "checkmark", "toggle-state": 1, "icon-data": b"png"})
         self.assertEqual(properties(MenuItem("Sub", children=[MenuItem("x")]))["children-display"], "submenu")
+
+    def test_icon_name_and_shortcut(self):
+        from multicred.tray.dbusmenu import properties
+        from multicred.tray.menu_model import MenuItem
+        self.assertEqual(properties(MenuItem("Verificar…", ("open", "verify"), icon_name="security-high-symbolic",
+                                             shortcut=("Control", "r"))),
+                         {"label": "Verificar…", "icon-name": "security-high-symbolic",
+                          "shortcut": [["Control", "r"]]})
+
+    def test_icon_theme_path_holds_the_apps_own_icons(self):
+        from pathlib import Path
+
+        from multicred.tray.dbusmenu import ICON_THEME_PATH
+        for name in ("branch", "code", "sparkle"):
+            self.assertTrue((Path(ICON_THEME_PATH) / "hicolor" / "scalable" / "actions"
+                             / f"multicred-{name}-symbolic.svg").is_file())
 
 
 def pixel(pixmap, x, y):
@@ -439,14 +635,18 @@ class FakeWatcher:
 
 
 class FakeModel:
-    """What the tray reads from AppModel, with recording switch methods."""
+    """What the tray reads from AppModel, with recording switch, status and verify methods."""
 
     def __init__(self, config, state):
         self.config, self.state = config, state
         self.inconsistent = False
         self.switching = False
         self.is_test_mode = False
+        self.verification = None
+        self.statuses = {}
+        self.tokens = {}
         self.switched, self.claude_switched = [], []
+        self.status_refreshes, self.verifies = [], []
         self._listeners = []
 
     @property
@@ -460,15 +660,37 @@ class FakeModel:
         for listener in list(self._listeners):
             listener()
 
+    def folder_name(self, config_dir):
+        return abbreviate(config_dir)
+
+    def folder_status(self, config_dir):
+        return self.statuses.get(config_dir)
+
+    def has_token(self, account):
+        return self.tokens.get(account.nickname, True)
+
+    def needs_claude_login(self, profile):
+        account = self.config.claude_account(profile.claude_account_id)
+        if account is not None:
+            return not self.has_token(account)
+        status = self.folder_status(profile.claude_config_dir)
+        return status is not None and status.kind == "loggedOut"
+
+    def refresh_claude_statuses(self, on_done=None):
+        self.status_refreshes.append(on_done)
+
+    def verify(self, on_done=None, deep=False):
+        self.verifies.append((on_done, deep))
+
     def switch_profile(self, profile_id, on_done):
         self.switched.append(profile_id)
         self.state = ActiveState(profile_id=profile_id, activated_at=FIXED_NOW)
-        on_done(None, None)
+        on_done(object(), None)
         self.notify()
 
     def switch_claude_only(self, account_id, on_done):
         self.claude_switched.append(account_id)
-        on_done(None, None)
+        on_done(object(), None)
 
 
 def walk(layout):
@@ -478,26 +700,34 @@ def walk(layout):
         yield from walk(child)
 
 
+def shown(children):
+    return [c[1].get("label") for c in children if c[1].get("type") != "separator"]
+
+
 @unittest.skipUnless(PRIVATE_BUS, "needs tests/run-ui-tests.sh (private bus)")
 class TrayTests(unittest.TestCase):
     def setUp(self):
         self.config, self.state = sample_world()
         self.model = FakeModel(self.config, self.state)
-        self.opened, self.quits, self.availability = [], [], []
+        self.opened, self.quits, self.availability, self.logins = [], [], [], []
+        self.now = FIXED_NOW
         self.client = new_connection(self)
 
-    def start_tray(self):
+    def start_tray(self, with_login=True):
         from multicred.tray.controller import TrayController
         tray = TrayController(self.model, on_open=self.opened.append, on_quit=lambda: self.quits.append(True),
-                              on_availability=self.availability.append, connection=new_connection(self), tz=BRT)
+                              on_login=(lambda kind, target: self.logins.append((kind, target))) if with_login
+                              else None,
+                              on_availability=self.availability.append, connection=new_connection(self), tz=BRT,
+                              clock=lambda: self.now)
         tray.start()
         self.addCleanup(tray.stop)
+        spin_until(lambda: self.availability)
         return tray
 
-    def layout(self, tray):
-        revision, layout = call(self.client, tray.bus_name, "/MenuBar", MENU, "GetLayout",
-                                GLib.Variant("(iias)", (0, -1, [])))
-        return revision, layout
+    def layout(self, tray, parent=0, depth=-1, names=()):
+        return call(self.client, tray.bus_name, "/MenuBar", MENU, "GetLayout",
+                    GLib.Variant("(iias)", (parent, depth, list(names))))
 
     def item_id(self, tray, label):
         _, layout = self.layout(tray)
@@ -507,10 +737,12 @@ class TrayTests(unittest.TestCase):
         call(self.client, tray.bus_name, "/MenuBar", MENU, "Event",
              GLib.Variant("(isvu)", (item_id, "clicked", GLib.Variant("s", ""), 0)))
 
+    def about_to_show(self, tray, item_id=0):
+        return call(self.client, tray.bus_name, "/MenuBar", MENU, "AboutToShow", GLib.Variant("(i)", (item_id,)))
+
     def test_registers_with_the_watcher(self):
         watcher = FakeWatcher(self)
         tray = self.start_tray()
-        spin_until(lambda: self.availability)
         self.assertEqual(self.availability, [True])
         self.assertTrue(tray.available)
         self.assertRegex(tray.bus_name, rf"^org\.kde\.StatusNotifierItem-{os.getpid()}-\d+$")
@@ -521,60 +753,134 @@ class TrayTests(unittest.TestCase):
                      "GetNameOwner", GLib.Variant("(s)", (tray.bus_name,)))[0]
         self.assertEqual(sender, owner)
 
-    def test_layout_has_header_profiles_claude_submenu_and_quit(self):
+    def test_layout_like_the_mac_menu(self):
         FakeWatcher(self)
+        self.model.statuses[WORK_FOLDER] = logged_in("dev@pasta.com")
+        self.model.tokens["Pessoal"] = False
         tray = self.start_tray()
-        spin_until(lambda: self.availability)
         revision, layout = self.layout(tray)
         root_id, root_props, children = layout
         self.assertEqual(root_id, 0)
         self.assertEqual(root_props.get("children-display"), "submenu")
-        top = [c[1].get("label") for c in children if c[1].get("type") != "separator"]
         since = FIXED_NOW.astimezone(BRT).strftime("%H:%M")
-        self.assertEqual(top, [f"Trabalho · ativo desde {since}", "git dev@empresa.com.br",
-                               "GitHub dev-empresa · Claude Empresa", "Trabalho", "Pessoal", "Cliente X",
-                               "Trocar só a conta Claude", "Verificar…", "Abrir MultiCred", "Contas…", "Ajustes…",
-                               "Sair do MultiCred"])
+        self.assertEqual(shown(children), [
+            f"Trabalho · Ativo desde {since}", "Não verificado", "dev@empresa.com.br", "dev-empresa",
+            "Claude · ~/.claude-trabalho · Empresa",
+            "Perfis", "Trabalho", "Pessoal", "Cliente X",
+            "Trocar só a conta Claude",
+            "Verificar…", "Contas…", "Ajustes…", "Abrir MultiCred",
+            "Sair do MultiCred"])
         by_label = {c[1].get("label"): c for c in children}
-        self.assertIs(by_label["git dev@empresa.com.br"][1].get("enabled"), False)
+        self.assertIs(by_label["dev@empresa.com.br"][1].get("enabled"), False)
         work, personal = by_label["Trabalho"][1], by_label["Pessoal"][1]
-        self.assertEqual((work.get("toggle-type"), work.get("toggle-state")), ("radio", 1))
-        self.assertEqual((personal.get("toggle-type"), personal.get("toggle-state")), ("radio", 0))
+        self.assertEqual((work.get("toggle-type"), work.get("toggle-state")), ("checkmark", 1))
+        self.assertEqual((personal.get("toggle-type"), personal.get("toggle-state")), ("checkmark", 0))
         self.assertEqual(bytes(personal["icon-data"][:4]), b"\x89PNG")
         claude = by_label["Trocar só a conta Claude"]
         self.assertEqual(claude[1].get("children-display"), "submenu")
-        self.assertEqual([c[1].get("label") for c in claude[2] if c[1].get("type") != "separator"],
-                         ["Login da pasta", "Empresa · do perfil", "Pessoal", "Adicionar conta Claude…"])
-        self.assertTrue(any(c[1].get("type") == "separator" for c in children))
+        self.assertEqual(shown(claude[2]), [
+            "Conta Claude · pasta ~/.claude-trabalho (Trabalho) fica", "Login da pasta · dev@pasta.com",
+            "Empresa · dev@empresa.com.br · do perfil", "Pessoal · sem token · conta Claude",
+            "Adicionar conta Claude…", "Agents, skills e conversas não mudam.",
+            "Vale para novos terminais; sessões abertas continuam."])
+        sub = {c[1].get("label"): c[1] for c in claude[2]}
+        self.assertIs(sub["Pessoal · sem token · conta Claude"].get("enabled"), False)
+        self.assertEqual(bytes(sub["Empresa · dev@empresa.com.br · do perfil"]["icon-data"][:4]), b"\x89PNG")
         ids = [i for i, _ in walk(layout)]
         self.assertEqual(len(ids), len(set(ids)))
         version = call(self.client, tray.bus_name, "/MenuBar", "org.freedesktop.DBus.Properties", "Get",
                        GLib.Variant("(ss)", (MENU, "Version")))[0]
         self.assertEqual(version, 3)
 
+    def test_icon_name_and_shortcut_go_over_the_bus(self):
+        FakeWatcher(self)
+        tray = self.start_tray()
+        _, layout = self.layout(tray)
+        props = {p.get("label"): p for _, p in walk(layout)}
+        self.assertEqual(props["Verificar…"]["icon-name"], "security-high-symbolic")
+        self.assertEqual(props["Verificar…"]["shortcut"], [["Control", "r"]])
+        self.assertEqual(props["Ajustes…"]["shortcut"], [["Control", "comma"]])
+        self.assertEqual(props["Sair do MultiCred"]["shortcut"], [["Control", "q"]])
+        self.assertEqual(props["Pessoal"]["shortcut"], [["Control", "2"]])
+        self.assertEqual(props["dev@empresa.com.br"]["icon-name"], "multicred-branch-symbolic")
+        self.assertEqual(props["Trocar só a conta Claude"]["icon-name"], "multicred-sparkle-symbolic")
+        verify_id = self.item_id(tray, "Verificar…")
+        (value,) = call(self.client, tray.bus_name, "/MenuBar", MENU, "GetProperty",
+                        GLib.Variant("(is)", (verify_id, "shortcut")))
+        self.assertEqual(value, [["Control", "r"]])
+        box = []
+        self.client.call(tray.bus_name, "/MenuBar", MENU, "GetGroupProperties",
+                         GLib.Variant("(aias)", ([verify_id], ["icon-name", "shortcut"])), None,
+                         Gio.DBusCallFlags.NONE, 3000, None, lambda conn, res: box.append(conn.call_finish(res)))
+        spin_until(lambda: box)
+        group = box[0].get_child_value(0).get_child_value(0).get_child_value(1)
+        self.assertEqual(group.lookup_value("shortcut", None).get_type_string(), "aas")
+        self.assertEqual(group.lookup_value("icon-name", None).get_type_string(), "s")
+        (theme_path,) = call(self.client, tray.bus_name, "/MenuBar", "org.freedesktop.DBus.Properties", "Get",
+                             GLib.Variant("(ss)", (MENU, "IconThemePath")))
+        from multicred.tray.dbusmenu import ICON_THEME_PATH
+        self.assertEqual(theme_path, [ICON_THEME_PATH])
+
     def test_sub_layout_and_group_properties(self):
         FakeWatcher(self)
         tray = self.start_tray()
-        spin_until(lambda: self.availability)
         claude_id = self.item_id(tray, "Trocar só a conta Claude")
-        _, sub = call(self.client, tray.bus_name, "/MenuBar", MENU, "GetLayout",
-                      GLib.Variant("(iias)", (claude_id, 1, ["label"])))
+        _, sub = self.layout(tray, claude_id, 1, ["label"])
         self.assertEqual(sub[0], claude_id)
-        self.assertEqual(sub[2][0][1], {"label": "Login da pasta"})
+        self.assertEqual(sub[2][0][1], {"label": "Conta Claude · pasta ~/.claude-trabalho (Trabalho) fica"})
         quit_id = self.item_id(tray, "Sair do MultiCred")
         (props,) = call(self.client, tray.bus_name, "/MenuBar", MENU, "GetGroupProperties",
-                        GLib.Variant("(aias)", ([quit_id], [])))
+                        GLib.Variant("(aias)", ([quit_id], ["label"])))
         self.assertEqual(props, [(quit_id, {"label": "Sair do MultiCred"})])
         (label,) = call(self.client, tray.bus_name, "/MenuBar", MENU, "GetProperty",
                         GLib.Variant("(is)", (quit_id, "label")))
         self.assertEqual(label, "Sair do MultiCred")
-        self.assertEqual(call(self.client, tray.bus_name, "/MenuBar", MENU, "AboutToShow",
-                              GLib.Variant("(i)", (0,))), (False,))
+
+    def test_about_to_show_refreshes_statuses_then_verifies_when_older_than_120_s(self):
+        FakeWatcher(self)
+        tray = self.start_tray()
+        self.assertEqual(self.about_to_show(tray), (False,))  # the layout follows with LayoutUpdated
+        self.assertEqual(len(self.model.status_refreshes), 1)
+        self.assertEqual(self.model.verifies, [])  # after the statuses, like the Mac's await
+        self.about_to_show(tray)
+        self.assertEqual(len(self.model.status_refreshes), 1)  # one refresh at a time
+        self.model.status_refreshes[0]()
+        self.assertEqual(len(self.model.verifies), 1)
+        on_done, deep = self.model.verifies[0]
+        self.assertFalse(deep)  # Mac: verify(checkTokens: false)
+        _, layout = self.layout(tray)
+        self.assertIn("Verificando", shown(layout[2]))
+        fresh = report("ok", "error", checked_at=FIXED_NOW)
+        self.model.verification = fresh
+        on_done(fresh, None)
+        self.model.notify()
+        _, layout = self.layout(tray)
+        self.assertIn("Inconsistente", shown(layout[2]))
+        self.assertIn("Corrigir…", shown(layout[2]))
+
+        # Opened again within 120 s: statuses only.
+        self.now = FIXED_NOW + timedelta(seconds=120)
+        self.about_to_show(tray)
+        self.model.status_refreshes[-1]()
+        self.assertEqual(len(self.model.status_refreshes), 2)
+        self.assertEqual(len(self.model.verifies), 1)
+        # Later: verifies again.
+        self.now = FIXED_NOW + timedelta(seconds=121)
+        (updates, errors) = call(self.client, tray.bus_name, "/MenuBar", MENU, "AboutToShowGroup",
+                                 GLib.Variant("(ai)", ([0, 9999],)))
+        self.assertEqual((updates, errors), ([], [9999]))
+        self.model.status_refreshes[-1]()
+        self.assertEqual(len(self.model.verifies), 2)
+
+    def test_about_to_show_of_a_submenu_does_nothing(self):
+        FakeWatcher(self)
+        tray = self.start_tray()
+        self.assertEqual(self.about_to_show(tray, self.item_id(tray, "Trocar só a conta Claude")), (False,))
+        self.assertEqual((self.model.status_refreshes, self.model.verifies), ([], []))
 
     def test_clicked_on_a_profile_switches_it(self):
         FakeWatcher(self)
         tray = self.start_tray()
-        spin_until(lambda: self.availability)
         revision, _ = self.layout(tray)
         updates = []
         self.client.signal_subscribe(tray.bus_name, MENU, "LayoutUpdated", "/MenuBar", None,
@@ -582,33 +888,62 @@ class TrayTests(unittest.TestCase):
         self.click(tray, self.item_id(tray, "Pessoal"))
         spin_until(lambda: self.model.switched and updates)
         self.assertEqual(self.model.switched, [self.config.profiles[1].id])
+        self.assertEqual(self.logins, [])
         new_revision, layout = self.layout(tray)
         self.assertGreater(new_revision, revision)
         toggled = [props.get("label") for _, props in walk(layout) if props.get("toggle-state") == 1]
         self.assertIn("Pessoal", toggled)
 
+    def test_switching_to_a_profile_that_needs_claude_login_opens_the_login(self):
+        """AppDelegate.swift:198-211: the account's login again, or the folder's own login."""
+        FakeWatcher(self)
+        self.model.statuses[None] = logged_out()
+        tray = self.start_tray()
+        self.click(tray, self.item_id(tray, "Pessoal  ⚠︎ Claude precisa entrar"))
+        spin_until(lambda: self.logins)
+        self.assertEqual(self.logins, [("folder", None)])
+        self.model.tokens["Empresa"] = False
+        self.model.notify()
+        self.click(tray, self.item_id(tray, "Trabalho  ⚠︎ Claude precisa entrar"))
+        spin_until(lambda: len(self.logins) == 2)
+        self.assertEqual(self.logins[1], ("login", self.config.claude_accounts[0]))
+
     def test_other_actions(self):
         FakeWatcher(self)
         tray = self.start_tray()
-        spin_until(lambda: self.availability)
         claude_id = self.item_id(tray, "Trocar só a conta Claude")
-        _, sub = call(self.client, tray.bus_name, "/MenuBar", MENU, "GetLayout",
-                      GLib.Variant("(iias)", (claude_id, 1, [])))
+        _, sub = self.layout(tray, claude_id, 1)
         own = next(c[0] for c in sub[2] if c[1].get("label") == "Login da pasta")
         self.click(tray, own)
         self.click(tray, self.item_id(tray, "Contas…"))
         self.click(tray, self.item_id(tray, "Sair do MultiCred"))
         spin_until(lambda: self.model.claude_switched and self.opened and self.quits)
         self.assertEqual(self.model.claude_switched, [None])
-        self.assertEqual(self.opened, ["accounts"])
+        self.assertEqual(self.opened, ["claude"])  # AppDelegate.swift:229
         call(self.client, tray.bus_name, "/StatusNotifierItem", SNI, "Activate", GLib.Variant("(ii)", (0, 0)))
         spin_until(lambda: len(self.opened) == 2)
         self.assertEqual(self.opened[-1], "main")
 
+    def test_folder_login_entrar_opens_the_folder_login(self):
+        FakeWatcher(self)
+        self.model.statuses[WORK_FOLDER] = logged_out()
+        tray = self.start_tray()
+        self.click(tray, self.item_id(tray, "Login da pasta · Entrar…"))
+        spin_until(lambda: self.logins)
+        self.assertEqual(self.logins, [("folder", WORK_FOLDER)])
+        self.assertEqual(self.model.claude_switched, [])
+
+    def test_without_a_login_handler_logins_open_the_claude_page(self):
+        FakeWatcher(self)
+        self.model.statuses[WORK_FOLDER] = logged_out()
+        tray = self.start_tray(with_login=False)
+        self.click(tray, self.item_id(tray, "Login da pasta · Entrar…"))
+        spin_until(lambda: self.opened)
+        self.assertEqual(self.opened, ["claude"])
+
     def test_item_properties_icon_and_status(self):
         FakeWatcher(self)
         tray = self.start_tray()
-        spin_until(lambda: self.availability)
         (props,) = call(self.client, tray.bus_name, "/StatusNotifierItem", "org.freedesktop.DBus.Properties",
                         "GetAll", GLib.Variant("(s)", (SNI,)))
         self.assertEqual(props["Category"], "ApplicationStatus")
@@ -633,17 +968,32 @@ class TrayTests(unittest.TestCase):
                          "Get", GLib.Variant("(ss)", (SNI, "Status")))
         self.assertEqual(status, "NeedsAttention")
         _, layout = self.layout(tray)
-        self.assertIn("⚠ Inconsistente — Corrigir", [p.get("label") for _, p in walk(layout)])
+        self.assertIn("Corrigir…", [p.get("label") for _, p in walk(layout)])
+
+    def test_verification_problems_mark_the_icon(self):
+        """AppDelegate.swift:59: the orange dot follows `consistency`, i.e. the report's problems."""
+        FakeWatcher(self)
+        tray = self.start_tray()
+        self.model.verification = report("ok", "warning")
+        self.model.notify()
+        (status,) = call(self.client, tray.bus_name, "/StatusNotifierItem", "org.freedesktop.DBus.Properties",
+                         "Get", GLib.Variant("(ss)", (SNI, "Status")))
+        self.assertEqual(status, "Active")
+        self.model.verification = report("ok", "error")
+        self.model.notify()
+        (status,) = call(self.client, tray.bus_name, "/StatusNotifierItem", "org.freedesktop.DBus.Properties",
+                         "Get", GLib.Variant("(ss)", (SNI, "Status")))
+        self.assertEqual(status, "NeedsAttention")
+        _, layout = self.layout(tray)
+        self.assertIn("Identidade do git sobrescrita 2", shown(layout[2]))
 
     def test_without_a_watcher_the_tray_is_unavailable(self):
         tray = self.start_tray()
-        spin_until(lambda: self.availability)
         self.assertEqual(self.availability, [False])
         self.assertFalse(tray.available)
 
     def test_registers_again_when_a_watcher_appears_later(self):
         tray = self.start_tray()
-        spin_until(lambda: self.availability)
         watcher = FakeWatcher(self)
         spin_until(lambda: watcher.registrations and tray.available)
         self.assertEqual(self.availability, [False, True])
@@ -744,6 +1094,36 @@ class TrayAppTests(unittest.TestCase):
         self.assertFalse(seen.get("banner"))
         self.assertTrue(seen.get("still_running"))
         self.assertFalse(seen.get("visible_after_close"))
+
+    def test_tray_logins_open_the_login_page_in_the_window(self):
+        """"Login da pasta · Entrar…" in the tray (Mac :155-168) lands on the window's
+        "Entrar no Claude" page, not just the Claude page."""
+        FakeWatcher(self)
+        folder = str(self.sandbox / ".claude")
+        seen = {}
+
+        def drive(app):
+            if app.tray_available is None:
+                return True
+            app.tray._login("folder", folder)
+            GLib.timeout_add(200, after_login, app)
+            return False
+
+        def after_login(app):
+            from multicred.ui.pages.claude import ClaudeFolderLoginPage
+            page = app.window.nav.get_visible_page() if app.window else None
+            seen["visible"] = app.window is not None and app.window.get_visible()
+            seen["page"] = type(page).__name__
+            seen["section"] = app.window.current_section if app.window else None
+            if isinstance(page, ClaudeFolderLoginPage):
+                app.window.nav.pop()  # leaving the page stops the (simulated) login
+            app.quit()
+            return False
+
+        self.run_app(drive)
+        self.assertTrue(seen.get("visible"))
+        self.assertEqual(seen.get("section"), "claude")
+        self.assertEqual(seen.get("page"), "ClaudeFolderLoginPage")
 
 
 if __name__ == "__main__":

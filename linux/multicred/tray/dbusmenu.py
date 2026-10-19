@@ -4,11 +4,16 @@ Every rebuild bumps the revision and emits LayoutUpdated; panels then call
 GetLayout again. Item ids stay the same across rebuilds for the same item (same
 parent, label and action), so a click that races a rebuild still hits the item the
 user saw, or no item at all.
+
+AboutToShow on the root is how the app learns the menu is opening (the Mac's
+menuNeedsUpdate): `on_about_to_show(id)` refreshes in the background, and the new
+layout follows with LayoutUpdated, so the answer is always "no update needed".
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable
 
 from gi.repository import Gio, GLib
@@ -18,6 +23,9 @@ from .menu_model import MenuItem
 INTERFACE = "com.canonical.dbusmenu"
 PATH = "/MenuBar"
 UNKNOWN_ID = "com.canonical.dbusmenu.Error.UnknownId"
+# The app's own symbolic icons (multicred-branch/code/sparkle-symbolic), as an icon-theme
+# search path for `icon-name` (the window loads the same directory, ui/widgets.py).
+ICON_THEME_PATH = str(Path(__file__).resolve().parent.parent / "ui" / "icons")
 
 XML = """<node><interface name="com.canonical.dbusmenu">
   <method name="GetLayout">
@@ -59,7 +67,7 @@ XML = """<node><interface name="com.canonical.dbusmenu">
 </interface></node>"""
 
 _TYPES = {"label": "s", "enabled": "b", "visible": "b", "type": "s", "toggle-type": "s", "toggle-state": "i",
-          "children-display": "s", "icon-data": "ay"}
+          "children-display": "s", "icon-data": "ay", "icon-name": "s", "shortcut": "aas"}
 
 
 @dataclass
@@ -81,17 +89,23 @@ def properties(item: MenuItem | None) -> dict:
     if item.toggle:
         props["toggle-type"] = item.toggle
         props["toggle-state"] = 1 if item.toggled else 0
+    if item.icon_name:
+        props["icon-name"] = item.icon_name
     if item.icon_png:
         props["icon-data"] = item.icon_png
+    if item.shortcut:
+        props["shortcut"] = [list(item.shortcut)]
     if item.children:
         props["children-display"] = "submenu"
     return props
 
 
 class DBusMenuServer:
-    def __init__(self, connection: Gio.DBusConnection, on_click: Callable[[tuple], None], path: str = PATH):
+    def __init__(self, connection: Gio.DBusConnection, on_click: Callable[[tuple], None], path: str = PATH,
+                 on_about_to_show: Callable[[int], None] | None = None):
         self.connection = connection
         self.on_click = on_click
+        self.on_about_to_show = on_about_to_show
         self.path = path
         self.revision = 0
         self._nodes: dict[int, _Node] = {0: _Node(None)}
@@ -184,10 +198,16 @@ class DBusMenuServer:
                 if item_id in self._nodes:
                     self._event(item_id, event)
         elif method == "AboutToShow":
+            item_id = args[0]
+            if item_id not in self._nodes:
+                return invocation.return_dbus_error(UNKNOWN_ID, f"unknown id {item_id}")
             invocation.return_value(GLib.Variant("(b)", (False,)))
+            self._about_to_show([item_id])
         elif method == "AboutToShowGroup":
-            errors = [i for i in args[0] if i not in self._nodes]
+            ids = args[0]
+            errors = [i for i in ids if i not in self._nodes]
             invocation.return_value(GLib.Variant("(aiai)", ([], errors)))
+            self._about_to_show([i for i in ids if i in self._nodes])
         else:
             invocation.return_dbus_error("org.freedesktop.DBus.Error.UnknownMethod", method)
 
@@ -196,10 +216,15 @@ class DBusMenuServer:
         if event == "clicked" and item is not None and item.enabled and item.action is not None:
             self.on_click(item.action)
 
+    def _about_to_show(self, ids):
+        if self.on_about_to_show is not None:
+            for item_id in ids:
+                self.on_about_to_show(item_id)
+
     def _property(self, connection, sender, path, interface, name):
         return {
             "Version": GLib.Variant("u", 3),
             "TextDirection": GLib.Variant("s", "ltr"),
             "Status": GLib.Variant("s", "normal"),
-            "IconThemePath": GLib.Variant("as", []),
+            "IconThemePath": GLib.Variant("as", [ICON_THEME_PATH]),
         }.get(name)

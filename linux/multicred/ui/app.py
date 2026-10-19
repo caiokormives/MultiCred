@@ -73,6 +73,11 @@ class MultiCredApplication(Adw.Application):
         self.present_window()
         self.window.open_page(page)
 
+    def open_login(self, kind: str, target) -> None:
+        """A login page from the tray: ("folder", config_dir) or ("login", account)."""
+        self.present_window()
+        self.window.on_login_requested(kind, target)
+
     def show_error(self, title: str, message: str) -> None:
         """A toast in the window when it is on screen; a desktop notification otherwise
         (a switch from the tray must not pop the window open)."""
@@ -101,7 +106,7 @@ class MultiCredApplication(Adw.Application):
         # Held until the watcher answers, so a --background launch does not exit at once.
         self._hold()
         self.tray = TrayController(self.model, on_open=self.open_page, on_quit=self.quit, on_error=self.show_error,
-                                   on_availability=self._tray_availability_changed)
+                                   on_availability=self._tray_availability_changed, on_login=self.open_login)
         try:
             self.tray.start()
         except GLib.Error:  # no session bus at all
