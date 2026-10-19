@@ -98,6 +98,9 @@ class OnboardingUITests(unittest.TestCase):
             seen["main_shown"] = app.window.view.get_content() is app.window.page
             seen["rows"] = [row.get_title() for row in app.window.rows]
             seen["toast"] = app.window.last_toast
+            visible = app.window.nav.get_visible_page()
+            seen["opened"] = (visible.get_title(), getattr(visible, "draft", None) and visible.draft.name,
+                              app.window.selected_sidebar_key() == f"profile:{model.state.profile_id}")
             app.quit()
             return False
 
@@ -115,6 +118,8 @@ class OnboardingUITests(unittest.TestCase):
         self.assertTrue(seen.get("main_shown"), "the normal window content comes back")
         self.assertEqual(seen.get("rows"), ["Trabalho"])
         self.assertEqual(seen.get("toast"), "Perfil Trabalho ativo")
+        self.assertEqual(seen.get("opened"), ("Editar perfil", "Trabalho", True),
+                         "like the Mac, setup ends on the active profile's editor")
 
         bashrc = (self.sandbox / ".bashrc").read_text()
         self.assertTrue(bashrc.startswith("export KEEP=yes\n\n# >>> MultiCred >>>\n"), bashrc)

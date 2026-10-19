@@ -1,6 +1,8 @@
-"""Perfis (approved Linux design A + extras): the active profile's card, "Trocar só a conta
-Claude", the other profiles with Ctrl+N and Ativar, "+ Novo perfil", and the Verificar
-footer. Rebuilt from the model on every change (it is small)."""
+"""Visão geral (approved Linux design A; a Linux extra the Mac does not have, kept by the
+user's decision at the top of the sidebar's Perfis section): the active profile's card,
+"Trocar só a conta Claude", the other profiles with Ctrl+N and Ativar, "+ Novo perfil",
+and the Verificar footer. Clicking a profile row opens its editor, as the Mac sidebar
+does; only "Ativar" switches. Rebuilt from the model on every change (it is small)."""
 
 from __future__ import annotations
 
@@ -17,10 +19,12 @@ from ..widgets import escape  # noqa: E402
 
 class ProfilesPage(Adw.NavigationPage):
     def __init__(self, window):
-        super().__init__(title="Perfis", tag="main")
+        super().__init__(title="Visão geral", tag="main")
         self.window, self.model = window, window.model
         self.rows: list[Adw.ActionRow] = []
         self.other_rows: list[Adw.ActionRow] = []
+        # The "Ativar" button of each other profile, by profile id.
+        self.activate_buttons: dict = {}
         self.hero_row: Adw.ActionRow | None = None
         self.detail_rows: dict[str, Adw.ActionRow] = {}
         self.claude_only_row: Adw.ComboRow | None = None
@@ -71,6 +75,7 @@ class ProfilesPage(Adw.NavigationPage):
             self.box.remove(child)
             child = self.box.get_first_child()
         self.rows, self.other_rows, self.hero_row, self.detail_rows = [], [], None, {}
+        self.activate_buttons = {}
         self.claude_only_row = None
         self._refresh_footer()
         config = self.model.config
@@ -115,13 +120,12 @@ class ProfilesPage(Adw.NavigationPage):
         hero = Adw.ActionRow(title=escape(profile.name), subtitle=f"Ativo desde {since}" if since else "Ativo",
                              activatable=False)
         hero.add_css_class("mc-hero")
-        hero.add_prefix(widgets.avatar(profile.icon.value if profile.icon else profile.name, profile.color, 64))
+        hero.add_prefix(widgets.avatar(widgets.profile_letter(profile), profile.color, 64))
         if self.model.inconsistent or self._verification_has_problems():
             hero.add_suffix(widgets.pill("● Inconsistente", "warning"))
         else:
             hero.add_suffix(widgets.pill("● Tudo certo", "ok"))
         hero.add_suffix(widgets.button("Editar", lambda: self.window.show_profile_editor(profile.id)))
-        hero.connect("activated", self.window.on_profile, profile.id)
         card.append(hero)
         self.hero_row = hero
 
@@ -185,15 +189,16 @@ class ProfilesPage(Adw.NavigationPage):
             parts.append(escape(github.username))
         if self.model.needs_claude_login(profile):
             parts.append("<span foreground='#D9770B' weight='bold'>⚠ Entrar no Claude</span>")
-        row = Adw.ActionRow(title=escape(profile.name), subtitle=" · ".join(parts),
-                            activatable=not self.model.switching)
-        row.add_prefix(widgets.avatar(profile.icon.value if profile.icon else profile.name, profile.color, 40))
+        row = Adw.ActionRow(title=escape(profile.name), subtitle=" · ".join(parts), activatable=True)
+        row.add_prefix(widgets.avatar(widgets.profile_letter(profile), profile.color, 40))
         if index < 9:
             row.add_suffix(widgets.kbd(f"Ctrl+{index + 1}"))
         activate = widgets.button("Ativar", lambda: self.window.on_profile(None, profile.id))
         activate.set_sensitive(not self.model.switching)
         row.add_suffix(activate)
-        row.connect("activated", self.window.on_profile, profile.id)
+        self.activate_buttons[profile.id] = activate
+        # Like the Mac sidebar: a click opens the profile, never switches (B2).
+        row.connect("activated", lambda *_: self.window.show_profile_editor(profile.id))
         return row
 
     def _verification_has_problems(self) -> bool:

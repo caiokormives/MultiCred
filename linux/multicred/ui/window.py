@@ -1,40 +1,83 @@
-"""The single main window (D31, approved Linux design A): sidebar + pages with back navigation.
+"""The single main window (D31): sidebar + pages with back navigation, structured like the Mac.
 
-Adw.NavigationSplitView with the sections Perfis, Contas, Verificar and Ajustes; each
-section is the root of an Adw.NavigationView, and sub-pages (profile editor, account
-editors) are pushed on it. Before setup, the 3-step onboarding (S-05) replaces the
-whole content in this same window.
+The sidebar follows `MainWindowView.swift:35-100`: section "Perfis" (one row per profile
+with its 20 px badge and a gray ✓ on the active one, then "Novo perfil"), "Contas" (Git,
+GitHub, Claude, Chaves de API with a gray count and an orange ⚠ by the Mac rule) and
+"Sistema" (Verificar with a green/orange dot once something was verified, Ajustes).
+Linux extra (user decision): "Visão geral", the dashboard of `pages/profiles.py`, heads
+the Perfis section and is the start page; without profiles the start page is Claude, as
+on the Mac. Clicking a profile opens its editor and never switches (the editor's and the
+dashboard's buttons do). Before setup, the onboarding replaces the whole content.
 
 Pages are built from `PAGE_FACTORIES` (name → callable(window) returning a widget), so
-the tray's `open_page(name)` and later slices can add pages without touching the
-navigation: S-08/S-09 replace the "verify"/"settings" placeholders with
-`PAGE_FACTORIES["verify"] = lambda window: VerifyPage(...)`. A factory may return
-an Adw.NavigationPage or any widget (it is then wrapped with a header bar).
+the tray's `open_page(name)` and later slices can replace a page without touching the
+navigation (S-02/S-03: `PAGE_FACTORIES["git"] = lambda window: GitAccountsPage(window)`).
+A factory may return an Adw.NavigationPage or any widget (it is then wrapped with a
+header bar). Sub-pages (editors) are pushed on the content's Adw.NavigationView.
 """
 
 from __future__ import annotations
 
+import uuid
+from dataclasses import dataclass
 from typing import Callable
 
 import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
+gi.require_version("Pango", "1.0")
+from gi.repository import Adw, Gio, GLib, Gtk, Pango  # noqa: E402
 
+from ..core.models import ProfileColor  # noqa: E402
 from . import widgets  # noqa: E402
 
 NO_TRAY_TEXT = ("Sem área de ícones: no Ubuntu, ative a extensão AppIndicator; "
                 "no Pop!_OS, o painel do COSMIC já mostra ícones")
 
-# Sidebar order: (name, title, icon).
-SECTIONS = (
-    ("main", "Perfis", "avatar-default-symbolic"),
-    ("accounts", "Contas", "dialog-password-symbolic"),
-    ("verify", "Verificar", "object-select-symbolic"),
-    ("settings", "Ajustes", "emblem-system-symbolic"),
-)
-SECTION_TITLES = {name: title for name, title, _icon in SECTIONS}
+# Navigation titles of the section pages (Mac: the root pages' navigationTitle).
+SECTION_TITLES = {
+    "main": "Visão geral", "git": "Git", "github": "GitHub", "claude": "Claude", "keys": "Chaves de API",
+    "verify": "Verificar", "settings": "Ajustes",
+}
+# Page names the tray menu uses: "Contas…" opens Claude, as on the Mac.
+PAGE_ALIASES = {"accounts": "claude"}
+# Until S-02/S-03 give each kind of account its own page, the four Contas entries share
+# the tabbed AccountsPage: entry name → its tab.
+ACCOUNT_TABS = {"git": "git", "github": "github", "claude": "claude", "keys": "keys"}
+
+# SF Symbols of the Mac sidebar → icon names (inventory B1). branch, </> and sparkle do
+# not exist in Adwaita: they are the app's own symbolic SVGs (widgets.load_icons).
+ICONS = {
+    "overview": "view-grid-symbolic",          # Linux extra
+    "new-profile": "list-add-symbolic",        # plus
+    "git": "multicred-branch-symbolic",        # arrow.triangle.branch
+    "github": "multicred-code-symbolic",       # chevron.left.forwardslash.chevron.right
+    "claude": "multicred-sparkle-symbolic",    # sparkle
+    "keys": "dialog-password-symbolic",        # key
+    "verify": "security-high-symbolic",        # checkmark.shield
+    "settings": "emblem-system-symbolic",      # gearshape
+}
+
+
+@dataclass(frozen=True)
+class SidebarItem:
+    """One sidebar row as plain data: the rows are rebuilt only when these change."""
+
+    # "overview", "profile:<UUID>", "new-profile", "git", "github", "claude", "keys",
+    # "verify" or "settings".
+    key: str
+    section: str  # "Perfis" | "Contas" | "Sistema"
+    title: str
+    icon: str | None = None
+    # Profiles show their badge (letter on the profile color) instead of an icon.
+    letter: str | None = None
+    color: str | None = None
+    active: bool = False
+    count: int | None = None
+    warning: bool = False
+    # Verificar: None before the first verification, then "ok" or "warning".
+    dot: str | None = None
 
 
 def _profiles_page(window):
@@ -42,9 +85,8 @@ def _profiles_page(window):
     return ProfilesPage(window)
 
 
-def _accounts_page(window):
-    from .pages.accounts import AccountsPage
-    return AccountsPage(window)
+def _accounts_entry(window):
+    return window.accounts_page
 
 
 def _verify_page(window):
@@ -68,7 +110,10 @@ def placeholder_page(title: str, icon: str, description: str) -> Adw.StatusPage:
 # name → callable(window) returning the section's root widget.
 PAGE_FACTORIES: dict[str, Callable] = {
     "main": _profiles_page,
-    "accounts": _accounts_page,
+    "git": _accounts_entry,
+    "github": _accounts_entry,
+    "claude": _accounts_entry,
+    "keys": _accounts_entry,
     "verify": _verify_page,
     "settings": _settings_page,
 }
@@ -76,14 +121,20 @@ PAGE_FACTORIES: dict[str, Callable] = {
 # Pages opened on top of a section: name → (section, callable(window)).
 PUSHED_PAGES: dict[str, tuple[str, Callable]] = {
     "new-profile": ("main", lambda window: window.show_profile_editor(None)),
-    "add-claude": ("accounts", lambda window: window.accounts_page.request_login("add", None, tab="claude")),
+    "add-claude": ("claude", lambda window: window.accounts_page.request_login("add", None, tab="claude")),
 }
+
+
+def _section_key(section: str) -> str:
+    """The sidebar row of a section's root page."""
+    return "overview" if section == "main" else section
 
 
 class MainWindow(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="MultiCred", default_width=1000, default_height=700)
         widgets.load_css()
+        widgets.load_icons()
         self.model = app.model
         self.last_toast = None
         # Login flows (S-07) opened from Contas, the tray or the profile page.
@@ -104,11 +155,13 @@ class MainWindow(Adw.ApplicationWindow):
         view.add_top_bar(self.tray_banner)
         self.onboarding = None
         self._section_pages: dict[str, Adw.NavigationPage] = {}
+        self._accounts_page = None
         self.current_section: str | None = None
         self._selecting = False
 
         self.nav = Adw.NavigationView()
-        self.content_page = Adw.NavigationPage(title="Perfis", child=self.nav)
+        self.nav.connect("notify::visible-page", lambda *_: self._sync_sidebar_selection())
+        self.content_page = Adw.NavigationPage(title="Visão geral", child=self.nav)
         self.split = Adw.NavigationSplitView(sidebar=self._build_sidebar(), content=self.content_page,
                                              min_sidebar_width=200, max_sidebar_width=260)
         # The normal content of the window (the onboarding swaps it out and back). No
@@ -122,7 +175,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._install_actions(app)
         self.model.add_listener(self.refresh)
         self.connect("close-request", self.on_close_request)
-        self.show_section("main")
+        self.show_section(self.start_section())
         if self.model.config is not None:
             self.model.refresh_claude_statuses()
             self.model.load_folder_summaries()
@@ -134,23 +187,12 @@ class MainWindow(Adw.ApplicationWindow):
     def _build_sidebar(self) -> Adw.NavigationPage:
         self.sidebar = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
         self.sidebar.add_css_class("navigation-sidebar")
+        self.sidebar.set_header_func(self._sidebar_header)
         self.sidebar_rows: dict[str, Gtk.ListBoxRow] = {}
-        self.verify_badge = widgets.label("", "mc-sidebar-badge", xalign=0.5)
-        self.verify_badge.set_visible(False)
-        for name, title, icon in SECTIONS:
-            box = Gtk.Box(spacing=12, margin_top=4, margin_bottom=4, margin_start=4, margin_end=4)
-            box.append(Gtk.Image.new_from_icon_name(icon))
-            box.append(widgets.label(title))
-            if name == "verify":
-                spacer = Gtk.Box(hexpand=True)
-                box.append(spacer)
-                box.append(self.verify_badge)
-            row = Gtk.ListBoxRow(child=box)
-            row.section = name
-            row.title = title
-            self.sidebar.append(row)
-            self.sidebar_rows[name] = row
+        self._sidebar_items: list[SidebarItem] | None = None
         self.sidebar.connect("row-selected", self._sidebar_selected)
+        self.sidebar.connect("row-activated", self._sidebar_activated)
+        self._rebuild_sidebar()
 
         menu = Gio.Menu()
         menu.append("Configurar de novo…", "win.onboarding")
@@ -163,16 +205,187 @@ class MainWindow(Adw.ApplicationWindow):
         view.set_content(Gtk.ScrolledWindow(child=self.sidebar, hscrollbar_policy=Gtk.PolicyType.NEVER))
         return Adw.NavigationPage(title="MultiCred", child=view)
 
+    def sidebar_model(self) -> list[SidebarItem]:
+        """The rows, in the Mac's order, with counts and warnings by the Mac rule
+        (MainWindowView.swift:37-72)."""
+        model, config = self.model, self.model.config
+        profiles = config.profiles if config is not None else []
+        items = [SidebarItem("overview", "Perfis", "Visão geral", icon=ICONS["overview"])]
+        for profile in profiles:
+            items.append(SidebarItem(f"profile:{profile.id}", "Perfis", profile.name,
+                                     letter=widgets.profile_letter(profile), color=profile.color.value,
+                                     active=profile.id == model.state.profile_id))
+        items.append(SidebarItem("new-profile", "Perfis", "Novo perfil", icon=ICONS["new-profile"]))
+        if config is not None:
+            counts = {"git": len(config.git_identities), "github": len(config.github_accounts),
+                      "claude": len(config.claude_accounts), "keys": len(config.api_keys)}
+            warnings = {
+                "git": False,
+                # Only logins gh knows and cannot use (an account gh never saw is not flagged).
+                "github": any(login is not None and not login.is_usable
+                              for login in map(model.github_login_for, config.github_accounts)),
+                # The profiles, not every account: an unused account without token is no warning.
+                "claude": any(model.needs_claude_login(profile) for profile in profiles),
+                "keys": any(not model.has_secret(key) for key in config.api_keys),
+            }
+        else:
+            counts, warnings = dict.fromkeys(ACCOUNT_TABS, 0), dict.fromkeys(ACCOUNT_TABS, False)
+        for key, title in (("git", "Git"), ("github", "GitHub"), ("claude", "Claude"), ("keys", "Chaves de API")):
+            items.append(SidebarItem(key, "Contas", title, icon=ICONS[key], count=counts[key],
+                                     warning=warnings[key]))
+        report = model.verification
+        dot = None if report is None else ("warning" if report.problems else "ok")
+        items.append(SidebarItem("verify", "Sistema", "Verificar", icon=ICONS["verify"], dot=dot))
+        items.append(SidebarItem("settings", "Sistema", "Ajustes", icon=ICONS["settings"]))
+        return items
+
+    def _rebuild_sidebar(self) -> None:
+        items = self.sidebar_model()
+        if items == self._sidebar_items:
+            return
+        self._sidebar_items = items
+        self._selecting = True
+        try:
+            self.sidebar.remove_all()
+            self.sidebar_rows = {}
+            for item in items:
+                row = self._make_sidebar_row(item)
+                self.sidebar.append(row)
+                self.sidebar_rows[item.key] = row
+        finally:
+            self._selecting = False
+        self._sync_sidebar_selection()
+
+    def _make_sidebar_row(self, item: SidebarItem) -> Gtk.ListBoxRow:
+        box = Gtk.Box(spacing=10, margin_top=2, margin_bottom=2, margin_start=2, margin_end=2)
+        row = Gtk.ListBoxRow(child=box)
+        row.item, row.title = item, item.title
+        row.avatar = row.count_label = row.warning_icon = row.check_icon = row.dot = None
+        row.dot_state = item.dot
+        if item.letter is not None:
+            row.avatar = widgets.avatar(item.letter, ProfileColor(item.color), 20)
+            row.avatar.update_state([Gtk.AccessibleState.HIDDEN], [True])  # Mac: accessibilityHidden
+            box.append(row.avatar)
+        else:
+            box.append(Gtk.Image.new_from_icon_name(item.icon))
+        title = widgets.label(item.title)
+        title.set_hexpand(True)
+        title.set_ellipsize(Pango.EllipsizeMode.END)
+        box.append(title)
+        if item.active:
+            row.check_icon = self._badge_icon("object-select-symbolic", "mc-sidebar-check", "ativo")
+            box.append(row.check_icon)
+        if item.count is not None:
+            row.count_label = widgets.label(str(item.count), "mc-sidebar-count")
+            box.append(row.count_label)
+        if item.warning:
+            row.warning_icon = self._badge_icon("dialog-warning-symbolic", "mc-sidebar-warning",
+                                                "precisa de atenção")
+            box.append(row.warning_icon)
+        if item.dot is not None:
+            row.dot = Gtk.Box(valign=Gtk.Align.CENTER, halign=Gtk.Align.CENTER,
+                              tooltip_text="tudo certo" if item.dot == "ok" else "inconsistente")
+            row.dot.add_css_class("mc-sidebar-dot")
+            row.dot.add_css_class(item.dot)
+            row.dot.update_property([Gtk.AccessibleProperty.LABEL], [row.dot.get_tooltip_text()])
+            box.append(row.dot)
+        return row
+
+    @staticmethod
+    def _badge_icon(name: str, css: str, description: str) -> Gtk.Image:
+        image = Gtk.Image(icon_name=name, pixel_size=12, tooltip_text=description, valign=Gtk.Align.CENTER)
+        image.add_css_class(css)
+        image.update_property([Gtk.AccessibleProperty.LABEL], [description])
+        return image
+
+    @staticmethod
+    def _sidebar_header(row, before) -> None:
+        if before is None or before.item.section != row.item.section:
+            if row.get_header() is None or row.get_header().get_label() != row.item.section:
+                row.set_header(widgets.label(row.item.section, "mc-sidebar-heading"))
+        elif row.get_header() is not None:
+            row.set_header(None)
+
+    def sidebar_sections(self) -> list[tuple[str, list[str]]]:
+        """[(section, [row titles])] in sidebar order (tests, screenshots)."""
+        sections: list[tuple[str, list[str]]] = []
+        for item in self._sidebar_items or []:
+            if not sections or sections[-1][0] != item.section:
+                sections.append((item.section, []))
+            sections[-1][1].append(item.title)
+        return sections
+
     def sidebar_titles(self) -> list[str]:
-        return [row.title for row in self.sidebar_rows.values()]
+        return [item.title for item in self._sidebar_items or []]
+
+    def sidebar_row(self, key: str) -> Gtk.ListBoxRow | None:
+        return self.sidebar_rows.get(key)
+
+    def selected_sidebar_key(self) -> str | None:
+        row = self.sidebar.get_selected_row()
+        return row.item.key if row is not None else None
+
+    def _select_sidebar(self, key: str | None) -> None:
+        row = self.sidebar_rows.get(key) if key is not None else None
+        if row is None or self.sidebar.get_selected_row() is row:
+            return
+        self._selecting = True
+        try:
+            self.sidebar.select_row(row)
+        finally:
+            self._selecting = False
+
+    def _visible_key(self) -> str | None:
+        """The row that matches what the content shows: a profile's editor, or a section root.
+        None for other pushed pages (an account editor keeps its entry selected)."""
+        page = self.nav.get_visible_page()
+        if page is None:
+            return None
+        if hasattr(page, "draft") and hasattr(page, "is_new"):  # ProfileEditorPage
+            return "new-profile" if page.is_new else f"profile:{page.draft.id}"
+        if self.current_section is not None and page is self._section_pages.get(self.current_section):
+            return _section_key(self.current_section)
+        return None
+
+    def _sync_sidebar_selection(self) -> None:
+        if not hasattr(self, "sidebar_rows"):
+            return
+        key = self._visible_key()
+        if key is not None and key.startswith("profile:") and key not in self.sidebar_rows:
+            # The profile on screen no longer exists: back to the start page.
+            self.show_section(self.start_section())
+            return
+        self._select_sidebar(key)
 
     def _sidebar_selected(self, _listbox, row) -> None:
         if row is None or self._selecting:
             return
-        self.show_section(row.section)
+        self._navigate(row.item.key)
         self.split.set_show_content(True)
 
+    def _sidebar_activated(self, _listbox, row) -> None:
+        """A click on the row already selected: back to its page from one of its sub-pages,
+        and to the content when the split view is collapsed."""
+        if self._selecting or row is not self.sidebar.get_selected_row():
+            return
+        if self._visible_key() != row.item.key:
+            self._navigate(row.item.key)
+        self.split.set_show_content(True)
+
+    def _navigate(self, key: str) -> None:
+        if key.startswith("profile:"):
+            self.show_profile_editor(uuid.UUID(key.removeprefix("profile:")))
+        elif key == "new-profile":
+            self.show_profile_editor(None)
+        else:
+            self.show_section("main" if key == "overview" else key)
+
     # MARK: navigation
+
+    def start_section(self) -> str:
+        """Visão geral (Linux extra) when there are profiles; Claude otherwise, as on the Mac."""
+        config = self.model.config
+        return "main" if config is not None and config.profiles else "claude"
 
     def _section_page(self, name: str) -> Adw.NavigationPage:
         page = self._section_pages.get(name)
@@ -182,20 +395,21 @@ class MainWindow(Adw.ApplicationWindow):
                 page = widget
             else:
                 page, _header = widgets.page(SECTION_TITLES.get(name, name), widget)
-            page.set_tag(name)
+            if page.get_tag() is None:
+                page.set_tag(name)
             self._section_pages[name] = page
         return page
 
     def show_section(self, name: str) -> Adw.NavigationPage:
         page = self._section_page(name)
-        self.nav.replace([page])
         self.current_section = name
+        tab = ACCOUNT_TABS.get(name)
+        if tab is not None and hasattr(page, "select_tab"):
+            page.select_tab(tab)
+            page.set_title(SECTION_TITLES[name])
+        self.nav.replace([page])
         self.content_page.set_title(SECTION_TITLES.get(name, page.get_title()))
-        row = self.sidebar_rows.get(name)
-        if row is not None and self.sidebar.get_selected_row() is not row:
-            self._selecting = True
-            self.sidebar.select_row(row)
-            self._selecting = False
+        self._select_sidebar(_section_key(name))
         if hasattr(page, "refresh"):
             page.refresh()
         return page
@@ -207,6 +421,7 @@ class MainWindow(Adw.ApplicationWindow):
             return
         if self.onboarding is not None:
             return  # setup first; the tray can bring the page back afterwards
+        name = PAGE_ALIASES.get(name, name)
         if name in PUSHED_PAGES:
             section, opener = PUSHED_PAGES[name]
             self.show_section(section)
@@ -228,14 +443,20 @@ class MainWindow(Adw.ApplicationWindow):
 
     @property
     def accounts_page(self):
-        return self._section_page("accounts")
+        """The tabbed Contas page shared by the Git/GitHub/Claude/Chaves entries (until S-02/S-03)."""
+        if self._accounts_page is None:
+            from .pages.accounts import AccountsPage
+            self._accounts_page = AccountsPage(self)
+        return self._accounts_page
 
     @property
     def rows(self):
-        """Profile rows of the Perfis page, in configuration order."""
+        """Profile rows of the Visão geral dashboard, in configuration order."""
         return self.profiles_page.rows
 
     def show_profile_editor(self, profile_id):
+        """A profile's editor (None = new profile), pushed over Visão geral: opening it never
+        switches; its back button returns to the dashboard."""
         from .pages.profile_editor import ProfileEditorPage
         if self.current_section != "main":
             self.show_section("main")
@@ -412,16 +633,9 @@ class MainWindow(Adw.ApplicationWindow):
         return False
 
     def refresh(self) -> None:
-        report = self.model.verification
-        if report is not None:
-            ok, total = report.ok_count, report.total
-            self.verify_badge.set_label(f"{ok}/{total}")
-            if ok < total:
-                self.verify_badge.add_css_class("warning")
-            else:
-                self.verify_badge.remove_css_class("warning")
-        self.verify_badge.set_visible(report is not None)
-        for page in list(self._section_pages.values()):
+        self._rebuild_sidebar()
+        # The four Contas entries share one page: refresh each page once.
+        for page in {id(p): p for p in self._section_pages.values()}.values():
             if (hasattr(page, "refresh") and page.get_parent() is not None
                     and getattr(page, "refresh_on_notify", True)):
                 page.refresh()
@@ -445,10 +659,14 @@ class MainWindow(Adw.ApplicationWindow):
         self.view.set_content(self.page)
         self.header.set_visible(False)
         self.header.set_title_widget(None)
-        self.show_section("main")
+        profile = self.model.active_profile
+        # Mac (MainWindowView.swift:24): the active profile's editor, or Claude without one.
+        if profile is not None:
+            self.show_profile_editor(profile.id)
+        else:
+            self.show_section("claude")
         self.model.refresh_claude_statuses()
         self.model.load_folder_summaries()
-        profile = self.model.active_profile
         if error is not None:
             self.show_toast(f"MultiCred configurado, mas não consegui ativar o perfil: {error}")
         elif profile is not None:

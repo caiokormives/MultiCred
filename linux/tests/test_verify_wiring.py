@@ -1,4 +1,4 @@
-"""Verificar plugged into the window: the real page, the sidebar badge and the Perfis footer.
+"""Verificar plugged into the window: the real page, the sidebar dot and the Visão geral footer.
 
 Runs only under tests/run-ui-tests.sh (private Xvfb display and private bus).
 """
@@ -50,7 +50,7 @@ class VerifyWiringTests(unittest.TestCase):
         app.run([])
         return app
 
-    def test_verify_page_feeds_the_badge_and_the_footer_without_looping(self):
+    def test_verify_page_feeds_the_dot_and_the_footer_without_looping(self):
         from multicred.ui.pages.verify import VerifyPage
         seen = {}
 
@@ -71,9 +71,8 @@ class VerifyWiringTests(unittest.TestCase):
                 if self.model.verification is None:
                     return True
                 report = self.model.verification
-                seen["badge"] = window.verify_badge.get_label()
-                seen["badge_visible"] = window.verify_badge.get_visible()
-                seen["expected"] = f"{report.ok_count}/{report.total}"
+                seen["dot"] = window.sidebar_row("verify").dot_state
+                seen["expected"] = "warning" if report.problems else "ok"
                 window.show_section("main")
                 profiles = window._section_pages["main"]
                 seen["footer"] = profiles.footer_label.get_label()
@@ -95,8 +94,8 @@ class VerifyWiringTests(unittest.TestCase):
 
         self.run_app(drive)
         self.assertTrue(seen.get("is_verify_page"), "the Verificar section is the real VerifyPage")
-        self.assertTrue(seen.get("badge_visible"))
-        self.assertEqual(seen.get("badge"), seen.get("expected"))
+        self.assertIsNotNone(seen.get("dot"), "the sidebar's Verificar dot shows once verified")
+        self.assertEqual(seen.get("dot"), seen.get("expected"))
         self.assertEqual(seen.get("footer"), seen.get("footer_expected"))
         self.assertEqual(seen.get("extra_runs"), 0)
 

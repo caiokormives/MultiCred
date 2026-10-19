@@ -7,6 +7,7 @@ stays language-neutral; UserMessages.swift is the Mac counterpart).
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Callable
 
 import gi
@@ -46,9 +47,15 @@ row.mc-detail, row.mc-detail > box.header { min-height: 38px; padding-top: 0; pa
 .mc-dot { min-width: 8px; min-height: 8px; border-radius: 4px; background: alpha(currentColor, 0.3); }
 .mc-dot.ok { background: @success_color; }
 .mc-dot.warning { background: @warning_color; }
-.mc-sidebar-badge { border-radius: 999px; padding: 0 7px; font-size: 11px; font-weight: bold;
-                    background: alpha(@success_color, 0.15); color: @success_color; }
-.mc-sidebar-badge.warning { background: alpha(@warning_color, 0.18); color: @warning_color; }
+.mc-avatar-20 { min-width: 20px; min-height: 20px; border-radius: 5px; font-size: 11px; }
+.mc-sidebar-heading { font-size: 11px; font-weight: bold; color: alpha(currentColor, 0.55);
+                      margin: 12px 10px 4px 10px; }
+.mc-sidebar-count { color: alpha(currentColor, 0.55); font-feature-settings: "tnum"; }
+.mc-sidebar-check { color: alpha(currentColor, 0.55); }
+.mc-sidebar-warning { color: @orange_3; }
+.mc-sidebar-dot { min-width: 7px; min-height: 7px; border-radius: 4px; }
+.mc-sidebar-dot.ok { background: @green_4; }
+.mc-sidebar-dot.warning { background: @orange_3; }
 .mc-preview { background: rgba(20, 20, 22, 0.92); color: #eeeeee; border-radius: 8px; padding: 6px 12px;
               font-size: 12px; }
 .mc-segmented { background: alpha(currentColor, 0.08); border-radius: 9px; padding: 3px; }
@@ -77,6 +84,30 @@ def load_css() -> None:
     provider.load_from_string(_CSS)
     Gtk.StyleContext.add_provider_for_display(display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
     _css_loaded = True
+
+
+ICONS_DIR = Path(__file__).resolve().parent / "icons"
+_icons_loaded = False
+
+
+def load_icons() -> None:
+    """The app's own symbolic icons (branch, </>, sparkle: Adwaita has none of them).
+
+    `icons/` is an icon-theme search path; its hicolor/scalable/actions holds the
+    `multicred-*-symbolic.svg` files, recolored by GTK like any symbolic icon."""
+    global _icons_loaded
+    display = Gdk.Display.get_default()
+    if _icons_loaded or display is None:
+        return
+    Gtk.IconTheme.get_for_display(display).add_search_path(str(ICONS_DIR))
+    _icons_loaded = True
+
+
+def profile_letter(profile) -> str:
+    """The badge letter (Mac `Profile.badgeLetter`): the icon's letter, else the name's first."""
+    if profile.icon is not None and profile.icon.kind == "letter" and profile.icon.value:
+        return profile.icon.value
+    return profile.name[:1]
 
 
 def escape(text: str | None) -> str:

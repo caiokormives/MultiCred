@@ -374,7 +374,8 @@ class MainWindowSmokeTests(unittest.TestCase):
                         other_actions, onboarding_still_works])
 
         self.assertEqual(seen["section"], "main")
-        self.assertEqual(seen["sidebar"], ["Perfis", "Contas", "Verificar", "Ajustes"])
+        self.assertEqual(seen["sidebar"], ["Visão geral", "Trabalho", "Pessoal", "Cliente X", "Novo perfil", "Git",
+                                           "GitHub", "Claude", "Chaves de API", "Verificar", "Ajustes"])
         self.assertEqual(seen["empty_rows"], ["Trabalho", "Pessoal", "Cliente X"], "no active profile yet")
         self.assertEqual(seen["accel2"], ["win.activate-profile(2)"])
         self.assertEqual(seen["accel_r"], ["win.verify"])
@@ -390,7 +391,7 @@ class MainWindowSmokeTests(unittest.TestCase):
         self.assertEqual(seen["claude_only"], ["Conta do perfil (login da pasta)", "Empresa", "Cliente X"])
         self.assertEqual(seen["footer"], "Verificar")
 
-        self.assertEqual(seen["accounts_section"], "accounts")
+        self.assertEqual(seen["accounts_section"], "claude", "Contas… opens the Claude entry, as on the Mac")
         self.assertEqual(seen["tabs"], ["Git 2", "GitHub 2", "Claude 2 ⚠", "Chaves 2"])
         self.assertEqual(seen["tab_rows"]["git"], ["Trabalho", "Pessoal"])
         self.assertEqual(seen["tab_rows"]["github"], ["Empresa", "Pessoal"])

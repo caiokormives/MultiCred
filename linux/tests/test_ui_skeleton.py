@@ -1,4 +1,4 @@
-"""S-01: the minimal window lists the profiles and a row switches the profile.
+"""S-01: the minimal window lists the profiles and a profile's "Ativar" switches to it.
 
 Runs only under tests/run-ui-tests.sh (private Xvfb display and private bus):
 without it GTK would fall back to the user's real Wayland desktop.
@@ -44,7 +44,8 @@ class MainWindowSkeletonTests(unittest.TestCase):
         ConfigRepository(environment).save(self.config)
         self.model = AppModel(environment, FixedTools(), dispatch=GLib.idle_add)
 
-    def test_rows_list_profiles_and_activating_one_switches(self):
+    def test_rows_list_profiles_and_ativar_switches(self):
+        """S-01 (R-01): a row click opens the editor (test_sidebar); its "Ativar" button switches."""
         from multicred.ui.app import MultiCredApplication
 
         app = MultiCredApplication(self.model, flags=Gio.ApplicationFlags.NON_UNIQUE)
@@ -53,7 +54,7 @@ class MainWindowSkeletonTests(unittest.TestCase):
         def drive():
             window = app.window
             seen["titles"] = [row.get_title() for row in window.rows]
-            window.rows[0].emit("activated")
+            window.profiles_page.activate_buttons[self.config.profiles[0].id].emit("clicked")
             GLib.timeout_add(50, wait_for_switch)
             return False
 

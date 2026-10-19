@@ -105,6 +105,9 @@ class PackagingTests(unittest.TestCase):
         self.assertIn("/usr/lib/multicred/multicred/core/engine/switch_engine.py", files)
         self.assertIn("/usr/lib/multicred/multicred/tray/controller.py", files)
         self.assertIn("/usr/lib/multicred/multicred/ui/window.py", files)
+        for icon in ("branch", "code", "sparkle"):  # S-01: the app's own sidebar icons ship
+            self.assertIn(f"/usr/lib/multicred/multicred/ui/icons/hicolor/scalable/actions/multicred-{icon}-symbolic.svg",
+                          files)
 
     def test_no_tests_bytecode_or_build_leftovers(self):
         files = self.contents()
@@ -317,9 +320,10 @@ class PackagedAppUITests(unittest.TestCase):
         self.assertTrue(report["sandbox_home"].startswith(str(sandbox.resolve())))
         self.assertTrue(report["mapped"], "the window was on screen")
         self.assertEqual(report["prgname"], APP_ID, "X11 WM_CLASS matches the .desktop's StartupWMClass")
-        self.assertEqual(report["sidebar"], ["Perfis", "Contas", "Verificar", "Ajustes"])
+        self.assertEqual(report["sidebar"], ["Visão geral", "Trabalho", "Pessoal", "Cliente X", "Novo perfil", "Git",
+                                             "GitHub", "Claude", "Chaves de API", "Verificar", "Ajustes"])
         self.assertTrue(report["tray_banner"], "no StatusNotifierWatcher on the private bus: the banner shows")
-        self.assertEqual(report["titles"], {"perfis": "Perfis", "contas": "Contas", "verificar": "Verificar",
+        self.assertEqual(report["titles"], {"perfis": "Visão geral", "contas": "Claude", "verificar": "Verificar",
                                             "ajustes": "Ajustes"})
         self.assertEqual(report["active"], "Trabalho", "the first profile was switched to (dry run)")
         warnings = [line for line in result.stderr.splitlines() if LOG_LINE.search(line)]
