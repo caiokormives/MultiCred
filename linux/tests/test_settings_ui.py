@@ -1,15 +1,19 @@
-"""S-09: the Ajustes page (approved Linux design G) on a sandbox, driven programmatically.
+"""S-07 (R-07): the Ajustes page like the Mac's SettingsPage.swift, on a sandbox, driven programmatically.
 
-Toggling the feedback setting persists in config.json, the autostart switch
-creates and removes the file in the sandbox, the shells sub-page re-runs the
-installer, "Copiar diagnóstico" carries no secret, and uninstalling from the
-page leaves no MultiCred block in the sandbox rc files and quits the app. Also:
-starting the app with an active profile re-applies it once.
+One form, no sub-pages (SettingsPage.swift:14-73): "Geral" (autostart switch and
+"Notificação breve / Só notificação / Nada"), "Shells" with a switch per shell and
+the Mac's footer, "Ferramentas encontradas", "Diagnóstico" ("Abrir pasta de logs",
+"Copiar diagnóstico") and, only once installed, "Desinstalar e restaurar arquivos
+originais", whose "Desinstalar…" pushes a page with the diff of each file and
+"Cancelar / Desinstalar" (UninstallPage, SettingsPage.swift:114-174). Uninstalling
+from that page leaves no MultiCred block in the sandbox rc files and quits the app.
+Also: starting the app with an active profile re-applies it once.
 
 Runs only under tests/run-ui-tests.sh (private Xvfb display and private bus):
 without it GTK would fall back to the user's real Wayland desktop. With
-MULTICRED_SCREENS_DIR set, S-09-ajustes.png is rendered from inside the private
-display (never the user's screen).
+MULTICRED_SCREENS_DIR set, S-07-ajustes.png, S-07-desinstalar.png and
+S-07-desinstalado.png are rendered from inside the private display (never the
+user's screen).
 """
 
 import json
@@ -66,8 +70,24 @@ def save_png(window, path):
     return texture.save_to_png(str(path))
 
 
-@unittest.skipUnless(HAS_DISPLAY, "needs tests/run-ui-tests.sh (private display and bus)")
-class SettingsPageUITests(unittest.TestCase):
+def screenshot_step(name, shots):
+    """A run_steps step that waits a few ticks (transitions, lookups) and saves `name`."""
+    def step(app):
+        directory = os.environ.get("MULTICRED_SCREENS_DIR")
+        if not directory:
+            return False
+        app.window.dismiss_toast()
+        shots[name] = shots.get(name, 0) + 1
+        if shots[name] < 8:
+            return True
+        return not save_png(app.window, Path(directory) / name)
+    step.__name__ = f"screenshot {name}"
+    return step
+
+
+class SandboxSettingsCase(unittest.TestCase):
+    installed = True
+
     def setUp(self):
         from multicred.core import real_env
         from multicred.core.install.autostart import Autostart
@@ -81,7 +101,8 @@ class SettingsPageUITests(unittest.TestCase):
         self.environment = real_env.make_sandbox(self.sandbox)
         (self.sandbox / ".bashrc").write_text("export ORIG=1\n")
         (self.sandbox / ".zshrc").write_text("# zsh do usuário\n")
-        Installer(self.environment).apply(InstallOptions(shells=[ShellKind.BASH, ShellKind.ZSH]))
+        if self.installed:
+            Installer(self.environment).apply(InstallOptions(shells=[ShellKind.BASH, ShellKind.ZSH]))
         config = real_env.seed_sandbox(self.environment)
         config.settings.enabled_shells = [ShellKind.BASH, ShellKind.ZSH]
         ConfigRepository(self.environment).save(config)
@@ -127,27 +148,36 @@ class SettingsPageUITests(unittest.TestCase):
         self.assertEqual(queue, [], f"steps left: {[getattr(s, '__name__', s) for s in queue]}")
         return app
 
+    def open_settings(self, app):
+        Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_LIGHT)
+        window = app.window
+        window.set_default_size(1225, 745)
+        window.open_page("settings")
+        self.page = window._section_pages["settings"]
+        return False
+
+
+@unittest.skipUnless(HAS_DISPLAY, "needs tests/run-ui-tests.sh (private display and bus)")
+class SettingsPageTests(SandboxSettingsCase):
     def test_settings_page_end_to_end(self):
         from multicred.core.install import managed_block
         from multicred.core.install.installer import Integrations
+        from multicred.core.models import ShellKind
+        from multicred.core.tools import Tool
         from multicred.ui.pages.settings import SettingsPage
+        from multicred.ui.pages.uninstall import UninstallPage
 
         seen = {}
-        shots = {"tries": 0}
+        shots = {}
 
-        def open_settings(app):
-            Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_LIGHT)
-            window = app.window
-            window.set_default_size(1225, 745)
-            window.open_page("settings")
-            page = window._section_pages["settings"]
-            seen["is_settings_page"] = isinstance(page, SettingsPage)
-            seen["section_title"] = window.content_page.get_title()
-            self.page = page
+        def opened(app):
+            seen["is_settings_page"] = isinstance(self.page, SettingsPage)
+            seen["section_title"] = app.window.content_page.get_title()
 
         def feedback(_app):
             page = self.page
             seen["feedback_options"] = page.feedback_options()
+            seen["feedback_title"] = page.feedback_row.get_title()
             seen["feedback_initial"] = page.feedback_row.get_selected()
             page.feedback_row.set_selected(2)
             seen["after_none"] = self.saved_settings()["switchFeedback"]
@@ -158,6 +188,7 @@ class SettingsPageUITests(unittest.TestCase):
 
         def autostart(_app):
             page = self.page
+            seen["autostart_title"] = page.autostart_row.get_title()
             seen["autostart_sensitive"] = page.autostart_row.get_sensitive()
             seen["autostart_initial"] = page.autostart_row.get_active()
             page.autostart_row.set_active(True)
@@ -166,27 +197,28 @@ class SettingsPageUITests(unittest.TestCase):
             page.autostart_row.set_active(False)
             seen["file_after_off"] = self.autostart.file.exists()
             seen["setting_after_off"] = self.saved_settings()["openAtLogin"]
-            page.autostart_row.set_active(True)  # as in the design
+            page.autostart_row.set_active(True)  # the uninstall page then lists it
 
         def wait_for_tools(_app):
-            return "claude ~/.local/bin/claude" not in (self.page.tools_row.get_subtitle() or "")
+            return self.page.tool_value(Tool.CLAUDE) == "procurando…"
 
         def texts(_app):
             page = self.page
-            seen["shells_subtitle"] = page.shells_row.get_subtitle()
-            seen["tools_subtitle"] = page.tools_row.get_subtitle()
-            seen["logs_subtitle"] = page.logs_row.get_subtitle()
             seen["groups"] = page.group_titles()
+            seen["shell_rows"] = [(shell.value, row.get_active(), row.get_subtitle())
+                                  for shell, row in page.shell_switches.items()]
+            seen["shells_footer"] = page.shells_footer.get_label()
+            seen["tools"] = {tool.value: (page.tool_rows[tool].get_title(), page.tool_value(tool)) for tool in Tool}
+            seen["diagnostics_buttons"] = [page.logs_button.get_label(), page.diagnostics_button.get_label()]
+            seen["danger_visible"] = page.danger_group.get_visible()
+            seen["danger_title"] = page.uninstall_row.get_title()
+            seen["danger_subtitle"] = page.uninstall_row.get_subtitle()
+            seen["danger_button"] = page.uninstall_button.get_label()
+            seen["sub_pages"] = [name for name in ("open_shells_page", "open_tools_page") if hasattr(page, name)]
 
-        def screenshot(app):
-            directory = os.environ.get("MULTICRED_SCREENS_DIR")
-            if not directory:
-                return False
-            app.window.dismiss_toast()
-            shots["tries"] += 1
-            if shots["tries"] < 8:  # let the transition and the tool lookup settle
-                return True
-            return not save_png(app.window, Path(directory) / "S-09-ajustes.png")
+        def scroll_to_bottom(_app):
+            adjustment = self.page.scroller.get_vadjustment()
+            adjustment.set_value(adjustment.get_upper())
 
         def diagnostics(_app):
             if "diagnostics" not in seen:
@@ -195,46 +227,63 @@ class SettingsPageUITests(unittest.TestCase):
             return seen["diagnostics"] is None
 
         def shells(_app):
-            sub = self.page.open_shells_page()
-            seen["shell_rows"] = sorted(s.value for s in sub.switches)
-            sub.switches[next(s for s in sub.switches if s.value == "fish")].set_active(True)
+            self.page.shell_switches[ShellKind.FISH].set_active(True)
             seen["fish_file"] = Integrations.fish_conf_file(self.environment).is_file()
             seen["shells_after_fish"] = self.saved_settings()["enabledShells"]
-            seen["shells_subtitle_after"] = self.page.shells_row.get_subtitle()
-            self.page.window.nav.pop()
 
-        def uninstall_dialog(_app):
-            dialog = self.page.open_uninstall()
-            seen["dialog_heading"] = dialog.get_heading()
-            seen["dialog_text"] = self.page.uninstall_preview_text()
-            seen["d12_active"] = self.page.claude_folders_check.get_active()
+        def open_uninstall_and_cancel(app):
+            uninstall = self.page.open_uninstall()
+            seen["pushed"] = isinstance(uninstall, UninstallPage) and app.window.nav.get_visible_page() is uninstall
+            seen["cancel_label"] = uninstall.cancel_button.get_label()
+            uninstall.cancel_button.emit("clicked")
+            seen["back_on_settings"] = app.window.nav.get_visible_page() is self.page
+            seen["bashrc_after_cancel"] = managed_block.BEGIN in (self.sandbox / ".bashrc").read_text()
 
-        def dialog_screenshot(app):
-            directory = os.environ.get("MULTICRED_SCREENS_DIR")
-            if not directory:
-                return False
-            app.window.dismiss_toast()
-            shots["dialog"] = shots.get("dialog", 0) + 1
-            if shots["dialog"] < 8:
-                return True
-            return not save_png(app.window, Path(directory) / "S-09-desinstalar.png")
+        def open_uninstall(app):
+            self.uninstall = self.page.open_uninstall()
+            page = self.uninstall
+            seen["uninstall_title"] = page.get_title()
+            seen["heading"] = page.heading_label.get_label()
+            seen["intro"] = page.intro_label.get_label()
+            seen["changes"] = {path: (summary, lines) for path, summary, lines in page.file_changes()}
+            seen["also"] = page.also_label.get_label()
+            seen["d12"] = (page.claude_folders_check.get_active(), page.claude_folders_check.get_sensitive())
+            seen["buttons"] = [page.cancel_button.get_label(), page.uninstall_button.get_label()]
+            seen["destructive"] = page.uninstall_button.has_css_class("destructive-action")
+
+        def scroll_uninstall(_app):
+            adjustment = self.uninstall.stack.get_child_by_name("preview").get_vadjustment()
+            adjustment.set_value(adjustment.get_upper())
 
         def confirm(_app):
-            self.page.uninstall_dialog.emit("response", "confirm")
+            self.uninstall.uninstall_button.emit("clicked")
 
         def wait_result(_app):
-            return self.page.result_dialog is None
+            return self.uninstall.report is None
+
+        def result(_app):
+            page = self.uninstall
+            seen["result_texts"] = page.result_texts()
+            seen["quit_label"] = page.quit_button.get_label()
 
         def quit_from_result(_app):
-            seen["result_text"] = self.page.result_text
-            self.page.result_dialog.emit("response", "quit")
+            self.uninstall.quit_button.emit("clicked")
+            return False
 
-        self.run_steps([open_settings, feedback, autostart, wait_for_tools, texts, screenshot, diagnostics, shells,
-                        uninstall_dialog, dialog_screenshot, confirm, wait_result, quit_from_result])
+        self.run_steps([self.open_settings, opened, feedback, autostart, wait_for_tools, texts,
+                        screenshot_step("S-07-ajustes.png", shots), scroll_to_bottom,
+                        screenshot_step("S-07-ajustes-fim.png", shots), diagnostics, shells,
+                        open_uninstall_and_cancel, open_uninstall, screenshot_step("S-07-desinstalar.png", shots),
+                        scroll_uninstall, screenshot_step("S-07-desinstalar-fim.png", shots),
+                        confirm, wait_result, result, screenshot_step("S-07-desinstalado.png", shots),
+                        quit_from_result])
 
         self.assertTrue(seen["is_settings_page"])
         self.assertEqual(seen["section_title"], "Ajustes")
-        self.assertEqual(seen["feedback_options"], ["Notificação curta", "Notificação", "Nada"])
+        # Geral (SettingsPage.swift:15-22; HUD → notificação breve).
+        self.assertEqual(seen["autostart_title"], "Abrir ao iniciar a sessão")
+        self.assertEqual(seen["feedback_title"], "Ao trocar de perfil, mostrar")
+        self.assertEqual(seen["feedback_options"], ["Notificação breve", "Só notificação", "Nada"])
         self.assertEqual(seen["feedback_initial"], 0)
         self.assertEqual((seen["after_none"], seen["after_notification"], seen["after_hud"]),
                          ("none", "notification", "hud"))
@@ -244,31 +293,72 @@ class SettingsPageUITests(unittest.TestCase):
         self.assertTrue(seen["setting_after_on"])
         self.assertFalse(seen["file_after_off"])
         self.assertFalse(seen["setting_after_off"])
-        self.assertEqual(seen["shells_subtitle"], "bash · zsh · fish não instalado")
-        self.assertEqual(seen["tools_subtitle"], "git /usr/bin/git · gh /usr/bin/gh · claude ~/.local/bin/claude")
-        self.assertEqual(seen["logs_subtitle"], "~/.local/state/multicred/")
-        self.assertEqual(seen["groups"], ["Geral", "Avançado", "Zona de perigo"])
+        # One form, in the Mac's order, no "Avançado" sub-pages.
+        self.assertEqual(seen["groups"], ["Geral", "Shells", "Ferramentas encontradas", "Diagnóstico"])
+        self.assertEqual(seen["sub_pages"], [])
+        self.assertEqual(seen["shell_rows"], [("bash", True, "~/.bashrc"),
+                                              ("zsh", True, "~/.zshrc"),
+                                              ("fish", False, "~/.config/fish/conf.d/multicred.fish")])
+        self.assertEqual(seen["shells_footer"],
+                         "Nos shells marcados, terminais já abertos também trocam de conta a cada prompt. Mudar aqui "
+                         "reescreve só o bloco do MultiCred nesses arquivos, com backup.")
+        self.assertEqual(seen["tools"], {"git": ("git", "/usr/bin/git"), "gh": ("GitHub CLI", "/usr/bin/gh"),
+                                         "claude": ("Claude Code", "~/.local/bin/claude")})
+        self.assertEqual(seen["diagnostics_buttons"], ["Abrir pasta de logs", "Copiar diagnóstico"])
+        # The red zone (SettingsPage.swift:55-71; launchd and Keychain in Linux terms).
+        self.assertTrue(seen["danger_visible"])
+        self.assertEqual(seen["danger_title"], "Desinstalar e restaurar arquivos originais")
+        self.assertEqual(seen["danger_subtitle"],
+                         "Remove o bloco do MultiCred dos arquivos de shell e do gitconfig, a variável do Claude Code "
+                         "na sessão gráfica e as chaves de API do chaveiro do sistema. As contas continuam logadas "
+                         "nas próprias ferramentas.")
+        self.assertEqual(seen["danger_button"], "Desinstalar…")
         diagnostics_text = seen["diagnostics"]
         self.assertIn("MultiCred 0.1.0", diagnostics_text)
         self.assertIn("git: /usr/bin/git", diagnostics_text)
         self.assertIn("claude: ~/.local/bin/claude", diagnostics_text)
-        self.assertIn("Sistema:", diagnostics_text)
         self.assertNotIn(SECRET, diagnostics_text)
-        self.assertEqual(seen["shell_rows"], ["bash", "fish", "zsh"])
         self.assertTrue(seen["fish_file"])
         self.assertEqual(sorted(seen["shells_after_fish"]), ["bash", "fish", "zsh"])
-        self.assertEqual(seen["shells_subtitle_after"], "bash · zsh · fish")
-        self.assertEqual(seen["dialog_heading"], "Desinstalar o MultiCred?")
-        self.assertIn("~/.bashrc", seen["dialog_text"])
-        self.assertIn("~/.zshrc", seen["dialog_text"])
-        self.assertIn("app.multicred.MultiCred.desktop", seen["dialog_text"])
-        self.assertFalse(seen["d12_active"], "D12 option off by default")
-        self.assertIn("MultiCred desinstalado", seen["result_text"])
+        # The uninstall page: pushed, "Cancelar" goes back and changes nothing.
+        self.assertTrue(seen["pushed"])
+        self.assertEqual(seen["cancel_label"], "Cancelar")
+        self.assertTrue(seen["back_on_settings"])
+        self.assertTrue(seen["bashrc_after_cancel"])
+        self.assertEqual(seen["uninstall_title"], "Desinstalar")
+        self.assertEqual(seen["heading"], "Desinstalar o MultiCred")
+        self.assertEqual(seen["intro"], "Estas são as mudanças. Só o bloco do MultiCred é removido de cada arquivo; "
+                                        "o resto fica como você deixou.")
+        changes = seen["changes"]
+        for path in ("~/.bashrc", "~/.zshrc", "~/.gitconfig"):
+            summary, lines = changes[path]
+            self.assertEqual(lines[0], f"− {managed_block.BEGIN}", path)
+            self.assertEqual(lines[-1], f"− {managed_block.END}", path)
+            self.assertTrue(summary.startswith("−") and summary.endswith("linhas"), summary)
+        self.assertTrue(any(line.startswith("− ") and '. "$HOME/.config/multicred/shell/hook.bash"' in line
+                            for line in changes["~/.bashrc"][1]), changes["~/.bashrc"])
+        self.assertEqual(changes["~/.config/fish/conf.d/multicred.fish"], ("será apagado", []))
+        self.assertEqual(changes["~/.config/multicred"], ("será apagado", []))
+        also = seen["also"]
+        self.assertTrue(also.startswith("Também: "), also)
+        self.assertIn("apagar do chaveiro do sistema as chaves de API e os tokens das contas Claude "
+                      "(pastas e conversas do Claude ficam)", also)
+        self.assertIn("(pastas e conversas do Claude ficam), desligar a abertura ao iniciar a sessão. "
+                      "Os backups vão para ~/.config/multicred-backups-", also)
+        self.assertEqual(seen["d12"], (False, False), "D12 option off, and nothing to delete in this sandbox")
+        self.assertEqual(seen["buttons"], ["Cancelar", "Desinstalar"])
+        self.assertTrue(seen["destructive"])
+        # Result in the same page (SettingsPage.swift:156-173).
+        texts = seen["result_texts"]
+        self.assertEqual(texts[0], "MultiCred desinstalado")
+        self.assertTrue(any(t.startswith("Arquivos restaurados: ") and "~/.bashrc" in t for t in texts), texts)
+        self.assertEqual(texts[-1], "Abra um novo terminal para que os shells deixem de carregar o MultiCred. "
+                                    "Para tirar o app: sudo apt remove multicred.")
+        self.assertEqual(seen["quit_label"], "Sair do MultiCred")
 
         # Nothing of MultiCred is left in the sandbox rc files; the user's lines are back.
         for name in (".bashrc", ".zshrc"):
-            text = (self.sandbox / name).read_text()
-            self.assertNotIn(managed_block.BEGIN, text, name)
+            self.assertNotIn(managed_block.BEGIN, (self.sandbox / name).read_text(), name)
         self.assertEqual((self.sandbox / ".bashrc").read_text(), "export ORIG=1\n")
         self.assertEqual((self.sandbox / ".zshrc").read_text(), "# zsh do usuário\n")
         self.assertFalse(Integrations.fish_conf_file(self.environment).exists())
@@ -282,15 +372,47 @@ class SettingsPageUITests(unittest.TestCase):
         self.model.autostart = Autostart(self.environment, command_path=str(self.sandbox / "nada/multicred"))
         seen = {}
 
-        def look(app):
-            app.window.open_page("settings")
-            page = app.window._section_pages["settings"]
-            seen["sensitive"] = page.autostart_row.get_sensitive()
-            seen["subtitle"] = page.autostart_row.get_subtitle()
+        def look(_app):
+            seen["sensitive"] = self.page.autostart_row.get_sensitive()
+            seen["subtitle"] = self.page.autostart_row.get_subtitle()
 
-        self.run_steps([look])
+        self.run_steps([self.open_settings, look])
         self.assertFalse(seen["sensitive"])
         self.assertIn("/usr/bin/multicred", seen["subtitle"])
+
+
+    def test_abrir_verificar_on_an_error_notification_opens_verificar(self):
+        """The error notification's button (AppDelegate.swift:242) reaches the real app."""
+        seen = {}
+
+        def press(app):
+            app.window.set_visible(False)
+            seen["registered"] = app.lookup_action("open-verify") is not None
+            app.activate_action("open-verify", None)
+            seen["section"] = app.window.current_section
+            seen["visible"] = app.window.get_visible()
+
+        self.run_steps([press])
+        self.assertTrue(seen["registered"])
+        self.assertEqual(seen["section"], "verify")
+        self.assertTrue(seen["visible"])
+
+
+@unittest.skipUnless(HAS_DISPLAY, "needs tests/run-ui-tests.sh (private display and bus)")
+class SettingsBeforeInstallTests(SandboxSettingsCase):
+    installed = False
+
+    def test_the_red_zone_only_shows_once_installed(self):
+        """SettingsPage.swift:55: `if model.isInstalled`."""
+        seen = {}
+
+        def look(_app):
+            seen["groups"] = self.page.group_titles()
+            seen["danger_visible"] = self.page.danger_group.get_visible()
+
+        self.run_steps([self.open_settings, look])
+        self.assertEqual(seen["groups"], ["Geral", "Shells", "Ferramentas encontradas", "Diagnóstico"])
+        self.assertFalse(seen["danger_visible"])
 
 
 @unittest.skipUnless(HAS_DISPLAY, "needs tests/run-ui-tests.sh (private display and bus)")

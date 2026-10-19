@@ -4,6 +4,11 @@ Lives inside the main window (D31). Step 1 shows what was detected (tools with
 their version or the install command, D6; the legacy ~/Perfis card, D13), step 2
 edits the suggested profiles, step 3 lists the shells and the exact diff of each
 file, then installs, saves the configuration and activates the initial profile.
+
+S-07 (R-07), after OnboardingView.swift: each card says "Completo" / "Falta N
+item" (:326, 363-365), step 3 ends with the Mac's group (backup folder, "Perfil
+inicial", "Abrir ao iniciar a sessão", :249-262) and "Aplicar e começar" (:101).
+`file_change_row` is the Mac's FileChangeView, shared with the uninstall page.
 """
 
 from __future__ import annotations
@@ -34,7 +39,6 @@ COLOR_NAMES = {
     ProfileColor.GREEN: "Verde", ProfileColor.ORANGE: "Laranja", ProfileColor.RED: "Vermelho",
     ProfileColor.PINK: "Rosa", ProfileColor.GRAPHITE: "Grafite",
 }
-KIND_TEXT = {ChangeKind.CREATE: "criar", ChangeKind.MODIFY: "modificar", ChangeKind.DELETE: "apagar"}
 
 _CSS = """
 .mc-step { color: alpha(currentColor, 0.55); font-weight: 600; }
@@ -58,7 +62,7 @@ _CSS = """
 _css_loaded = False
 
 
-def _load_css() -> None:
+def load_css() -> None:
     global _css_loaded
     display = Gdk.Display.get_default()
     if _css_loaded or display is None:
@@ -67,6 +71,46 @@ def _load_css() -> None:
     provider.load_from_string(_CSS)
     Gtk.StyleContext.add_provider_for_display(display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
     _css_loaded = True
+
+
+_load_css = load_css
+
+
+def change_summary(change) -> str:
+    """The Mac's FileChangeView summary (Components.swift:209-218), plurals in words."""
+    if change.kind == ChangeKind.CREATE:
+        return "arquivo novo"
+    if change.kind == ChangeKind.DELETE:
+        return "será apagado"
+    parts = []
+    if change.added_lines:
+        parts.append(f"+{_plural(len(change.added_lines), 'linha', 'linhas')}")
+    if change.removed_lines:
+        parts.append(f"−{_plural(len(change.removed_lines), 'linha', 'linhas')}")
+    return " · ".join(parts)
+
+
+def diff_lines(change) -> list[str]:
+    return ([f"− {line}" for line in change.removed_lines] + [f"+ {line}" for line in change.added_lines])
+
+
+def file_change_row(path: str, summary: str, lines: list[str]) -> Gtk.ListBoxRow:
+    """One file and its diff (the Mac's FileChangeView): the path in monospace, the
+    summary, then the removed lines in red and the added ones in green."""
+    content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_top=10, margin_bottom=10,
+                      margin_start=12, margin_end=12)
+    header = Gtk.Box(spacing=8)
+    header.append(_label(path, "monospace", "heading", selectable=True))
+    header.append(_label(summary, "dim-label", "caption"))
+    content.append(header)
+    if lines:
+        diff = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        diff.add_css_class("mc-diff")
+        for text in lines:
+            css = "mc-diff-removed" if text.startswith("−") else "mc-diff-added"
+            diff.append(_label(text.expandtabs(4), "monospace", css, wrap=True, selectable=True))
+        content.append(diff)
+    return Gtk.ListBoxRow(child=content, activatable=False)
 
 
 def _label(text: str, *classes: str, wrap: bool = False, xalign: float = 0.0, selectable: bool = False) -> Gtk.Label:
@@ -141,11 +185,17 @@ class ProfileCard(Adw.PreferencesGroup):
         header = Gtk.Box(spacing=8)
         self.badge = _badge(profile)
         header.append(self.badge)
+        # "Completo" / "Falta N item" (OnboardingView.swift:325-326), then the Mac's "x".
+        self.status_pill = _pill("", "ok")
+        header.append(self.status_pill)
+        self.remove_button = None
         if removable:
-            remove = Gtk.Button(icon_name="user-trash-symbolic", tooltip_text="Remover perfil", valign=Gtk.Align.CENTER)
+            remove = Gtk.Button(icon_name="window-close-symbolic", tooltip_text="Remover perfil",
+                                valign=Gtk.Align.CENTER)
             remove.add_css_class("flat")
             remove.connect("clicked", lambda *_: page.remove_profile(profile))
             header.append(remove)
+            self.remove_button = remove
         self.set_header_suffix(header)
 
         self.name_row = Adw.EntryRow(title="Nome do perfil", text=profile.name)
@@ -190,6 +240,24 @@ class ProfileCard(Adw.PreferencesGroup):
         self.claude_row.set_selected(self.folders.index(profile.claude_config_dir))
         self.claude_row.connect("notify::selected", self._claude_changed)
         self.add(self.claude_row)
+        self.update_status()
+
+    def missing_count(self) -> int:
+        """OnboardingView.swift:363-365: no git identity, no GitHub account. An identity
+        left with both fields empty counts as missing (it is dropped before saving)."""
+        identity = self.page.draft.git_identity(self.profile.git_identity_id)
+        no_git = identity is None or not (identity.name.strip() or identity.email.strip())
+        return int(no_git) + int(self.profile.github_account_id is None)
+
+    def update_status(self) -> None:
+        missing = self.missing_count()
+        if missing == 0:
+            text = "Completo"
+        else:  # the Mac says "Falta N item"; the plural agrees here
+            text = "Falta 1 item" if missing == 1 else f"Faltam {missing} itens"
+        self.status_pill.set_label(text)
+        self.status_pill.remove_css_class("warning" if missing == 0 else "ok")
+        self.status_pill.add_css_class("ok" if missing == 0 else "warning")
 
     def _name_changed(self, row):
         name = row.get_text()
@@ -215,9 +283,11 @@ class ProfileCard(Adw.PreferencesGroup):
             config.git_identities.append(identity)
             self.profile.git_identity_id = identity.id
         setattr(identity, attribute, row.get_text().strip())
+        self.update_status()
 
     def _github_changed(self, row, _param):
         self.profile.github_account_id = self.github_ids[row.get_selected()]
+        self.update_status()
 
     def _claude_changed(self, row, _param):
         self.profile.claude_config_dir = self.folders[row.get_selected()]
@@ -236,6 +306,9 @@ class OnboardingPage(Gtk.Box):
         self.initial_profile_id = model.state.profile_id if model.config is not None else None
         self.shells: set[ShellKind] = set()
         self.remove_legacy = False
+        # Step 3's "Abrir ao iniciar a sessão": on by default like the Mac (OnboardingView.swift:26);
+        # a re-run starts from the current setting.
+        self.open_at_login = model.config.settings.open_at_login if model.config is not None else True
         self.applying = False
         self.install_command_labels: dict[str, str] = {}
         self.profile_cards: list[ProfileCard] = []
@@ -250,7 +323,7 @@ class OnboardingPage(Gtk.Box):
         loading = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, valign=Gtk.Align.CENTER)
         spinner = Gtk.Spinner(spinning=True, width_request=32, height_request=32)
         loading.append(spinner)
-        loading.append(_label("Procurando ferramentas e contas…", "dim-label", xalign=0.5))
+        loading.append(_label("Procurando ferramentas e contas nesta máquina…", "dim-label", xalign=0.5))
         self.stack.add_named(loading, "loading")
         self.append(Gtk.Separator())
         self.append(self._build_bottom_bar())
@@ -274,19 +347,11 @@ class OnboardingPage(Gtk.Box):
         self.error_label.set_visible(False)
         bar.append(self.error_label)
         bar.append(Gtk.Box(hexpand=True))
-        self.initial_box = Gtk.Box(spacing=6, valign=Gtk.Align.CENTER)
-        self.initial_box.append(_label("Perfil inicial:", "dim-label"))
-        self.initial_profile_label = _label("", "heading")
-        self.initial_box.append(self.initial_profile_label)
-        self.initial_dropdown = Gtk.DropDown(valign=Gtk.Align.CENTER)
-        self.initial_dropdown.connect("notify::selected", self._initial_changed)
-        self.initial_box.append(self.initial_dropdown)
-        bar.append(self.initial_box)
         self.next_button = Gtk.Button(label="Continuar")
         self.next_button.add_css_class("suggested-action")
         self.next_button.connect("clicked", self._next_clicked)
         bar.append(self.next_button)
-        self.apply_button = Gtk.Button(label="Aplicar e ativar")
+        self.apply_button = Gtk.Button(label="Aplicar e começar")
         self.apply_button.add_css_class("suggested-action")
         self.apply_button.connect("clicked", self._apply_clicked)
         bar.append(self.apply_button)
@@ -319,10 +384,8 @@ class OnboardingPage(Gtk.Box):
         self.next_button.set_visible(self.step < 2)
         self.next_button.set_sensitive(ready and (self.step == 0 or bool(self.draft and self.draft.profiles)))
         self.apply_button.set_visible(self.step == 2)
-        self.apply_button.set_label("Aplicando…" if self.applying else "Aplicar e ativar")
+        self.apply_button.set_label("Aplicando…" if self.applying else "Aplicar e começar")
         self.apply_button.set_sensitive(ready and bool(self.shells) and not self.preview_failed)
-        self.initial_box.set_visible(self.step == 2)
-        self.initial_dropdown.set_sensitive(not self.applying)
 
     def show_error(self, text: str | None) -> None:
         self.error_label.set_label(text or "")
@@ -391,7 +454,8 @@ class OnboardingPage(Gtk.Box):
             intro.append(line)
         box.append(intro)
 
-        tools = Adw.PreferencesGroup(title="Ferramentas")
+        tools = Adw.PreferencesGroup(title="Ferramentas nesta máquina")
+        self.tools_group = tools
         self.install_command_labels = {}
         for info in setup.tools:
             row = Adw.ActionRow(title=info.tool.display_name,
@@ -539,11 +603,13 @@ class OnboardingPage(Gtk.Box):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
         heading = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         heading.append(_label("Revise antes de aplicar", "title-1", wrap=True))
-        heading.append(_label("Cada arquivo ganha só um bloco marcado. Backup em ~/.config/multicred/backups/.",
-                              "dim-label", wrap=True))
+        self.apply_subtitle = _label("Estas são as únicas mudanças fora da pasta ~/.config/multicred/.",
+                                     "dim-label", wrap=True)
+        heading.append(self.apply_subtitle)
         box.append(heading)
 
-        shells = Adw.PreferencesGroup(title="Shells")
+        shells = Adw.PreferencesGroup(title="Shells que vão carregar o MultiCred")
+        self.shells_group = shells
         self.shell_checks = {}
         for shell in SHELL_ORDER:
             installed = shell in self.setup.installed_shells
@@ -569,6 +635,7 @@ class OnboardingPage(Gtk.Box):
         self.files_list.add_css_class("boxed-list")
         self.files_group.add(self.files_list)
         box.append(self.files_group)
+        box.append(self._build_start_group())
         box.append(_label("Abra um novo terminal depois de aplicar para que o shell carregue o perfil. Apps gráficos "
                           "pegam a pasta do Claude no próximo login da sessão.", "dim-label", "caption", wrap=True))
         self._refresh_initial_profile()
@@ -615,63 +682,75 @@ class OnboardingPage(Gtk.Box):
 
     @staticmethod
     def _change_row(change) -> Gtk.ListBoxRow:
-        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_top=10, margin_bottom=10,
-                          margin_start=12, margin_end=12)
-        header = Gtk.Box(spacing=8)
-        header.append(_label(change.path, "monospace", "heading", selectable=True))
-        summary = KIND_TEXT[change.kind]
-        if change.added_lines:
-            summary += f" · +{_plural(len(change.added_lines), 'linha', 'linhas')}"
-        if change.removed_lines:
-            summary += f" · −{_plural(len(change.removed_lines), 'linha', 'linhas')}"
-        header.append(_label(summary, "dim-label"))
-        content.append(header)
-        if change.added_lines or change.removed_lines:
-            diff = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-            diff.add_css_class("mc-diff")
-            for prefix, lines, css in (("−", change.removed_lines, "mc-diff-removed"),
-                                       ("+", change.added_lines, "mc-diff-added")):
-                for line in lines:
-                    text = f"{prefix} {line.expandtabs(4)}"
-                    label = _label(text, "monospace", css, wrap=True, selectable=True)
-                    diff.append(label)
-            content.append(diff)
-        return Gtk.ListBoxRow(child=content, activatable=False)
+        return file_change_row(change.path, change_summary(change), diff_lines(change))
+
+    def _build_start_group(self) -> Gtk.Widget:
+        """The Mac's last group (OnboardingView.swift:249-262): where the backups go, the
+        initial profile and "Abrir ao iniciar a sessão"."""
+        from .settings import AUTOSTART_UNAVAILABLE
+
+        group = Adw.PreferencesGroup()
+        self.backup_row = Adw.ActionRow(title="Backup dos originais em ~/.config/multicred/backups/")
+        self.backup_row.add_prefix(Gtk.Image.new_from_icon_name("package-x-generic-symbolic"))
+        group.add(self.backup_row)
+        self.initial_row = Adw.ComboRow(title="Perfil inicial")
+        self.initial_row.add_prefix(Gtk.Image.new_from_icon_name("view-refresh-symbolic"))
+        self.initial_row.connect("notify::selected", self._initial_changed)
+        group.add(self.initial_row)
+        available = self.model.autostart.is_available()
+        self.autostart_row = Adw.SwitchRow(title="Abrir ao iniciar a sessão",
+                                           active=self.open_at_login and available, sensitive=available)
+        if not available:
+            self.autostart_row.set_subtitle(GLib.markup_escape_text(AUTOSTART_UNAVAILABLE))
+        self.autostart_row.add_prefix(Gtk.Image.new_from_icon_name("preferences-system-time-symbolic"))
+        self.autostart_row.connect("notify::active", self._autostart_toggled)
+        group.add(self.autostart_row)
+        return group
+
+    def _autostart_toggled(self, row, _param) -> None:
+        if row.get_sensitive():
+            self.open_at_login = row.get_active()
+
+    def initial_profile_name(self) -> str:
+        profile = self.draft.profile(self.initial_profile_id) if self.draft else None
+        return profile.name if profile else ""
 
     def _refresh_initial_profile(self) -> None:
         profiles = self.draft.profiles
         if self.initial_profile_id is None or self.draft.profile(self.initial_profile_id) is None:
             self.initial_profile_id = profiles[0].id if profiles else None
         self._updating_dropdown = True
-        self.initial_dropdown.set_model(Gtk.StringList.new([p.name for p in profiles]))
+        self.initial_row.set_model(Gtk.StringList.new([p.name for p in profiles]))
         index = next((i for i, p in enumerate(profiles) if p.id == self.initial_profile_id), 0)
-        self.initial_dropdown.set_selected(index)
+        self.initial_row.set_selected(index)
         self._updating_dropdown = False
-        self.initial_dropdown.set_visible(len(profiles) > 1)
-        self.initial_profile_label.set_visible(len(profiles) <= 1)
-        profile = self.draft.profile(self.initial_profile_id)
-        self.initial_profile_label.set_label(profile.name if profile else "")
 
-    def _initial_changed(self, dropdown, _param) -> None:
+    def _initial_changed(self, row, _param) -> None:
         if getattr(self, "_updating_dropdown", False) or self.draft is None:
             return
-        index = dropdown.get_selected()
+        index = row.get_selected()
         if 0 <= index < len(self.draft.profiles):
             self.initial_profile_id = self.draft.profiles[index].id
-            self.initial_profile_label.set_label(self.draft.profiles[index].name)
 
     def _apply_clicked(self, _button) -> None:
         if self.applying:
             return
         self.applying = True
         self.show_error(None)
+        self.initial_row.set_sensitive(False)
+        self.autostart_row.set_sensitive(False)
         draft = self.draft
-        self.model.complete_onboarding(draft, self.options(), self.initial_profile_id, self._applied)
+        # Outside the installed package the switch is off and explained: the setting stays as it is.
+        open_at_login = self.open_at_login if self.model.autostart.is_available() else None
+        self.model.complete_onboarding(draft, self.options(), self.initial_profile_id, self._applied,
+                                       open_at_login=open_at_login)
 
     def _applied(self, _result, error) -> None:
         self.applying = False
         saved = self.model.config is self.draft
         if error is not None and not (saved and isinstance(error, SwitchError)):
+            self.initial_row.set_sensitive(True)
+            self.autostart_row.set_sensitive(self.model.autostart.is_available())
             self.show_error(describe_error(error, self.draft))
             return
         # Installed and saved; a failed first switch is reported by the window, which offers the profiles.

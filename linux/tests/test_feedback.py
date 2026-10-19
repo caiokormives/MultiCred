@@ -4,6 +4,8 @@ On Linux the HUD is a short desktop notification (Wayland has no positioned
 overlay): "hud" = notification withdrawn after ~2 s, "notification" = a normal
 one, "none" = nothing. With Claude Code sessions open after a switch that
 changed the Claude account or folder, the notification says so and stays.
+S-07: the texts are the Mac's (SwitchFeedbackPresenter.swift:73-79, 125), with the
+Portuguese agreement kept singular for one item where the Mac says "trocados".
 The decision logic is pure; the presenter is tested with a fake application.
 """
 
@@ -37,7 +39,7 @@ class MessageTests(unittest.TestCase):
 
     def test_hud_is_a_short_notification(self):
         message = message_for(outcome(), SwitchFeedback.HUD)
-        self.assertEqual(message, FeedbackMessage("Agora em Pessoal", "git, GitHub e Claude trocados.", True))
+        self.assertEqual(message, FeedbackMessage("Agora em Pessoal", "git, GitHub, Claude trocados.", True))
 
     def test_notification_stays(self):
         message = message_for(outcome(), SwitchFeedback.NOTIFICATION)
@@ -48,19 +50,19 @@ class MessageTests(unittest.TestCase):
         self.assertEqual(message_for(outcome(steps=(K.GIT, K.STATE), claude_changed=False),
                                      SwitchFeedback.HUD).body, "git trocado.")
         self.assertEqual(message_for(outcome(steps=(K.GIT, K.SESSION, K.STATE), claude_changed=True),
-                                     SwitchFeedback.HUD).body, "git e Claude trocados.")
+                                     SwitchFeedback.HUD).body, "git, Claude trocados.")
         self.assertEqual(message_for(outcome(steps=(K.ENV_FILES, K.STATE), claude_changed=False),
                                      SwitchFeedback.HUD).body, "Perfil trocado.")
 
     def test_open_sessions_after_a_claude_change_warn_and_stay(self):
         message = message_for(outcome(running_claude_sessions=2, claude_account_name="Dev HINC"), SwitchFeedback.HUD)
         self.assertFalse(message.transient, "the warning must not vanish after 2 s")
-        self.assertIn("2 sessões do Claude Code já abertas continuam na conta anterior. "
-                      "Reinicie-as para usar Dev HINC.", message.body)
+        self.assertEqual(message.body, "git, GitHub, Claude trocados. 2 sessões do Claude Code abertas antes da "
+                                       "troca continuam na conta anterior. Reinicie-as para usar Dev HINC.")
 
     def test_one_open_session_is_singular(self):
         message = message_for(outcome(running_claude_sessions=1), SwitchFeedback.NOTIFICATION)
-        self.assertIn("1 sessão do Claude Code já aberta continua na conta anterior. "
+        self.assertIn("1 sessão do Claude Code aberta antes da troca continua na conta anterior. "
                       "Reinicie-a para usar o login da pasta.", message.body)
 
     def test_open_sessions_without_a_claude_change_do_not_warn(self):
@@ -74,7 +76,8 @@ class MessageTests(unittest.TestCase):
         message = message_for(outcome(claude_only=True, claude_account_name="Cliente X",
                                       steps=(K.CLAUDE_LOGIN, K.ENV_FILES, K.STATE)), SwitchFeedback.NOTIFICATION)
         self.assertEqual(message.title, "Conta Claude: Cliente X")
-        self.assertEqual(message.body, "Só o login do Claude mudou; agents, skills e conversas ficam.")
+        self.assertEqual(message.body, "Só o login do Claude mudou; agents, skills e conversas ficam. "
+                                       "Vale para novos terminais.")
         folder = message_for(outcome(claude_only=True, claude_account_name=None), SwitchFeedback.HUD)
         self.assertEqual(folder.title, "Conta Claude: login da pasta")
 
@@ -86,13 +89,39 @@ class MessageTests(unittest.TestCase):
 
 class FakeApplication:
     def __init__(self):
-        self.sent, self.withdrawn = [], []
+        self.sent, self.withdrawn, self.opened = [], [], []
+        self.actions = {}
 
     def send_notification(self, identifier, notification):
         self.sent.append((identifier, notification))
 
     def withdraw_notification(self, identifier):
         self.withdrawn.append(identifier)
+
+    def add_action(self, action):
+        self.actions[action.get_name()] = action
+
+    def lookup_action(self, name):
+        return self.actions.get(name)
+
+    def open_page(self, page):
+        self.opened.append(page)
+
+
+class FakeNotification:
+    """Records what the presenter puts on a Gio.Notification (it has no getters)."""
+
+    def __init__(self, title):
+        self.title, self.body, self.priority, self.buttons = title, None, None, []
+
+    def set_body(self, body):
+        self.body = body
+
+    def set_priority(self, priority):
+        self.priority = priority
+
+    def add_button(self, label, action):
+        self.buttons.append((label, action))
 
 
 class PresenterTests(unittest.TestCase):
@@ -107,7 +136,8 @@ class PresenterTests(unittest.TestCase):
             return self.next_id
 
         self.presenter = SwitchFeedbackPresenter(self.app, schedule=schedule,
-                                                 cancel=lambda source: self.timers.pop(source, None))
+                                                 cancel=lambda source: self.timers.pop(source, None),
+                                                 notification=FakeNotification)
 
     def fire(self):
         for _ms, callback in list(self.timers.values()):
@@ -140,6 +170,29 @@ class PresenterTests(unittest.TestCase):
     def test_error_notification(self):
         self.presenter.notify_error("Não consegui trocar para Pessoal", "gh: keyring locked")
         self.assertEqual([i for i, _ in self.app.sent], ["error"])
+
+    def test_error_notification_offers_abrir_verificar_like_the_mac_alert(self):
+        """AppDelegate.swift:234-243: the switch error alert has "Ok" and "Abrir Verificar",
+        which opens Verificar. A notification is dismissed on its own, so only the second
+        button is needed; it activates app.open-verify, registered by the presenter."""
+        self.presenter.notify_error("Não consegui trocar para Pessoal", "gh: keyring locked")
+        notification = self.app.sent[0][1]
+        self.assertEqual((notification.title, notification.body),
+                         ("Não consegui trocar para Pessoal", "gh: keyring locked"))
+        self.assertEqual(notification.buttons, [("Abrir Verificar", "app.open-verify")])
+        self.app.actions["open-verify"].activate(None)
+        self.assertEqual(self.app.opened, ["verify"])
+
+    def test_switch_notifications_have_no_button(self):
+        self.presenter.present(outcome(), SwitchFeedback.NOTIFICATION)
+        self.assertEqual(self.app.sent[0][1].buttons, [])
+
+    def test_an_existing_open_verify_action_is_kept(self):
+        app = FakeApplication()
+        SwitchFeedbackPresenter(app, notification=FakeNotification)
+        first = app.actions["open-verify"]
+        SwitchFeedbackPresenter(app, notification=FakeNotification)
+        self.assertIs(app.actions["open-verify"], first)
 
 
 class ModelSwitchOutcomeTests(SafeTestCase):
