@@ -231,9 +231,67 @@ class TrayIconTests(unittest.TestCase):
         self.assertEqual(appearance(None), (ProfileColor.GRAPHITE.hex, "M"))
         self.assertEqual(appearance(Profile(name="Cliente", color=ProfileColor.TEAL, icon=ProfileIcon("letter", "x"))),
                          (ProfileColor.TEAL.hex, "X"))
-        # SF Symbols do not exist on Linux: a symbol icon falls back to the name's letter.
+        # S-05: one of the editor's 8 symbols is drawn as that symbol (StatusIcon.swift:22-29).
         self.assertEqual(appearance(Profile(name="Casa", color=ProfileColor.RED, icon=ProfileIcon("symbol", "house"))),
+                         (ProfileColor.RED.hex, "house"))
+        # A symbol this port does not draw (e.g. typed on the Mac) falls back to the name's letter.
+        self.assertEqual(appearance(Profile(name="Casa", color=ProfileColor.RED, icon=ProfileIcon("symbol", "bolt"))),
                          (ProfileColor.RED.hex, "C"))
+
+    def test_the_eight_symbols_are_drawn_in_white_and_differ(self):
+        """The editor's symbols (Components.swift:65) are drawn in the tray icon, not a letter."""
+        from multicred.tray.icon import SYMBOLS, sni_pixmaps
+        self.assertEqual(SYMBOLS, ("briefcase", "house", "building.2", "laptopcomputer", "star", "person", "flask",
+                                   "globe"))
+        masks = {}
+        for symbol in SYMBOLS + ("C",):
+            width, height, data = sni_pixmaps(ProfileColor.TEAL.hex, symbol)[-1]
+            pixels = [tuple(data[i:i + 4]) for i in range(0, len(data), 4)]
+            white = frozenset(i for i, (a, r, g, b) in enumerate(pixels) if a == 255 and min(r, g, b) > 200)
+            self.assertGreater(len(white), 40, f"{symbol} draws something white")
+            self.assertEqual(pixel((width, height, data), 2, height // 2), (255, *rgb(ProfileColor.TEAL.hex)),
+                             f"{symbol} keeps the colored square")
+            masks[symbol] = white
+        self.assertEqual(len(set(masks.values())), len(SYMBOLS) + 1, "every symbol looks different (and not a letter)")
+
+    def test_menu_png_of_a_symbol_profile_shows_the_symbol(self):
+        from multicred.tray.icon import png_bytes, profile_png
+        profile = Profile(name="Casa", color=ProfileColor.RED, icon=ProfileIcon("symbol", "house"))
+        self.assertEqual(profile_png(profile), png_bytes(ProfileColor.RED.hex, "house", size=16))
+        self.assertNotEqual(profile_png(profile), png_bytes(ProfileColor.RED.hex, "C", size=16))
+
+    def test_symbol_sheet_screenshot(self):
+        """With MULTICRED_SCREENS_DIR set: every symbol in each color, at the panel sizes, plus the alert dot."""
+        directory = os.environ.get("MULTICRED_SCREENS_DIR")
+        if not directory:
+            self.skipTest("MULTICRED_SCREENS_DIR not set")
+        from pathlib import Path
+
+        import cairo
+
+        from multicred.tray.icon import SYMBOLS, render
+        sizes, gap = (22, 32, 48), 12
+        glyphs = ("T",) + SYMBOLS
+        colors = list(ProfileColor) + [None]  # None: no profile, with the alert dot
+        band = sum(size + 4 for size in sizes) + gap
+        sheet = cairo.ImageSurface(cairo.FORMAT_ARGB32, gap + len(glyphs) * (48 + gap), gap + len(colors) * band)
+        context = cairo.Context(sheet)
+        context.set_source_rgb(0.18, 0.18, 0.2)  # a dark panel
+        context.paint()
+        y = gap
+        for color in colors:
+            for size in sizes:
+                for column, glyph in enumerate(glyphs):
+                    icon = render(color.hex if color else ProfileColor.GRAPHITE.hex, glyph, size,
+                                  alert=color is None)
+                    context.set_source_surface(icon, gap + column * (48 + gap) + (48 - size) / 2, y)
+                    context.paint()
+                y += size + 4
+            y += gap
+        Path(directory).mkdir(parents=True, exist_ok=True)
+        path = Path(directory) / "S-05-bandeja-simbolos.png"
+        sheet.write_to_png(str(path))
+        self.assertEqual(path.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
 
     def test_png_for_menu_items(self):
         from multicred.tray.icon import png_bytes
