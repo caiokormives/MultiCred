@@ -242,6 +242,36 @@ class TermuxVerifierTests(TermuxClaudeWorld):
             self.assertNotIn(absent, text)
         self.assert_stayed_in_termux()
 
+    def version_runs(self):
+        claude = str(self.prefix / "bin" / "claude")
+        return sum(1 for r in self.recording.requests if r.executable == claude and r.arguments == ["--version"])
+
+    def test_a_fix_and_corrigir_tudo_run_claude_version_once(self):
+        """S-16 (review r1): `claude --version` takes up to 10 s; fix() and fix_all() re-check
+        before and after every repair, so the diagnosis is kept like the folders' statuses."""
+        self.install_claude("2.1.112")
+        self.assertEqual(self.cli("trocar", "Celular")[0], 0)
+        state = StateStore(AppPaths(self.termux), self.termux.clock).load()
+        verifier = Verifier(self.termux, self.termux_tools(), FixedProcessScanner(0))
+        report = verifier.run(self.config, state)
+        self.assertTrue(report.fixable, [c.id for c in report.problems])  # the shells' block is missing
+        before = self.version_runs()
+        verifier.fix(report.fixable[0], self.config)
+        self.assertEqual(self.version_runs() - before, 1)
+
+        (self.home / ".bashrc").unlink()  # the block is missing again
+        report = verifier.run(self.config, state)
+        before = self.version_runs()
+        after = verifier.fix_all(report, self.config)
+        self.assertEqual(self.version_runs() - before, 1)
+        self.assertEqual(self.check(after, "claude.code").found, "Claude Code 2.1.112 · atualização automática ligada")
+        # Outside a fix every run asks again (a Claude Code just installed shows).
+        before = self.version_runs()
+        verifier.run(self.config, state)
+        verifier.run(self.config, state)
+        self.assertEqual(self.version_runs() - before, 2)
+        self.assert_stayed_in_termux()
+
     def test_claude_code_row_states(self):
         self.assertEqual(self.cli("trocar", "Celular")[0], 0)
         report = self.verify()

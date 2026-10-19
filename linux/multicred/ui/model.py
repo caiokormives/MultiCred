@@ -8,7 +8,7 @@ from typing import Callable
 
 from ..core.engine.switch_engine import SwitchEngine
 from ..core.engine.types import Busy, StepFailed, SwitchError
-from ..core.models import ActiveState, ClaudeAccountKind, ClaudeFolder, Config
+from ..core.models import ActiveState, ClaudeFolder, Config
 from ..core.storage import ConfigRepository, JSONStoreError
 
 
@@ -478,11 +478,9 @@ class AppModel:
                 self.switch_claude_only(None, lambda _result, _error: None)
 
     def has_token(self, account) -> bool:
-        """Login accounts live in the vault (checked by the switch preflight, not on every
-        render); token accounts need their secret."""
-        if account.kind == ClaudeAccountKind.LOGIN:
-            return True
-        return self.has_secret(account)
+        """core/claude/status.py account_has_token (the terminal uses it too)."""
+        from ..core.claude.status import account_has_token
+        return account_has_token(account, self.environment.secrets)
 
     # MARK: slow lookups, off the UI thread (S-06)
 
@@ -555,20 +553,27 @@ class AppModel:
         return self.claude_statuses.get(ClaudeFolder.own_login(config_dir).id)
 
     def needs_claude_login(self, profile) -> bool:
-        """A profile cannot really be used while its Claude credential is missing."""
-        account = self.config.claude_account(profile.claude_account_id) if self.config else None
-        if account is not None:
-            return not self.has_token(account)
-        status = self.folder_status(profile.claude_config_dir)
-        return status is not None and status.kind == "loggedOut"
+        """A profile cannot really be used while its Claude credential is missing: the core
+        rule (core/claude/status.py, also the terminal's) with the statuses cached here."""
+        from ..core.claude.status import needs_claude_login
+        return needs_claude_login(profile, self.config, self.has_token, self.folder_status)
 
-    def refresh_claude_statuses(self, on_done: Callable[[], None] | None = None) -> None:
-        """Login status of every folder in use (`claude auth status` takes ~1 s each)."""
+    def _status_service_instance(self):
         from ..core.claude.status import ClaudeStatusService
 
         if self._status_service is None:
             self._status_service = ClaudeStatusService(self.environment, self.tools)
-        service, folders = self._status_service, self.claude_folders_in_use
+        return self._status_service
+
+    def _known_claude_status(self, account):
+        """Verificar's folder status (off the UI thread): the model's, else the status
+        service's (its own cache, or `claude auth status` when it has none)."""
+        known = self.claude_statuses.get(account.id)
+        return known if known is not None else self._status_service_instance().status(account)
+
+    def refresh_claude_statuses(self, on_done: Callable[[], None] | None = None) -> None:
+        """Login status of every folder in use (`claude auth status` takes ~1 s each)."""
+        service, folders = self._status_service_instance(), self.claude_folders_in_use
 
         def work():
             return {ClaudeFolder.own_login(d).id: service.status(ClaudeFolder.own_login(d)) for d in folders}
@@ -618,11 +623,7 @@ class AppModel:
     def refresh_folder_status(self, config_dir: str | None, force: bool = True,
                               on_done: Callable[[], None] | None = None) -> None:
         """Mac refreshFolderStatus: after the folder's login or logout, its status read again."""
-        from ..core.claude.status import ClaudeStatusService
-
-        if self._status_service is None:
-            self._status_service = ClaudeStatusService(self.environment, self.tools)
-        service, account = self._status_service, ClaudeFolder.own_login(config_dir)
+        service, account = self._status_service_instance(), ClaudeFolder.own_login(config_dir)
 
         def finished(status, _error):
             if status is not None:
@@ -660,8 +661,11 @@ class AppModel:
             if on_done is not None:
                 on_done(None, None)
             return
-        # The model's scanner (no GTK here: the tray runs this too).
-        verifier = Verifier(self.environment, self.tools, self.processes, engine=self.engine, log=self.log)
+        # The model's scanner (no GTK here: the tray runs this too), and the folders'
+        # statuses the model already has (the Mac passes its status service,
+        # AppModel.swift:444-452): no second `claude auth status` for a cached folder.
+        verifier = Verifier(self.environment, self.tools, self.processes, engine=self.engine, log=self.log,
+                            claude_status=self._known_claude_status)
 
         def finished(report, error):
             if report is not None:

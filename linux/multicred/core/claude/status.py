@@ -11,6 +11,7 @@ import threading
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from .. import claude_paths
 from ..runner import CommandRequest, run_checked
@@ -40,6 +41,34 @@ class ClaudeLoginStatus:
     @property
     def is_logged_in(self) -> bool:
         return self.kind == "loggedIn"
+
+
+def account_has_token(account, secrets) -> bool:
+    """Whether a Claude account can be used now. Login accounts live in the vault (the switch
+    preflight checks it, not every render); token accounts need their secret, and a store
+    that cannot be reached counts as no token."""
+    from ..models import ClaudeAccountKind
+
+    if account.kind == ClaudeAccountKind.LOGIN:
+        return True
+    try:
+        return bool(secrets.contains_item(account.secret_account))
+    except Exception:
+        return False
+
+
+def needs_claude_login(profile, config, has_token: Callable[[object], bool],
+                       folder_status: Callable[[str | None], "ClaudeLoginStatus | None"]) -> bool:
+    """"⚠︎ Claude precisa entrar" (the tray, the sidebar, Visão geral, `multicred perfis`): the
+    profile's Claude account without its token, or, with no account, its folder known to be
+    logged out (unknown or not asked yet is never "logged out"). The callers bring the
+    lookups: the app its cached statuses, the terminal a fresh one; `folder_status` is only
+    asked when the profile has no account."""
+    account = config.claude_account(profile.claude_account_id) if config is not None else None
+    if account is not None:
+        return not has_token(account)
+    status = folder_status(profile.claude_config_dir)
+    return status is not None and status.kind == "loggedOut"
 
 
 def state_file(account, environment) -> Path:

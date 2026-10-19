@@ -26,6 +26,7 @@ import getpass
 import queue
 import unicodedata
 
+from .cli import choice_index
 from .core.models import APIProvider, ClaudeAccountKind, GitHubAccount, GitIdentity, Profile, ProfileColor, \
     ProfileIcon, ShellKind
 
@@ -161,8 +162,9 @@ class Terminal:
             answer = self.read(f"{title}" + (f" [{current_label}]" if current_label else "") + ": ").strip()
             if not answer:
                 return current
-            if answer.isdigit() and 1 <= int(answer) <= len(entries):
-                return entries[int(answer) - 1][0]
+            index = choice_index(answer, len(entries))
+            if index is not None:
+                return entries[index][0]
             match = [value for value, label in entries if label.casefold() == answer.casefold()]
             if match:
                 return match[0]
@@ -175,8 +177,9 @@ class Terminal:
             answer = self.read(f"Cor [{COLOR_NAMES[current]}]: ").strip()
             if not answer:
                 return current
-            if answer.isdigit() and 1 <= int(answer) <= len(colors):
-                return colors[int(answer) - 1]
+            index = choice_index(answer, len(colors))
+            if index is not None:
+                return colors[index]
             match = [c for c in colors if COLOR_NAMES[c].casefold() == answer.casefold()]
             if match:
                 return match[0]
@@ -1272,8 +1275,8 @@ class Menus:
                     (None, self._own_login_label(draft.claude_config_dir))] + [
                     (a.id, a.nickname + (f" · {a.email}" if a.email else "")) for a in config.claude_accounts],
                     draft.claude_account_id)
-            elif key.isdigit() and 8 <= int(key) < 8 + len(providers):
-                provider = providers[int(key) - 8]
+            elif (provider_index := choice_index(key, len(providers), first=8)) is not None:
+                provider = providers[provider_index]
                 keys = [k for k in config.api_keys if k.provider == provider]
                 current = next((k for k in draft.api_key_ids if k in [x.id for x in keys]), None)
                 chosen = self.t.pick(provider.display_name, [(None, "Nenhuma")] + [

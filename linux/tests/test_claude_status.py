@@ -150,5 +150,68 @@ class ClaudeStatusTests(SafeTestCase):
         self.assertNotIn("sk-ant", json.dumps(dataclasses.asdict(status)))
 
 
+class NeedsClaudeLoginRuleTests(unittest.TestCase):
+    """S-17 (review r1): one rule for "⚠︎ Claude precisa entrar" (the tray, the sidebar, Visão
+    geral and `multicred perfis`): the profile's Claude account without its token, or else the
+    profile's folder known to be logged out. The lookups stay with the callers (the app's
+    cache, the terminal's fresh status)."""
+
+    def setUp(self):
+        from multicred.core.models import ClaudeAccountKind, Config, Profile
+        self.token = ClaudeAccount(nickname="Ana", color=ProfileColor.ORANGE)
+        self.login = ClaudeAccount(nickname="Bia", color=ProfileColor.TEAL, kind=ClaudeAccountKind.LOGIN)
+        self.profile = Profile(name="Trabalho", color=ProfileColor.INDIGO, claude_config_dir="/h/.claude-t")
+        self.config = Config(claude_accounts=[self.token, self.login], profiles=[self.profile])
+        self.asked = []
+
+    def needs(self, has_token=lambda account: True, status=None, profile=None, config="default"):
+        from multicred.core.claude.status import needs_claude_login
+
+        def folder_status(config_dir):
+            self.asked.append(config_dir)
+            return status
+        return needs_claude_login(profile or self.profile, self.config if config == "default" else config,
+                                  has_token, folder_status)
+
+    def test_the_profile_account_without_its_token_needs_a_login(self):
+        self.profile.claude_account_id = self.token.id
+        self.assertTrue(self.needs(has_token=lambda account: account is not self.token))
+        self.assertFalse(self.needs(has_token=lambda account: True, status=ClaudeLoginStatus.logged_out()))
+        self.assertEqual(self.asked, [], "with an account the folder's own login does not matter (not asked)")
+
+    def test_without_an_account_a_logged_out_folder_needs_a_login(self):
+        self.assertTrue(self.needs(status=ClaudeLoginStatus.logged_out()))
+        self.assertEqual(self.asked, ["/h/.claude-t"])
+        for status in (ClaudeLoginStatus.logged_in("a@b.com"), ClaudeLoginStatus.logged_in(None),
+                       ClaudeLoginStatus.unknown("Claude Code not found"), None):
+            self.assertFalse(self.needs(status=status), status)  # unknown is never "logged out"
+
+    def test_an_account_no_longer_in_the_configuration_falls_back_to_the_folder(self):
+        import uuid
+        self.profile.claude_account_id = uuid.uuid4()
+        self.assertTrue(self.needs(has_token=lambda account: False, status=ClaudeLoginStatus.logged_out()))
+        self.assertFalse(self.needs(has_token=lambda account: False, status=ClaudeLoginStatus.logged_in(None)))
+
+    def test_no_configuration_looks_only_at_the_folder(self):
+        self.profile.claude_account_id = self.token.id
+        self.assertTrue(self.needs(has_token=lambda account: False, status=ClaudeLoginStatus.logged_out(),
+                                   config=None))
+
+    def test_has_token(self):
+        from multicred.core.claude.status import account_has_token
+        from multicred.core.secrets import InMemorySecretStore
+
+        class Unreachable:
+            def contains_item(self, _account):
+                raise OSError("locked")
+
+        secrets = InMemorySecretStore()
+        self.assertTrue(account_has_token(self.login, Unreachable()), "login accounts live in the vault")
+        self.assertFalse(account_has_token(self.token, secrets))
+        secrets.set_secret(b"sk-ant-oat01-x", self.token.secret_account)
+        self.assertTrue(account_has_token(self.token, secrets))
+        self.assertFalse(account_has_token(self.token, Unreachable()), "unreachable store: no token to use")
+
+
 if __name__ == "__main__":
     unittest.main()

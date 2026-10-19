@@ -145,16 +145,10 @@ class _Facts:
     has_token: Callable
     folder_name: Callable
 
-    def status_kind(self, config_dir: str | None) -> str | None:
-        status = self.folder_status(config_dir)
-        return status.kind if status is not None else None
-
     def needs_claude_login(self, profile: Profile) -> bool:
-        """AppModel.needs_claude_login: a missing token, or a folder known to be logged out."""
-        account = self.config.claude_account(profile.claude_account_id)
-        if account is not None:
-            return not self.has_token(account)
-        return self.status_kind(profile.claude_config_dir) == "loggedOut"
+        """AppModel.needs_claude_login: the core rule with the facts' lookups."""
+        from ..core.claude.status import needs_claude_login
+        return needs_claude_login(profile, self.config, self.has_token, self.folder_status)
 
 
 def _status(verification, problems, inconsistent: bool, verifying: bool) -> str:

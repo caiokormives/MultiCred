@@ -310,6 +310,176 @@ class CliTests(SafeTestCase):
         self.assertEqual(code, 0, out)
 
 
+class CliReviewR1Tests(SafeTestCase):
+    """S-15 (review r1): Unicode digits in the choices, "Usar agora" without a profile, the report
+    after "Corrigir tudo" at the depth of the first one, and "Corrigir tudo" from `report.fixable`."""
+
+    # Digits Python's str.isdigit() accepts besides 0-9: superscript two, Arabic-Indic one,
+    # full-width one (the last two even convert with int()).
+    UNICODE_DIGITS = ("²", "١", "１")
+
+    def setUp(self):
+        super().setUp()
+        from tests.login_support import ToolsAt
+        from tests.test_cli_menus import responder
+        self.sandbox = real_env.make_sandbox(self.home / "sandbox", responder=responder)
+        config = real_env.seed_sandbox(self.sandbox)
+        self.ana = ClaudeAccount(nickname="Ana", color=ProfileColor.ORANGE)
+        self.sandbox.secrets.set_secret(b"sk-ant-oat01-x", self.ana.secret_account)
+        config.claude_accounts = [self.ana]
+        ConfigRepository(self.sandbox).save(config)
+        self.tools = ToolsAt(git="/usr/bin/git", gh="/usr/bin/gh")
+
+    def cli(self, *argv, inp=""):
+        return run(argv, self.sandbox, self.tools, inp=inp)
+
+    def edit(self, change):
+        repository = ConfigRepository(self.sandbox)
+        config = repository.load()
+        change(config)
+        repository.save(config)
+
+    # achado 1: str.isdigit() + int()
+
+    def test_unicode_digits_are_not_profile_numbers(self):
+        for text in self.UNICODE_DIGITS:
+            code, out, err = self.cli("trocar", text)
+            self.assertEqual((code, out), (1, ""), text)
+            self.assertIn(f"Nenhum perfil chamado “{text}”", err)
+
+    def test_unicode_digits_are_not_claude_account_numbers(self):
+        self.assertEqual(self.cli("trocar", "Trabalho")[0], 0)
+        for text in self.UNICODE_DIGITS:
+            code, out, err = self.cli("claude", text)
+            self.assertEqual((code, out), (1, ""), text)
+            self.assertIn(f"Nenhuma conta Claude chamada “{text}”", err)
+
+    def test_ascii_numbers_still_choose(self):
+        config = ConfigRepository(self.sandbox).load()
+        self.assertEqual(cli.resolve_profile(config, " 2 ").name, "Pessoal")
+        self.assertIs(cli.resolve_claude_account(config, "1"), config.claude_accounts[0])
+        self.assertIsNone(cli.resolve_profile(config, "02"))
+
+    def test_menu_lists_and_colors_say_invalid_option_for_unicode_digits(self):
+        from multicred.cli_menus import Terminal
+        for text in self.UNICODE_DIGITS:
+            out = io.StringIO()
+            terminal = Terminal(out, io.StringIO(f"{text}\n2\n"), interactive=True)
+            self.assertEqual(terminal.pick("Git", [("a", "A"), ("b", "B")], None), "b", text)
+            self.assertIn("Opção inválida.", out.getvalue())
+            out = io.StringIO()
+            terminal = Terminal(out, io.StringIO(f"{text}\n1\n"), interactive=True)
+            self.assertEqual(terminal.color(ProfileColor.ORANGE), list(ProfileColor)[0], text)
+            self.assertIn("Opção inválida.", out.getvalue())
+
+    def test_choice_index_takes_only_ascii_numbers_in_range(self):
+        self.assertEqual(cli.choice_index("3", 3), 2)
+        self.assertEqual(cli.choice_index("8", 2, first=8), 0)
+        for text in ("0", "4", "", "-1", "1.0", " 1", *self.UNICODE_DIGITS):
+            self.assertIsNone(cli.choice_index(text, 3), text)
+        self.assertIsNone(cli.choice_index("7", 2, first=8))
+
+    # achado 5 (not applied, see the S-15 report): removing the applied Claude account with no
+    # active profile still goes back to the folder's login, like the Mac (AppModel.swift:372-375,
+    # "Shells must stop exporting a token that no longer exists") and ui/model.py.
+
+    def test_removing_the_applied_account_without_a_profile_goes_back_to_the_folder_login(self):
+        from multicred.core.models import ActiveState
+        from multicred.core.paths import AppPaths
+        from multicred.core.storage import StateStore
+        store = StateStore(AppPaths(self.sandbox), self.sandbox.clock)
+        # The active profile was deleted ("o sistema fica como está"): the token stays applied.
+        store.commit(ActiveState(applied_claude_account_id=self.ana.id, generation=1))
+        code, out, err = self.cli("contas", "--menu", inp="3\n1\nr\ns\n0\n0\n")
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertIn("Conta Ana removida", out)
+        self.assertIn("Conta Claude: login da pasta", out)
+        self.assertNotIn("Não consegui trocar a conta Claude", out)
+        self.assertEqual(ConfigRepository(self.sandbox).load().claude_accounts, [])
+        state = store.load()
+        self.assertEqual((state.profile_id, state.applied_claude_account_id, state.generation), (None, None, 2))
+
+    # achado 8: the report after "Corrigir tudo" has the depth of the first
+
+    def _github_profile_with_a_stale_login(self):
+        """Trabalho uses dev-b, whose gh login is no longer valid (the deep run's warning)."""
+        from tests import test_cli_menus
+        logins = {"hosts": {"github.com": [
+            {"host": "github.com", "login": "dev-a", "active": True, "state": "success"},
+            {"host": "github.com", "login": "dev-b", "active": False, "state": "error"},
+        ]}}
+        original = test_cli_menus.GH_LOGINS
+        test_cli_menus.GH_LOGINS = logins
+        self.addCleanup(setattr, test_cli_menus, "GH_LOGINS", original)
+        account = GitHubAccount(nickname="Dev B", username="dev-b", color=ProfileColor.BLUE)
+        self.edit(lambda config: (config.github_accounts.append(account),
+                                  setattr(config.profiles[0], "github_account_id", account.id)))
+
+    def test_verificar_corrigir_shows_the_new_report_as_deep_as_the_first(self):
+        self._github_profile_with_a_stale_login()
+        self.assertEqual(self.cli("trocar", "Trabalho")[0], 0)
+        code, out, _ = self.cli("verificar", "--corrigir", inp="s\n")
+        before, after = out.split("Executar? [s/N] ", 1)
+        before, after = before.splitlines(), after.lstrip("\n").splitlines()
+        self.assertIsNotNone(row_of(before, "!", "GitHub CLI · login de dev-b"), before)
+        self.assertRegex(after[1], HEADER_LINE)
+        self.assertIsNotNone(row_of(after, "!", "GitHub CLI · login de dev-b"), after)
+        self.assertIn("  No terminal: multicred entrar github", after)
+
+    def test_verificar_corrigir_keeps_the_errors_of_the_repairs(self):
+        from datetime import datetime, timezone
+        from unittest import mock
+
+        from multicred.core.engine.verifier import Check, CheckStatus, Fix, VerifyReport
+        broken = Check("shell", "Bash carrega o MultiCred", CheckStatus.ERROR, fix=Fix("install", "Reescrever"))
+        token = Check("gh.token", "GitHub CLI · login de dev-b", CheckStatus.WARNING)
+        when = datetime(2026, 10, 19, 12, tzinfo=timezone.utc)
+
+        class FakeVerifier:
+            runs = []
+
+            def run(self, config, state, deep=False):
+                self.runs.append(deep)
+                return VerifyReport([broken, token] if len(self.runs) == 1 else [token], when)
+
+            def fix_all(self, report, config):
+                return VerifyReport([], when, errors=["Bash carrega o MultiCred: sem permissão"])
+
+        fake = FakeVerifier()
+        with mock.patch.object(cli, "make_verifier", lambda *args, **kwargs: fake):
+            code, out, err = self.cli("verificar", "--corrigir", inp="s\n")
+        self.assertEqual(fake.runs, [True, True])
+        after = out.split("Executar? [s/N] ", 1)[1].splitlines()
+        self.assertIsNotNone(row_of(after, "!", "GitHub CLI · login de dev-b"), after)
+        self.assertIn("Não consegui corrigir: Bash carrega o MultiCred: sem permissão", err)
+        self.assertEqual(code, 1)
+
+    # achado 7: "Corrigir tudo" = report.fixable, one per key
+
+    def test_runnable_fixes_are_report_fixable_deduplicated_by_key(self):
+        from datetime import datetime, timezone
+
+        from multicred.core.engine.verifier import Check, CheckStatus, Fix, FixKind, VerifyReport
+        install = Fix("install", "Reescrever o bloco", lambda: None)
+        bare = Fix("gh", "gh auth switch")  # runs (kind RUN) even without `apply` in this report
+        checks = [
+            Check("bash", "Bash", CheckStatus.ERROR, fix=install),
+            Check("zsh", "Zsh", CheckStatus.ERROR, fix=install),
+            Check("gh", "GitHub CLI · conta ativa", CheckStatus.ERROR, fix=bare),
+            Check("claude.login", "Claude Code · conta", CheckStatus.ERROR,
+                  fix=Fix("login-claude:x", "Entrar", kind=FixKind.LOGIN_CLAUDE)),
+            Check("legacy", "Legado", CheckStatus.WARNING, fix=Fix("install-legacy", "Remover")),
+        ]
+        report = VerifyReport(checks, datetime(2026, 10, 19, tzinfo=timezone.utc))
+        expected = []
+        for check in report.fixable:
+            if check.fix.key not in [fix.key for fix in expected]:
+                expected.append(check.fix)
+        self.assertEqual(cli.runnable_fixes(report), expected)
+        self.assertEqual([fix.key for fix in cli.runnable_fixes(report)], ["install", "gh"])
+        self.assertFalse(hasattr(cli, "_opens_page"), "one rule: Fix.opens_page / report.fixable")
+
+
 def _wording_failures():
     return {
         "apiKeyMissing": PreflightFailure("apiKeyMissing", "Empresa", "OPENAI_API_KEY"),

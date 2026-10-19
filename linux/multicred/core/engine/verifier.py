@@ -276,8 +276,11 @@ class Verifier:
         # cached statuses. Default: asked fresh on every run (a login just made shows).
         self.claude_status = claude_status or self._fresh_claude_status
         # Statuses kept while one fix / "Corrigir tudo" re-checks several times (each
-        # `claude auth status` costs about a second); None outside them.
+        # `claude auth status` costs about a second); None outside them. Same for
+        # Termux's Claude Code diagnosis (`claude --version`, up to 10 s): no repair
+        # here changes Claude Code.
         self._status_memo: dict[str | None, object] | None = None
+        self._diagnosis_memo: dict[str | None, object] | None = None
         self._config: Config | None = None
         platform = environment.platform
         # In the Mac's order: Ferramentas (git, gh, Claude, keys), Integração, Sessões.
@@ -352,11 +355,11 @@ class Verifier:
 
     @contextmanager
     def _remembering_statuses(self):
-        self._status_memo = {}
+        self._status_memo, self._diagnosis_memo = {}, {}
         try:
             yield
         finally:
-            self._status_memo = None
+            self._status_memo, self._diagnosis_memo = None, None
 
     def _fresh(self, config: Config) -> VerifyReport:
         state = StateStore(self.paths, self.environment.clock).load()
@@ -592,7 +595,13 @@ class Verifier:
         from ..claude import termux_support
 
         folder = context.profile.claude_config_dir if context.profile else None
-        diagnosis = termux_support.diagnose(self.environment, self.tools, folder)
+        memo = self._diagnosis_memo
+        if memo is not None and folder in memo:
+            diagnosis = memo[folder]
+        else:
+            diagnosis = termux_support.diagnose(self.environment, self.tools, folder)
+            if memo is not None:
+                memo[folder] = diagnosis
         if diagnosis.state == termux_support.ClaudeCodeState.MISSING:
             status = CheckStatus.INFO
         elif diagnosis.is_broken:

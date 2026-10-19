@@ -185,15 +185,24 @@ def run(args, environment=None, tools=None, out=None, err=None, inp=None) -> int
     }[args.command]()
 
 
+def choice_index(text: str, count: int, first: int = 1) -> int | None:
+    """The 0-based position of a typed number among `count` choices numbered from `first`,
+    or None. Only ASCII 0-9: str.isdigit() also takes "²" (int() then raises) and
+    int() reads "١" or "１" as 1, which nobody typing a menu number means."""
+    if not (text.isascii() and text.isdecimal()):
+        return None
+    index = int(text) - first
+    return index if 0 <= index < count else None
+
+
 def resolve_profile(config, text: str):
     """By name, ignoring case, or by position 1–9 (the Ctrl+N of the menu). None when neither."""
     wanted = text.strip().casefold()
     for profile in config.profiles:
         if profile.name.casefold() == wanted:
             return profile
-    if wanted.isdigit() and len(wanted) == 1 and 1 <= int(wanted) <= min(9, len(config.profiles)):
-        return config.profiles[int(wanted) - 1]
-    return None
+    index = choice_index(wanted, min(9, len(config.profiles))) if len(wanted) == 1 else None
+    return config.profiles[index] if index is not None else None
 
 
 _UNRESOLVED = object()
@@ -208,9 +217,8 @@ def resolve_claude_account(config, text: str):
     for account in config.claude_accounts:
         if account.nickname.casefold() == wanted:
             return account
-    if wanted.isdigit() and 1 <= int(wanted) <= len(config.claude_accounts):
-        return config.claude_accounts[int(wanted) - 1]
-    return _UNRESOLVED
+    index = choice_index(wanted, len(config.claude_accounts))
+    return config.claude_accounts[index] if index is not None else _UNRESOLVED
 
 
 def folder_name(environment, config_dir: str | None) -> str:
@@ -263,18 +271,13 @@ def _needs_attention(check) -> bool:
     return _value(check.status) not in ("ok", "info")
 
 
-def _opens_page(fix) -> bool:
-    """A fix that leads to a login or a key's editor: the app opens a page, nothing runs."""
-    return bool(getattr(fix, "opens_page", False)) or fix.apply is None
-
-
 def runnable_fixes(report) -> list:
-    """What "Corrigir tudo" runs: one fix per key (several checks may share one repair)."""
+    """What "Corrigir tudo" runs: `report.fixable` (no login or key page), one fix per key
+    (several checks may share one repair). The window's page does the same."""
     fixes = []
     for check in report.fixable:
-        fix = check.fix
-        if not _opens_page(fix) and fix.key not in {f.key for f in fixes}:
-            fixes.append(fix)
+        if check.fix.key not in {f.key for f in fixes}:
+            fixes.append(check.fix)
     return fixes
 
 
@@ -295,7 +298,7 @@ def check_lines(check, terminal_command=None) -> list[str]:
         # The button's title ("Corrigir", "Entrar…", "Abrir chave…") followed by what it does.
         label = getattr(check.fix, "button_title", "Corrigir").rstrip("…")
         lines.append(f"  {label}: {check.fix.command}")
-        command = terminal_command(check.fix) if terminal_command is not None and _opens_page(check.fix) else None
+        command = terminal_command(check.fix) if terminal_command is not None and check.fix.opens_page else None
         if command:
             lines.append(f"  No terminal: {command}")
     return lines
@@ -490,19 +493,12 @@ class _Session:
             return None
         return config, engine, state
 
-    # MARK: Claude logins (ui/model.py: has_token, folder_status, needs_claude_login)
+    # MARK: Claude logins (the rules in core/claude/status.py, shared with ui/model.py; here the
+    # folder's status is asked fresh instead of read from the app's cache)
 
     def _has_token(self, account) -> bool:
-        """Login accounts live in the vault (the switch preflight checks it); token
-        accounts need their secret."""
-        from .core.models import ClaudeAccountKind
-
-        if account.kind == ClaudeAccountKind.LOGIN:
-            return True
-        try:
-            return bool(self.environment.secrets.contains_item(account.secret_account))
-        except Exception:
-            return False
+        from .core.claude.status import account_has_token
+        return account_has_token(account, self.environment.secrets)
 
     def _folder_status(self, config_dir: str | None):
         """`claude auth status` of the folder, or what its .claude.json says (never a token)."""
@@ -517,11 +513,8 @@ class _Session:
             return None
 
     def _needs_claude_login(self, config, profile) -> bool:
-        account = config.claude_account(profile.claude_account_id)
-        if account is not None:
-            return not self._has_token(account)
-        status = self._folder_status(profile.claude_config_dir)
-        return status is not None and status.kind == "loggedOut"
+        from .core.claude.status import needs_claude_login
+        return needs_claude_login(profile, config, self._has_token, self._folder_status)
 
     # MARK: commands
 
@@ -710,7 +703,13 @@ class _Session:
             self._say("Nada foi alterado.")
             return 1
         try:
-            report = verifier.fix_all(report, config)
+            errors = verifier.fix_all(report, config).errors
+            # fix_all re-checks shallowly between repairs; the report shown has the depth of
+            # the first, so the GitHub login row stays while it is not resolved and "N de M"
+            # counts the same rows. (The window keeps the Mac's shallow re-check:
+            # AppModel.swift:500/510 verify(checkTokens: false).)
+            report = verifier.run(config, engine.current_state(), deep=True)
+            report.errors = errors
         except Exception as error:
             self._say(f"Não consegui corrigir: {error}", error=True)
             return 1

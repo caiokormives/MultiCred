@@ -298,6 +298,41 @@ class VerifierTests(VerifierTestCase):
         verifier.run(self.config, self.state)
         self.assertEqual(len(asked), 2, "a plain run asks again")
 
+    def claude_status_requests(self):
+        return [r for r in self.runner.requests
+                if Path(r.executable).name == "claude" and r.arguments[:2] == ["auth", "status"]]
+
+    def model_verify(self, model):
+        import threading
+        done = threading.Event()
+        found = []
+        model.verify(lambda report, error: (found.append((report, error)), done.set()))
+        self.assertTrue(done.wait(20), "verify never finished")
+        report, error = found[0]
+        self.assertIsNone(error)
+        return report
+
+    def test_the_app_model_passes_its_cached_folder_statuses(self):
+        """S-16 (review r1): AppModel.verify gives the Verifier the statuses the model already
+        has (the Mac passes its status service, AppModel.swift:444-452), so the profile's
+        folder is not asked `claude auth status` again; not cached yet → asked once."""
+        from multicred.core.models import ClaudeFolder
+        from multicred.ui.model import AppModel
+
+        model = AppModel(self.environment, FakeTools(), processes=FixedProcessScanner(0))
+        model.config, model.state = self.config, StateStore(self.paths, self.environment.clock).load()
+        before = len(self.claude_status_requests())
+        model.claude_statuses[ClaudeFolder.own_login(self.claude_dir).id] = ClaudeLoginStatus.logged_in(
+            "cache@empresa.com.br")
+        item = self.check(self.model_verify(model), "claude.login")
+        self.assertEqual(item.found, "login da pasta ~/.claude-empresa · cache@empresa.com.br")
+        self.assertEqual(len(self.claude_status_requests()), before, "cached: claude auth status not run")
+
+        model.claude_statuses.clear()
+        item = self.check(self.model_verify(model), "claude.login")
+        self.assertEqual(item.found, "login da pasta ~/.claude-empresa · dev@empresa.com.br")  # the folder's file
+        self.assertEqual(len(self.claude_status_requests()), before + 1)
+
     def test_claude_account_in_use_is_checked_in_the_keyring_and_its_fix_signs_in_again(self):
         """Verifier.swift:130-144: with an account applied, the folder's own login does not
         matter; a missing token or login leads to "Entrar…" for that account."""
