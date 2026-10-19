@@ -27,6 +27,7 @@ class ClaudeCredentialStore(Protocol):
     def read_vault(self, key: str) -> bytes | None: ...
     def write_vault(self, key: str, data: bytes) -> None: ...
     def delete_vault(self, key: str) -> None: ...
+    def vault_keys(self) -> list[str]: ...
 
 
 def folder_key(config_dir: str | None) -> str:
@@ -62,6 +63,10 @@ class InMemoryClaudeCredentialStore:
     def delete_vault(self, key):
         with self._lock:
             self.vault.pop(key, None)
+
+    def vault_keys(self):
+        with self._lock:
+            return sorted(self.vault)
 
 
 class InMemoryVaultBackend:
@@ -158,3 +163,7 @@ class FileClaudeCredentialStore:
 
     def delete_vault(self, key):
         self.vault.clear(key)
+
+    def vault_keys(self):
+        """Every key MultiCred's login vault holds (uninstall empties all of them)."""
+        return self.vault.accounts()

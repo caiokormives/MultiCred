@@ -316,8 +316,11 @@ class SwitchEngine:
             cli.switch_account(account.host, account.username)
 
             def undo():
-                if previous is not None:
-                    cli.switch_account(account.host, previous)
+                if previous is None:
+                    # gh had no active account recorded for the host: there is nothing to
+                    # switch back to, so the rollback reports this step as not undone.
+                    raise RuntimeError(f"conta anterior do gh em {account.host} desconhecida")
+                cli.switch_account(account.host, previous)
             return undo
 
         return SwitchStep(SwitchStepKind.GITHUB, apply)

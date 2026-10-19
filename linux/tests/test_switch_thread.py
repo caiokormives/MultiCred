@@ -197,6 +197,37 @@ class ModelWithoutGtkTests(unittest.TestCase):
         self.assertIn("VERIFY-OK", done.stdout, done.stdout + done.stderr)
 
 
+class RemovingTheAppliedClaudeAccountTests(SafeTestCase):
+    """S-34: removing the Claude account in use always brings Claude back to the folder's
+    own login, with or without an active profile, and after a running switch."""
+
+    def setUp(self):
+        super().setUp()
+        from multicred.core.models import ActiveState, ClaudeAccount, ClaudeAccountKind
+        self.token = ClaudeAccount(nickname="Marco", color=ProfileColor.TEAL, kind=ClaudeAccountKind.TOKEN)
+        self.secrets.set_secret(b"sk-ant-oat01-marco", self.token.secret_account)
+        ConfigRepository(self.environment).save(Config(claude_accounts=[self.token]))
+        self.model = AppModel(self.environment, base.FakeTools())
+        self.model.load()
+        self.model.state = ActiveState(applied_claude_account_id=self.token.id, generation=3)  # no profile
+        self.resets = []
+        self.model.switch_claude_only = lambda account, on_done: self.resets.append(account)
+
+    def test_without_an_active_profile_the_token_is_dropped_at_once(self):
+        self.model.remove_claude_account(self.token.id)
+        self.assertEqual(self.resets, [None], "env files stop exporting the removed token")
+        self.assertIsNone(self.secrets.stored_value(self.token.secret_account))
+
+    def test_during_a_switch_the_reset_waits_for_it_and_runs_once(self):
+        self.model.switching = True
+        self.model.remove_claude_account(self.token.id)
+        self.assertEqual(self.resets, [], "not while another switch runs")
+        self.model.switching = False
+        self.model._run_pending_reapply()
+        self.model._run_pending_reapply()
+        self.assertEqual(self.resets, [None])
+
+
 class ClaudeLoginLockTests(SafeTestCase):
     """S-23: removing a Claude account (and signing one in again) changes the folders'
     logins like a switch does, so it runs under the same lock: never two place() at once."""

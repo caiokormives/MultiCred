@@ -24,7 +24,7 @@ import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ..adapters.session_env import SYSTEMCTL, environment_d_file
+from ..adapters.session_env import SessionEnvironment, environment_d_file
 from ..claude import attribution
 from ..claude.login_vault import ClaudeFolderOccupancy, ClaudeLoginSwitcher, OccupancyUnreadable
 from ..models import ClaudeAccount, ClaudeAccountKind, Config, uuid_text
@@ -36,7 +36,7 @@ from . import managed_block
 from .autostart import Autostart
 from .installer import Installer, Integrations
 
-CLAUDE_VARIABLE = "CLAUDE_CONFIG_DIR"
+from ..engine.switch_engine import CLAUDE_VARIABLE  # noqa: E402
 CREATED_FOLDERS_FILE = "created-claude-folders.json"
 
 
@@ -319,6 +319,11 @@ class Uninstaller:
         keys = [uuid_text(a.id) for a in self._login_accounts()]
         keys += [ClaudeLoginSwitcher.own_login_key(folder) for folder in folders]
         store = self.environment.claude_credentials
+        # Also own logins saved for folders no profile uses any more: the vault is listed.
+        try:
+            keys += [k for k in store.vault_keys() if k not in keys]
+        except Exception as error:
+            report.problems.append(f"Cofre de logins do Claude: {error}")
         for key in (k for k in keys if k not in kept):
             try:
                 store.delete_vault(key)
@@ -390,10 +395,10 @@ class Uninstaller:
                 report.problems.append(f"{self._abbreviate(path)}: {error}")
 
     def _unset_session(self, report: UninstallReport) -> None:
-        environment = self.environment.base_process_environment(["/usr/bin", "/bin"])
-        request = CommandRequest(SYSTEMCTL, ["--user", "unset-environment", CLAUDE_VARIABLE], environment, timeout=10)
+        # The same path a switch uses (session bus included), so both stay in step.
+        session = SessionEnvironment(self.environment, self.environment.base_process_environment(["/usr/bin", "/bin"]))
         try:
-            run_checked(self.environment.runner, request)
+            session.apply(CLAUDE_VARIABLE, None)
         except Exception as error:
             report.problems.append(f"systemctl --user unset-environment {CLAUDE_VARIABLE}: {error}")
 

@@ -36,6 +36,10 @@ class SystemEnvironment:
     # The user's $XDG_CONFIG_HOME, if set. git reads its global config from
     # $XDG_CONFIG_HOME/git/config (or ~/.config/git/config when unset).
     xdg_config_home: str | None = None
+    # The session bus of the desktop session. `systemctl --user` needs it (without it:
+    # "Failed to connect to bus: No medium found"); the Secret Service clients too.
+    xdg_runtime_dir: str | None = None
+    dbus_session_bus_address: str | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "home", Path(self.home))
@@ -92,4 +96,8 @@ class SystemEnvironment:
         }
         if self.xdg_config_home:
             env["XDG_CONFIG_HOME"] = self.xdg_config_home
+        if self.xdg_runtime_dir:
+            env["XDG_RUNTIME_DIR"] = self.xdg_runtime_dir
+        if self.dbus_session_bus_address:
+            env["DBUS_SESSION_BUS_ADDRESS"] = self.dbus_session_bus_address
         return env

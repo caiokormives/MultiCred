@@ -241,6 +241,16 @@ class UninstallerTests(SafeTestCase):
         self.assertEqual(self.claude_store.vault, {}, "the login vault is emptied (accounts and own logins)")
         self.assertTrue(Path(self.claude_dir).is_dir(), "Claude folders are kept by default (D12)")
 
+    def test_own_logins_of_folders_no_profile_uses_any_more_are_deleted_too(self):
+        """S-32: a folder's own login saved while a now-deleted profile used it."""
+        from multicred.core.claude.login_vault import ClaudeLoginSwitcher
+        self.install([B])
+        orphan_key = ClaudeLoginSwitcher.own_login_key(f"{self.home}/.claude-apagado")
+        self.claude_store.write_vault(orphan_key, b'{"claudeAiOauth":{"accessToken":"old","refreshToken":"r"}}')
+        report = self.uninstaller().apply()
+        self.assertEqual(report.problems, [])
+        self.assertNotIn(orphan_key, self.claude_store.vault, "no refresh token left in the keyring")
+
     def test_a_folder_that_could_not_get_its_own_login_back_keeps_its_vault_entries(self):
         """S-11: a failed restore must not delete the folder's original login (the only
         copy, in the vault) nor the account that still lives in that folder."""

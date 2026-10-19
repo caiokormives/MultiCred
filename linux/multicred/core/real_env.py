@@ -44,7 +44,9 @@ def make_real() -> SystemEnvironment:
     name, home, shell = _account()
     return SystemEnvironment(mode="real", home=home, login_shell=shell, user_name=name, runner=ProcessRunner(),
                              secrets=SecretServiceStore(), claude_credentials=FileClaudeCredentialStore(home),
-                             xdg_config_home=os.environ.get("XDG_CONFIG_HOME") or None)
+                             xdg_config_home=os.environ.get("XDG_CONFIG_HOME") or None,
+                             xdg_runtime_dir=os.environ.get("XDG_RUNTIME_DIR") or None,
+                             dbus_session_bus_address=session_bus_address() or None)
 
 
 def make_process_scanner(proc_root: Path = Path("/proc")):

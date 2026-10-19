@@ -382,6 +382,17 @@ class SwitchEngineTests(SafeTestCase):
         self.assertEqual(raised.exception.rollback.failed, (K.SESSION,))
         self.assertEqual(self.system.gh_active, "dev-empresa", "the other steps were still undone")
 
+    def test_github_without_a_known_previous_account_is_reported_as_not_undone(self):
+        """S-33: gh had no `user` for the host, so the switch cannot be reverted; say so."""
+        self.system.gh_active = ""  # `gh config get -h github.com user` prints nothing
+        self.paths.env_fish.parent.mkdir(parents=True, exist_ok=True)
+        self.paths.env_fish.mkdir()  # a later step fails
+        with self.assertRaises(StepFailed) as raised:
+            self.engine().switch_profile(self.personal.id, self.config)
+        self.assertEqual(raised.exception.step, K.ENV_FILES)
+        self.assertIn(K.GITHUB, raised.exception.rollback.failed,
+                      "gh stays on the new account: the rollback must not claim it was undone")
+
     def test_concurrent_switch_is_rejected_as_busy(self):
         engine = self.engine()
         self.system.gh_switch_delay = 0.4

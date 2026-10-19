@@ -44,6 +44,8 @@ class AppModel:
         # S-27: a re-apply asked for while a switch ran (UI thread only); it runs once that
         # switch ends.
         self._reapply_pending = False
+        # The Claude account in use was removed during a switch: reset Claude after it.
+        self._claude_reset_pending = False
         self._listeners: list[Callable[[], None]] = []
         # Filled off the UI thread by refresh_github_logins / refresh_claude_statuses /
         # load_folder_summaries (S-06); empty means "not known yet", never "logged out".
@@ -197,6 +199,9 @@ class AppModel:
         if self._reapply_pending and not self.switching:
             self._reapply_pending = False
             self.reapply_active_profile()
+        if self._claude_reset_pending and not self.switching:
+            self._claude_reset_pending = False
+            self.switch_claude_only(None, lambda _result, _error: None)
 
     def _log(self, level: str, message: str) -> None:
         if self.log is not None:
@@ -457,8 +462,13 @@ class AppModel:
                     self._log("error", f"could not put the Claude account back in its folder: {error!r}")
                 raise
             account_editor.discard_removed_account(account, self.environment.secrets, switcher)
-        if was_applied and self.active_profile is not None and not self.switching:
-            self.switch_claude_only(None, lambda _result, _error: None)
+        if was_applied:
+            # Back to the folder's own login, also without an active profile (a token can be
+            # applied with none); during a switch, once it ends.
+            if self.switching:
+                self._claude_reset_pending = True
+            else:
+                self.switch_claude_only(None, lambda _result, _error: None)
 
     def has_token(self, account) -> bool:
         """Login accounts live in the vault (checked by the switch preflight, not on every
