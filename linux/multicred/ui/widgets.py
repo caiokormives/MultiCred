@@ -1,6 +1,6 @@
 """Small building blocks shared by the main window pages (approved Linux designs A, D, E).
 
-Avatars in the profile colors of tokens.json, status pills, the Ctrl+N hint, color
+Avatars in the profile colors (ProfileColor), status pills, the Ctrl+N hint, color
 swatches, per-field error labels, and the Portuguese text for core errors (the core
 stays language-neutral; UserMessages.swift is the Mac counterpart).
 """
@@ -166,7 +166,7 @@ def page(title: str, content: Gtk.Widget, tag: str | None = None, header_end: li
 
 
 def color_swatches(selected: ProfileColor, on_change: Callable[[ProfileColor], None]) -> tuple[Gtk.Box, dict]:
-    """The eight tokens.json colors as round toggle buttons; returns the box and buttons by value."""
+    """The eight profile colors as round toggle buttons; returns the box and buttons by value."""
     box = Gtk.Box(spacing=6, valign=Gtk.Align.CENTER)
     buttons: dict[str, Gtk.ToggleButton] = {}
     group = None

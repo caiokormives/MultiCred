@@ -1,6 +1,6 @@
 """Profile editor (approved Linux design D), also used for a new profile.
 
-Name, the 8 tokens.json colors, icon letter and a tray preview; composition (git
+Name, the 8 profile colors, icon letter and a tray preview; composition (git
 identity — empty = git is not switched —, GitHub account, Claude folder, Claude account
 — empty = the folder's own login —) and one key per API provider present in the
 configuration. Validation problems are shown next to the field they belong to.

@@ -14,7 +14,7 @@ from enum import Enum
 
 
 class ProfileColor(str, Enum):
-    """The eight profile colors from the design tokens (`perfis-design/tokens.json`)."""
+    """The eight profile colors, the same hex values as the macOS `ProfileColor`."""
 
     INDIGO = "indigo"
     BLUE = "blue"
