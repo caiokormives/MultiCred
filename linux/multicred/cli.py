@@ -9,12 +9,20 @@ conta Claude") and its Verificar page (VerifyPage.swift).
 
     trocar <perfil|1-9>       the menu's profile items
     status                    the menu header
-    perfis                    the menu's "Perfis" section
+    perfis [--menu]           the menu's "Perfis" section; in a terminal (or --menu) the
+                              profile list and editor (cli_menus.py, S-11)
     claude [conta|N|pasta]    the "Trocar só a conta Claude" submenu (no argument: list it)
     verificar [--corrigir]    the Verificar page; "Corrigir tudo" asks before running
+    configurar                the onboarding (cli_menus.py)
+    contas [--menu]           the Contas pages as text; in a terminal (or --menu) their menus
+    entrar claude|pasta|github  the "Entrar…" buttons (a Claude account again, a folder's own
+                              login, gh auth login)
+
+`perfis` and `contas` print a listing when the input is not a terminal (scripts, pipes), so
+their output stays stable; `--menu` asks for the menus anyway (scripted input).
 
 Exit codes: 0 done (verificar: everything de acordo), 1 failure or problems left,
-2 bad usage (argparse).
+2 bad usage (argparse), 130 interrupted (Ctrl+C) in a menu.
 """
 
 from __future__ import annotations
@@ -53,8 +61,11 @@ def build_parser() -> argparse.ArgumentParser:
     switch.add_argument("perfil", help="nome do perfil (maiúsculas não importam) ou número 1–9")
     commands.add_parser("status", help="mostra o perfil ativo e o que ele usa",
                         description="Mostra o perfil ativo e o que ele usa.")
-    commands.add_parser("perfis", help="lista os perfis (✓ no ativo; o número serve para trocar)",
-                        description="Lista os perfis, como o menu da bandeja.")
+    profiles = commands.add_parser(
+        "perfis", help="lista os perfis (✓ no ativo); num terminal, cria, edita e apaga perfis",
+        description="Lista os perfis, como o menu da bandeja. Num terminal, abre o menu para criar, editar, "
+                    "ativar e apagar perfis.")
+    profiles.add_argument("--menu", action="store_true", help="abre o menu mesmo sem terminal (entrada por script)")
     claude = commands.add_parser(
         "claude", help="troca só a conta Claude (sem conta, lista as contas)",
         description="Trocar só a conta Claude: a pasta do perfil ativo fica; git, GitHub e chaves também. "
@@ -67,6 +78,20 @@ def build_parser() -> argparse.ArgumentParser:
                                              "e os segredos têm agora.")
     verify.add_argument("--corrigir", action="store_true",
                         help="corrige tudo o que dá para corrigir (mostra os comandos e pergunta antes)")
+    commands.add_parser("configurar", help="configuração inicial: detecta, sugere perfis, mostra e instala",
+                        description="Procura ferramentas e contas, sugere perfis, mostra o que muda no ~/.bashrc e "
+                                    "no gitconfig e instala.")
+    accounts = commands.add_parser(
+        "contas", help="lista as contas; num terminal, cadastra, edita e remove git, GitHub, Claude e chaves",
+        description="Contas › Git, GitHub, Claude e Chaves de API.")
+    accounts.add_argument("--menu", action="store_true", help="abre o menu mesmo sem terminal (entrada por script)")
+    sign_in = commands.add_parser(
+        "entrar", help="entra de novo numa conta Claude, no login de uma pasta do Claude ou no GitHub",
+        description="claude <conta>: entrar de novo na conta (claude auth login, ou um token colado); "
+                    "pasta [caminho]: o login da própria pasta (a do perfil ativo sem caminho); "
+                    "github [servidor]: gh auth login.")
+    sign_in.add_argument("tipo", choices=["claude", "pasta", "github"])
+    sign_in.add_argument("alvo", nargs="?", help="a conta Claude, a pasta ou o servidor do GitHub")
     return parser
 
 
@@ -112,9 +137,30 @@ def run(args, environment=None, tools=None, out=None, err=None, inp=None) -> int
     from .core.tools import ToolLocator
 
     environment = environment or build_environment(args)
-    tools = tools or ToolLocator(environment, well_known=environment.platform.tool_search_directories)
+    tools = tools or ToolLocator(environment)  # the platform's directories ($PREFIX/bin on Termux)
     log = EventLog(environment.logs_directory, environment.clock)
-    session = _Session(environment, tools, log, out, err, inp or sys.stdin)
+    inp = inp or sys.stdin
+    session = _Session(environment, tools, log, out, err, inp)
+    if args.command in ("configurar", "contas", "perfis", "entrar"):
+        try:
+            interactive = getattr(args, "menu", False) or bool(inp.isatty())
+        except (AttributeError, ValueError):
+            interactive = bool(getattr(args, "menu", False))
+        if args.command == "perfis" and not interactive:
+            return session.profiles()
+        from .cli_menus import Menus, Terminal
+
+        menus = Menus(session, Terminal(out, inp, interactive))
+        try:
+            return {
+                "configurar": menus.configure,
+                "contas": lambda: menus.accounts(interactive),
+                "perfis": menus.profiles,
+                "entrar": lambda: menus.sign_in(args.tipo, args.alvo),
+            }[args.command]()
+        except KeyboardInterrupt:
+            print(file=out)
+            return 130
     return {
         "trocar": lambda: session.switch(args.perfil),
         "status": session.status,
@@ -217,7 +263,9 @@ def runnable_fixes(report) -> list:
     return fixes
 
 
-def check_lines(check) -> list[str]:
+def check_lines(check, terminal_command=None) -> list[str]:
+    """`terminal_command(fix)`: the `multicred …` that does what a fix opening a page does
+    (the login, the key's editor), shown under it; None leaves it out."""
     lines = [f"{_glyph(check)} {check.title}"]
     if check.expected is not None:
         lines.append(f"  Esperado {check.expected}, encontrado {check.found or 'nada'}")
@@ -226,15 +274,19 @@ def check_lines(check) -> list[str]:
     if check.origin:
         lines.append(f"  definido em {check.origin}")
     if check.hint:
-        lines.append(f"  {check.hint}")
+        # A hint may have several lines (Termux's Claude Code guidance): all stay under the row.
+        lines += [f"  {line}" for line in check.hint.splitlines()]
     if check.fix is not None and _needs_attention(check):
         # The button's title ("Corrigir", "Entrar…", "Abrir chave…") followed by what it does.
         label = getattr(check.fix, "button_title", "Corrigir").rstrip("…")
         lines.append(f"  {label}: {check.fix.command}")
+        command = terminal_command(check.fix) if terminal_command is not None and _opens_page(check.fix) else None
+        if command:
+            lines.append(f"  No terminal: {command}")
     return lines
 
 
-def verify_lines(report, tz=None) -> list[str]:
+def verify_lines(report, tz=None, terminal_command=None) -> list[str]:
     """Top ("{perfil}" and "N de M itens de acordo · verificado às HH:MM"), then the rows,
     by section when the verifier gives them (Ferramentas, Integração, Sessões)."""
     lines = [report.profile_name or "Nenhum perfil ativo",
@@ -249,31 +301,36 @@ def verify_lines(report, tz=None) -> list[str]:
         if key in _SECTION_TITLES:
             lines.append(_SECTION_TITLES[key])
         for check in groups[key]:
-            lines += check_lines(check)
+            lines += check_lines(check, terminal_command)
     return lines
 
 
+def terminal_command_for(fix, config, environment) -> str | None:
+    """The `multicred …` for a fix that opens a page in the app (VerifyPage.swift:148-160)."""
+    import shlex
+
+    from .core.engine.verifier import FixKind
+
+    kind = getattr(fix, "kind", None)
+    if kind == FixKind.LOGIN_CLAUDE:
+        account = config.claude_account(fix.target) if config is not None else None
+        return f"multicred entrar claude {shlex.quote(account.nickname)}" if account is not None else None
+    if kind == FixKind.LOGIN_CLAUDE_FOLDER:
+        return f"multicred entrar pasta {shlex.quote(folder_name(environment, fix.target))}"
+    if kind == FixKind.LOGIN_GITHUB:
+        host = fix.target or "github.com"
+        return "multicred entrar github" + ("" if host == "github.com" else f" {shlex.quote(host)}")
+    if kind == FixKind.OPEN_API_KEY:
+        return "multicred contas (Chaves de API)"
+    return None
+
+
 def make_verifier(environment, tools, processes=None, engine=None, log=None):
-    """The app's Verifier. Without a graphical session (Termux) the check of the Claude
-    folder in the session (systemctl --user, environment.d) does not apply, and asking
-    for it would run systemctl, so it is left out. TODO(S-12): drop this once
-    Verifier.run skips that check itself on such platforms."""
-    from .core.engine.verifier import Check, CheckStatus, Verifier
+    """The app's Verifier; it picks the platform's checks itself (no graphical-session
+    check on Termux, a Claude Code check instead)."""
+    from .core.engine.verifier import Verifier
 
-    if environment.platform.has_graphical_session:
-        return Verifier(environment, tools, processes, engine=engine, log=log)
-    skipped = "cli.no-graphical-session"
-
-    class _WithoutGraphicalSession(Verifier):
-        def _session_check(self, profile, env):
-            return Check(skipped, "", CheckStatus.INFO)
-
-        def run(self, config, state, deep=False):
-            report = super().run(config, state, deep)
-            report.checks = [check for check in report.checks if check.id != skipped]
-            return report
-
-    return _WithoutGraphicalSession(environment, tools, processes, engine=engine, log=log)
+    return Verifier(environment, tools, processes, engine=engine, log=log)
 
 
 class _Session:
@@ -292,8 +349,20 @@ class _Session:
             print(line, file=stream)
 
     def _describe(self, error) -> str:
+        """The app's message. Termux has no window, so the hints that name its screens
+        ("Contas › Claude") name the terminal command instead."""
+        import shlex
+
+        from .core.engine.types import Preflight
         from .ui.messages import describe_switch_error
-        return describe_switch_error(error, self.store)
+
+        text = describe_switch_error(error, self.store)
+        if self.environment.platform.has_graphical_session or not isinstance(error, Preflight):
+            return text
+        nickname = error.failure.detail or ""
+        command = f"multicred entrar claude {shlex.quote(nickname)}"
+        return (text.replace("Gere outro em Contas › Claude.", f"Gere outro com: {command}")
+                .replace(f"Em Contas › Claude › {nickname}, use \"Entrar de novo\".", f"Entre de novo com: {command}"))
 
     def _load(self):
         """(config, engine, state), or None after printing why (exit code 1)."""
@@ -306,7 +375,7 @@ class _Session:
             self._say(f"Não consegui ler a configuração: {error}", error=True)
             return None
         if config is None:
-            self._say(NOT_CONFIGURED, error=True)
+            self._say(NOT_CONFIGURED, "Para configurar: multicred configurar", error=True)
             return None
         engine = SwitchEngine(self.environment, self.tools, self.log)
         try:
@@ -367,38 +436,60 @@ class _Session:
         lines = ["Perfis"]
         if not config.profiles:
             lines.append("Nenhum perfil configurado.")
-        for index, profile in enumerate(config.profiles, start=1):
-            line = f"  {index if index <= 9 else ' '}  {profile.name}"
-            if profile.id == state.profile_id:
-                line += f"  {ACTIVE_MARK}"
-            if self._needs_claude_login(config, profile):
-                line += f"  {NEEDS_CLAUDE_LOGIN}"
-            lines.append(line)
+        for index, label in enumerate(self.profile_labels(config, state), start=1):
+            lines.append(f"  {index if index <= 9 else ' '}  {label}")
         self._say(*lines)
         return 0
 
-    def switch(self, text: str) -> int:
-        from .core.models import SwitchFeedback
-        from .ui.feedback import message_for
+    def profile_labels(self, config, state) -> list[str]:
+        """Each profile as the menu shows it: name, ✓ on the active one, the Claude warning."""
+        labels = []
+        for profile in config.profiles:
+            label = profile.name
+            if profile.id == state.profile_id:
+                label += f"  {ACTIVE_MARK}"
+            if self._needs_claude_login(config, profile):
+                label += f"  {NEEDS_CLAUDE_LOGIN}"
+            labels.append(label)
+        return labels
 
+    def switch(self, text: str) -> int:
         loaded = self._load()
         if loaded is None:
             return 1
-        config, engine, previous = loaded
+        config = loaded[0]
         profile = resolve_profile(config, text)
         if profile is None:
             self._say(f"Nenhum perfil chamado “{text}”. Use o nome ou o número de um destes:",
                       *(f"  {index}  {each.name}" for index, each in enumerate(config.profiles, start=1)),
                       error=True)
             return 1
+        return self.switch_to(profile.id, loaded)
+
+    def switch_to(self, profile_id, loaded=None) -> int:
+        """Switches to the profile and prints the app's notification (also used by the menus:
+        "Ativar este perfil", saving the active profile, the end of `configurar`)."""
+        from .core.models import SwitchFeedback
+        from .ui.feedback import message_for
+
+        loaded = loaded or self._load()
+        if loaded is None:
+            return 1
+        config, engine, previous = loaded
+        profile = config.profile(profile_id)
         try:
-            result = engine.switch_profile(profile.id, config)
+            result = engine.switch_profile(profile_id, config)
         except Exception as error:  # SwitchError, or anything else: the app's message, exit 1
-            self._say(f"Não consegui trocar para {profile.name}", self._describe(error), error=True)
+            self._say(f"Não consegui trocar para {profile.name if profile else 'o perfil'}", self._describe(error),
+                      error=True)
             return 1
         message = message_for(self._outcome(config, previous, result, claude_only=False), SwitchFeedback.NOTIFICATION)
         self._say(message.title, message.body)
         return 0
+
+    def forget_folder_status(self) -> None:
+        """After a folder's login changed: ask again."""
+        self._status_service = None
 
     def _claude_choices(self, config, state, profile) -> list[str]:
         """The submenu's items: the folder's own login, then each account."""
@@ -424,15 +515,10 @@ class _Session:
         return lines
 
     def claude(self, text: str | None) -> int:
-        from .core.engine.types import PreflightFailure
-        from .core.models import ClaudeFolder, SwitchFeedback
-        from .ui.feedback import message_for
-        from .ui.messages import describe_preflight
-
         loaded = self._load()
         if loaded is None:
             return 1
-        config, engine, previous = loaded
+        config, _, previous = loaded
         profile = config.profile(previous.profile_id)
         if text is None:
             if profile is None:
@@ -449,14 +535,33 @@ class _Session:
             self._say(f"Nenhuma conta Claude chamada “{text}”. Use o apelido, o número ou “{FOLDER_LOGIN_KEYWORD}”:",
                       *self._claude_choices(config, previous, profile), error=True)
             return 1
-        failure_title = "Não consegui trocar a conta Claude"
-        if profile is None:
-            # The Mac's submenu is off without a profile ("Ative um perfil primeiro").
-            target = account.nickname if account is not None else "login da pasta"
-            self._say(failure_title, describe_preflight(PreflightFailure("noActiveProfile", target), self.store),
-                      error=True)
+        return self.use_claude_account(account.id if account is not None else None, loaded=loaded)
+
+    def use_claude_account(self, account_id, loaded=None, quiet_without_profile=False) -> int:
+        """"Usar agora": only the Claude account changes (None = the folder's own login)."""
+        from .core.engine.types import PreflightFailure
+        from .core.models import ClaudeFolder, SwitchFeedback
+        from .ui.feedback import message_for
+        from .ui.messages import describe_preflight
+
+        loaded = loaded or self._load()
+        if loaded is None:
             return 1
-        override = ClaudeFolder.override_for(account.id if account else None, profile)
+        config, engine, previous = loaded
+        profile = config.profile(previous.profile_id)
+        account = config.claude_account(account_id)
+        failure_title = "Não consegui trocar a conta Claude"
+        if profile is None and account_id is not None:
+            # The Mac's submenu is off without a profile ("Ative um perfil primeiro").
+            self._say(failure_title, describe_preflight(
+                PreflightFailure("noActiveProfile", account.nickname if account else "login da pasta"), self.store),
+                error=True)
+            return 1
+        if profile is None and not quiet_without_profile:
+            self._say(failure_title, describe_preflight(PreflightFailure("noActiveProfile", "login da pasta"),
+                                                        self.store), error=True)
+            return 1
+        override = ClaudeFolder.override_for(account_id, profile)
         try:
             result = engine.switch_claude_only(override, config)
         except Exception as error:
@@ -464,10 +569,11 @@ class _Session:
             return 1
         message = message_for(self._outcome(config, previous, result, claude_only=True), SwitchFeedback.NOTIFICATION)
         self._say(message.title, message.body)
-        if account is None:
+        if account_id is None and profile is not None:
             status = self._folder_status(profile.claude_config_dir)
             if status is not None and status.kind == "loggedOut":
-                self._say(f"A pasta {folder_name(self.environment, profile.claude_config_dir)} não tem login.")
+                self._say(f"A pasta {folder_name(self.environment, profile.claude_config_dir)} não tem login.",
+                          "Para entrar: multicred entrar pasta")
         return 0
 
     def verify(self, fix: bool) -> int:
@@ -482,7 +588,8 @@ class _Session:
         except Exception as error:
             self._say(f"Não consegui verificar: {error}", error=True)
             return 1
-        self._say(*verify_lines(report))
+        hint = lambda fix: terminal_command_for(fix, config, self.environment)  # noqa: E731
+        self._say(*verify_lines(report, terminal_command=hint))
         fixes = runnable_fixes(report)
         if not fix:
             if fixes:
@@ -502,7 +609,7 @@ class _Session:
         except Exception as error:
             self._say(f"Não consegui corrigir: {error}", error=True)
             return 1
-        self._say("", *verify_lines(report))
+        self._say("", *verify_lines(report, terminal_command=hint))
         if report.errors:
             self._say("Não consegui corrigir: " + "; ".join(report.errors), error=True)
         return 0 if report.is_consistent and not report.errors else 1

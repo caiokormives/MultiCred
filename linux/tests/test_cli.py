@@ -424,9 +424,10 @@ class TermuxCommandTests(TermuxWorld):
         self.assertEqual(self.cli("trocar", "Celular")[0], 0)
         code, out, err = self.cli("claude", "Marco")
         self.assertEqual((code, out), (1, ""))
+        # S-11: Termux has no "Contas › Claude" screen; the hint names the terminal command.
         self.assertEqual(err, "Não consegui trocar a conta Claude\n"
                               "O token da conta Claude Marco não está em ~/.config/multicred/secrets. "
-                              "Gere outro em Contas › Claude.\n")
+                              "Gere outro com: multicred entrar claude Marco\n")
         self.assert_stayed_in_termux()
 
     def test_verificar_has_no_graphical_session_row_and_runs_nothing_outside_prefix(self):
