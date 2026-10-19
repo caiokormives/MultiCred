@@ -1,12 +1,14 @@
 """Finds tool binaries for a desktop app, which does not inherit the shell's PATH.
 
 Search order (first match wins):
-1. Well-known install locations: /usr/local/bin, ~/.local/bin (Claude Code
-   native installer), /usr/bin, /bin, /snap/bin, Homebrew on Linux.
+1. Well-known install locations, from the platform (core/platform.py). On the
+   desktop: /usr/local/bin, ~/.local/bin (Claude Code native installer),
+   /usr/bin, /bin, /snap/bin, Homebrew on Linux. On Termux: $PREFIX/bin (where
+   pkg and npm globals land) and ~/.local/bin.
 2. Entries from the user's login shell PATH (npm globals, asdf, mise, nvm…).
 
 Well-known locations come first on purpose: a login-shell PATH entry must not
-be able to shadow /usr/bin/gh with something else named gh.
+be able to shadow the system's gh with something else named gh.
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ import os
 import threading
 from enum import Enum
 
+from .platform import DESKTOP_SEARCH_DIRECTORIES
 from .runner import CommandRequest
 
 
@@ -28,14 +31,8 @@ class Tool(str, Enum):
         return {"git": "git", "gh": "GitHub CLI", "claude": "Claude Code"}[self.value]
 
 
-DEFAULT_SEARCH_DIRECTORIES = [
-    "/usr/local/bin",
-    "~/.local/bin",
-    "/usr/bin",
-    "/bin",
-    "/snap/bin",
-    "/home/linuxbrew/.linuxbrew/bin",
-]
+# The desktop's well-known locations (kept here for callers and tests that name them).
+DEFAULT_SEARCH_DIRECTORIES = list(DESKTOP_SEARCH_DIRECTORIES)
 
 PATH_MARKER = "__MULTICRED_PATH__"
 
@@ -54,8 +51,9 @@ def is_executable_file(path: str) -> bool:
 
 class ToolLocator:
     def __init__(self, environment, well_known=None, login_shell_timeout: float = 5.0):
+        """`well_known` defaults to the environment's platform directories ($PREFIX/bin on Termux)."""
         self.environment = environment
-        self.well_known = list(well_known if well_known is not None else DEFAULT_SEARCH_DIRECTORIES)
+        self.well_known = list(well_known if well_known is not None else environment.platform.tool_search_directories)
         self.login_shell_timeout = login_shell_timeout
         self._lock = threading.Lock()
         self._login_shell_path: list[str] | None = None
@@ -102,17 +100,21 @@ class ToolLocator:
         """PATH as a new terminal sees it (login + interactive, so .bashrc runs).
 
         stdin is /dev/null and the call has a timeout, so a prompting rc file
-        cannot hang us. Empty when the shell fails or hangs.
+        cannot hang us. Empty when the shell fails or hangs. The shell starts from
+        the platform's probe PATH and, on Termux, gets PREFIX, TMPDIR and
+        LD_PRELOAD (termux-exec), as a new Termux session would.
         """
         with self._lock:
             if self._login_shell_path is not None:
                 return self._login_shell_path
         env = self.environment
+        probe_environment = {"HOME": str(env.home), "USER": env.user_name, "LOGNAME": env.user_name,
+                             "SHELL": env.login_shell, "PATH": env.platform.login_shell_probe_path, "TERM": "dumb"}
+        probe_environment.update(env.platform.child_environment())
         request = CommandRequest(
             env.login_shell,
             ["-l", "-i", "-c", f"printf '{PATH_MARKER}%s{PATH_MARKER}' \"$PATH\""],
-            {"HOME": str(env.home), "USER": env.user_name, "LOGNAME": env.user_name, "SHELL": env.login_shell,
-             "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "TERM": "dumb"},
+            probe_environment,
             timeout=self.login_shell_timeout,
         )
         try:

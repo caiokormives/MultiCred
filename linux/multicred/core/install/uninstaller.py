@@ -146,7 +146,10 @@ class Uninstaller:
 
     def _multicred_set_session(self) -> bool:
         """MultiCred only ever sets CLAUDE_CONFIG_DIR in a switch: a state with a
-        profile, or its environment.d file, says it did."""
+        profile, or its environment.d file, says it did. Never on a platform without a
+        graphical session (Termux): a switch there has no session step."""
+        if not self.environment.platform.has_graphical_session:
+            return False
         if os.path.lexists(self.environment_d_file):
             return True
         try:
@@ -396,7 +399,8 @@ class Uninstaller:
 
     def _unset_session(self, report: UninstallReport) -> None:
         # The same path a switch uses (session bus included), so both stay in step.
-        session = SessionEnvironment(self.environment, self.environment.base_process_environment(["/usr/bin", "/bin"]))
+        session = SessionEnvironment(self.environment,
+                                     self.environment.base_process_environment(self.environment.platform.system_path))
         try:
             session.apply(CLAUDE_VARIABLE, None)
         except Exception as error:

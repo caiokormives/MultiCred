@@ -2,10 +2,11 @@
 `claude setup-token` and `gh auth login --web`, which need a TTY for their prompts.
 
 Port of PseudoTerminalProcess.swift (D29). Linux specifics:
-- `os.openpty()` + subprocess running `/usr/bin/setsid --ctty <program>`: the
-  program gets its own session with the terminal as its controlling terminal, so
-  /dev/tty, job control and SIGWINCH work like in a real terminal emulator, without
-  a preexec_fn (not safe in a process with threads).
+- `os.openpty()` + subprocess running `setsid --ctty <program>`: the program gets
+  its own session with the terminal as its controlling terminal, so /dev/tty, job
+  control and SIGWINCH work like in a real terminal emulator, without a preexec_fn
+  (not safe in a process with threads). setsid is the platform's (core/platform.py):
+  /usr/bin/setsid on the desktop, $PREFIX/bin/setsid (util-linux) on Termux.
 - The environment is always the explicit one given; nothing is inherited.
 - The master side is read by a thread with `select` + `read(2)`: once the child
   side closes, Linux answers EIO, which ends the output.
@@ -32,6 +33,8 @@ import termios
 import threading
 from typing import Callable
 
+from .platform import Platform
+
 # A process that ended without closing the terminal (grandchild) is reported after this.
 EXIT_GRACE_SECONDS = 1.0
 KILL_AFTER_SECONDS = 2.0
@@ -49,8 +52,9 @@ class PTYError(Exception):
 # util-linux setsid(1): `--ctty` makes stdin (the terminal) the controlling terminal
 # of the new session. The child Popen starts is not a process group leader, so
 # setsid does not fork: it becomes the session (and group) leader and execs the
-# program in place, so the pid stays the program's.
-SETSID = "/usr/bin/setsid"
+# program in place, so the pid stays the program's. The desktop's; callers pass
+# `environment.platform.setsid`.
+SETSID = Platform.desktop().setsid
 
 
 def _launch_failure(executable: str, environment: dict[str, str]) -> str | None:
@@ -69,7 +73,8 @@ def _launch_failure(executable: str, environment: dict[str, str]) -> str | None:
 
 
 class PseudoTerminalProcess:
-    def __init__(self):
+    def __init__(self, setsid: str = SETSID):
+        self.setsid = setsid
         self._lock = threading.Lock()
         self._process: subprocess.Popen | None = None
         self._master = -1
@@ -95,7 +100,8 @@ class PseudoTerminalProcess:
         with self._lock:
             if self._process is not None:
                 raise PTYError("alreadyStarted")
-        failure = _launch_failure(executable, environment)
+        # Termux ships setsid in util-linux, which may be missing: say so instead of a bare ENOENT.
+        failure = _launch_failure(executable, environment) or _launch_failure(self.setsid, environment)
         if failure is not None:
             raise PTYError("launchFailed", failure)
         try:
@@ -106,7 +112,7 @@ class PseudoTerminalProcess:
             fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, columns, 0, 0))
             # No preexec_fn (unsafe with threads): setsid does setsid() + TIOCSCTTY.
             process = subprocess.Popen(
-                [SETSID, "--ctty", executable, *arguments], env=dict(environment), cwd=cwd,
+                [self.setsid, "--ctty", executable, *arguments], env=dict(environment), cwd=cwd,
                 stdin=slave, stdout=slave, stderr=slave, close_fds=True, start_new_session=False,
             )
         except (OSError, subprocess.SubprocessError) as error:

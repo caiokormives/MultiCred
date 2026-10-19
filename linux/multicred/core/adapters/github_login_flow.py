@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from ..claude.login_flow import EscapeStripper, LoginLaunchError, resolve_login_tool, terminal_environment
+from ..platform import Platform
 from ..pty import PseudoTerminalProcess, PTYError
 from ..tools import Tool
 from .github_cli import GitHubCLI
@@ -186,9 +187,11 @@ class GitHubLoginStateMachine:
 
 class GitHubLoginSimulator:
     """Test-mode stand-in for `gh auth login --web` (gh in a sandbox would still store
-    a real token in the user's keyring)."""
+    a real token in the user's keyring). A POSIX sh script: the platform's sh runs it
+    ($PREFIX/bin/sh on Termux, where /bin/sh is only a stub)."""
 
-    EXECUTABLE = "/bin/sh"
+    # The desktop's sh; `executable(platform)` is the one to run.
+    EXECUTABLE = Platform.desktop().sh
     SIMULATED_LOGIN = "usuario-teste"
 
     SCRIPT = r"""
@@ -200,6 +203,10 @@ sleep 1
 printf '\342\234\223 Authentication complete.\n'
 printf '\342\234\223 Logged in as usuario-teste\n'
 """
+
+    @classmethod
+    def executable(cls, platform: Platform) -> str:
+        return platform.sh
 
     @classmethod
     def arguments(cls) -> list[str]:
@@ -235,7 +242,7 @@ class GitHubLoginSession:
         self._on_finished = on_finished
         self._log = log
         self._lock = threading.RLock()
-        self._pty = PseudoTerminalProcess()
+        self._pty = PseudoTerminalProcess(setsid=environment.platform.setsid)
         self._parser = GitHubLoginParser()
         self._machine = GitHubLoginStateMachine()
         self._finished_reported = False
@@ -286,12 +293,13 @@ class GitHubLoginSession:
         env = terminal_environment(self.environment, self.tools)
         env["GH_NO_UPDATE_NOTIFIER"] = "1"
         env.update(self.extra_environment)
+        platform = self.environment.platform
         if path is None:
-            executable, arguments, display = (GitHubLoginSimulator.EXECUTABLE, GitHubLoginSimulator.arguments(),
-                                              "gh auth login --web (simulado)")
-            env["PATH"] = "/usr/bin:/bin"
+            executable, arguments, display = (GitHubLoginSimulator.executable(platform),
+                                              GitHubLoginSimulator.arguments(), "gh auth login --web (simulado)")
+            env["PATH"] = ":".join(platform.system_path)
             # Switching back in test mode is recorded by the dry-run runner.
-            self._gh = self.tools.locate(Tool.GH) or "/usr/bin/gh"
+            self._gh = self.tools.locate(Tool.GH) or platform.system_tool(Tool.GH.value)
         else:
             executable, arguments, display = path, login_arguments(self.host), "gh auth login --web"
             self._gh = path

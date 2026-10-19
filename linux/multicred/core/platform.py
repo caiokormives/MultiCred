@@ -30,6 +30,22 @@ TERMUX = "termux"
 TERMUX_DEFAULT_PREFIX = "/data/data/com.termux/files/usr"
 TERMUX_PATH_MARKER = "/com.termux/"
 
+# Where a desktop app finds tools (core/tools.py explains the order). This module is
+# the only one in the core that names system paths (tests/test_architecture.py).
+DESKTOP_SEARCH_DIRECTORIES = (
+    "/usr/local/bin",
+    "~/.local/bin",
+    "/usr/bin",
+    "/bin",
+    "/snap/bin",
+    "/home/linuxbrew/.linuxbrew/bin",
+)
+# The system's own programs, for children that need nothing else (login simulators,
+# systemctl).
+DESKTOP_SYSTEM_PATH = ("/usr/bin", "/bin")
+# PATH the login-shell probe starts from; the rc files add the rest.
+DESKTOP_PROBE_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+
 
 class SecretBackend(str, Enum):
     # libsecret / GNOME Keyring; the shell hook reads values with `secret-tool`.
@@ -72,8 +88,21 @@ class Platform:
         where pip --user and Claude Code's own installer put things."""
         if self.is_termux:
             return [f"{self.prefix}/bin", "~/.local/bin"]
-        from .tools import DEFAULT_SEARCH_DIRECTORIES  # local: tools may come to depend on this module
-        return list(DEFAULT_SEARCH_DIRECTORIES)
+        return list(DESKTOP_SEARCH_DIRECTORIES)
+
+    @property
+    def system_path(self) -> list[str]:
+        """PATH entries of the system's own programs (sh, sleep, systemctl…)."""
+        return [f"{self.prefix}/bin"] if self.is_termux else list(DESKTOP_SYSTEM_PATH)
+
+    @property
+    def login_shell_probe_path(self) -> str:
+        """PATH the login shell starts with when asked for the user's PATH."""
+        return f"{self.prefix}/bin" if self.is_termux else DESKTOP_PROBE_PATH
+
+    def system_tool(self, name: str) -> str:
+        """Where a packaged tool would be installed: /usr/bin/<name>, or $PREFIX/bin/<name>."""
+        return self._bin(name) if self.is_termux else f"/usr/bin/{name}"
 
     @property
     def sh(self) -> str:

@@ -44,10 +44,6 @@ from .login_vault import ClaudeLoginRecord, ClaudeLoginSwitcher, NoLoginInFolder
 
 # The login window gives up after ten minutes.
 LOGIN_TIMEOUT = 600.0
-# Value for the CLI's BROWSER variable: a no-op opener. The dialog opens the
-# link itself, in the browser the user picks.
-SUPPRESS_CLI_BROWSER = "/usr/bin/true"
-
 CLAUDE_NOT_INSTALLED = "Claude Code não foi encontrado. Instale com: curl -fsSL https://claude.ai/install.sh | bash"
 NO_LOGIN_FOUND = "O login terminou, mas não encontrei a credencial. Tente de novo."
 NO_TOKEN_SHOWN = "O Claude Code terminou sem mostrar um token. Tente de novo ou cole o token manualmente."
@@ -520,7 +516,7 @@ class ClaudeLoginSession:
         self._log = log
         self._lock = threading.RLock()
         self._scratch_lock = threading.Lock()
-        self._pty = PseudoTerminalProcess()
+        self._pty = PseudoTerminalProcess(setsid=environment.platform.setsid)
         self._parser = SetupTokenParser()
         self._machine = LoginStateMachine()
         self._sent_codes: list[str] = []
@@ -618,12 +614,15 @@ class ClaudeLoginSession:
         path = resolve_login_tool(self.environment, self.tools, Tool.CLAUDE, self.simulated)
         from .login_simulator import LoginSimulator, SetupTokenSimulator
 
+        platform = self.environment.platform
         env = terminal_environment(self.environment, self.tools)
-        env["BROWSER"] = SUPPRESS_CLI_BROWSER
+        # A no-op opener (the platform's `true`): the dialog opens the link itself, in the
+        # browser the user picks.
+        env["BROWSER"] = platform.true
         if path is None:
             simulator = LoginSimulator if self.mode == LoginMode.LOGIN else SetupTokenSimulator
-            executable, arguments = simulator.EXECUTABLE, simulator.arguments()
-            env["PATH"] = "/usr/bin:/bin"
+            executable, arguments = simulator.executable(platform), simulator.arguments()
+            env["PATH"] = ":".join(platform.system_path)
         else:
             executable = path
             arguments = ["auth", "login", "--claudeai"] if self.mode == LoginMode.LOGIN else ["setup-token"]

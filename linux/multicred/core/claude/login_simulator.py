@@ -1,8 +1,9 @@
 """Test-mode stand-ins for `claude auth login` and `claude setup-token` (D30).
 
-Port of LoginSimulator.swift and SetupTokenSimulator. They are `/bin/sh`
-scripts that print what the real CLI printed (Phase 1 spike) and wait for a
-code. Codes starting with "erro" or containing "expir" fail.
+Port of LoginSimulator.swift and SetupTokenSimulator. They are POSIX sh
+scripts (the platform's sh: /bin/sh, or $PREFIX/bin/sh on Termux, where /bin/sh
+is only a stub) that print what the real CLI printed (Phase 1 spike) and wait for
+a code. Codes starting with "erro" or containing "expir" fail.
 
 On Linux the login simulator writes what Claude Code itself writes after a
 login: a fake `claudeAiOauth` in `<folder>/.credentials.json` (0600) and the
@@ -15,11 +16,14 @@ components and folders whose real location (symlinks resolved) is outside.
 
 from __future__ import annotations
 
+from ..platform import Platform
+
 SIMULATED_ACCESS_TOKEN = "sk-ant-oat01-SIMULADO-modo-de-teste"
 
 
 class LoginSimulator:
-    EXECUTABLE = "/bin/sh"
+    # The desktop's sh; `executable(platform)` is the one to run.
+    EXECUTABLE = Platform.desktop().sh
     SIMULATED_EMAIL = "simulado@example.com"
     REFUSED_EXIT_CODE = 3
 
@@ -55,12 +59,16 @@ printf 'Login successful.\r\n'
 """
 
     @classmethod
+    def executable(cls, platform: Platform) -> str:
+        return platform.sh
+
+    @classmethod
     def arguments(cls) -> list[str]:
         return ["-c", cls.SCRIPT]
 
 
 class SetupTokenSimulator:
-    EXECUTABLE = "/bin/sh"
+    EXECUTABLE = Platform.desktop().sh
     FAKE_TOKEN = "sk-ant-oat01-SIMULADO-modo-de-teste-0000000000"
 
     SCRIPT = r"""
@@ -75,6 +83,10 @@ esac
 printf '\r\nLogin successful.\r\n'
 printf 'Your OAuth token (valid for 1 year):\r\n\r\nsk-ant-oat01-SIMULADO-modo-de-teste-0000000000\r\n'
 """
+
+    @classmethod
+    def executable(cls, platform: Platform) -> str:
+        return platform.sh
 
     @classmethod
     def arguments(cls) -> list[str]:

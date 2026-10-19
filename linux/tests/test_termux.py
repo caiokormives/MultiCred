@@ -16,6 +16,7 @@ import subprocess
 import tempfile
 import uuid
 from pathlib import Path
+from unittest import mock
 
 from multicred.core import real_env
 from multicred.core.claude.credentials import FileClaudeCredentialStore
@@ -35,7 +36,8 @@ from multicred.core.rendering.envfile import (
 from multicred.core.runner import ProcessRunner
 from multicred.core.secrets import EmptySecret, InvalidAccount
 from multicred.core.storage import ConfigRepository
-from multicred.core.tools import DEFAULT_SEARCH_DIRECTORIES, ToolLocator
+from multicred.core.tools import DEFAULT_SEARCH_DIRECTORIES, PATH_MARKER, Tool, ToolLocator
+from tests.login_support import SerialDispatcher, wait_until
 from tests.support import FIXED_NOW, SafeTestCase
 
 TERMUX_VERSION = "0.118.3"
@@ -87,6 +89,7 @@ class TermuxWorld(SafeTestCase):
         super().setUp()
         root = Path(tempfile.mkdtemp(prefix="MultiCredTermux-")).resolve()
         self.addCleanup(shutil.rmtree, root, True)
+        self.root = root
         self.prefix = root / "usr"
         (self.prefix / "bin").mkdir(parents=True)
         (self.prefix / "tmp").mkdir()
@@ -119,7 +122,7 @@ class TermuxWorld(SafeTestCase):
 
     def termux_tools(self, environment=None):
         environment = environment or self.termux
-        return ToolLocator(environment, well_known=environment.platform.tool_search_directories)
+        return ToolLocator(environment)  # the platform's directories ($PREFIX/bin) by default
 
     def assert_nothing_forbidden_ran(self):
         names = {Path(r.executable).name for r in self.recording.requests}
@@ -167,6 +170,16 @@ class PlatformDetectionTests(SafeTestCase):
         for value in [*termux.tool_search_directories, termux.sh, termux.true, termux.setsid, termux.temp_directory]:
             self.assertFalse(value.startswith(("/usr/", "/bin/", "/tmp")), value)
 
+    def test_system_paths_and_probe_path(self):
+        desktop = Platform.desktop()
+        self.assertEqual(desktop.system_path, ["/usr/bin", "/bin"])
+        self.assertEqual(desktop.login_shell_probe_path, "/usr/bin:/bin:/usr/sbin:/sbin")
+        self.assertEqual(desktop.system_tool("gh"), "/usr/bin/gh")
+        termux = detect({"TERMUX_VERSION": TERMUX_VERSION, "PREFIX": "/p/usr"})
+        self.assertEqual(termux.system_path, ["/p/usr/bin"])
+        self.assertEqual(termux.login_shell_probe_path, "/p/usr/bin")
+        self.assertEqual(termux.system_tool("gh"), "/p/usr/bin/gh")
+
     def test_termux_temp_directory_defaults_to_prefix_tmp(self):
         # /tmp is not writable on Android.
         self.assertEqual(detect({"TERMUX_VERSION": TERMUX_VERSION, "PREFIX": "/p/usr"}).temp_directory, "/p/usr/tmp")
@@ -204,6 +217,154 @@ class RealEnvironmentTests(TermuxWorld):
     def test_make_real_picks_termux_when_detected(self):
         self.assertTrue(real_env.make_real(self.termux_environ).platform.is_termux)
         self.assertFalse(real_env.detect_platform({}).is_termux)
+
+
+def _assert_no_desktop_path(test, values):
+    """None of `values` (argv entries, environment values, PATH entries) is a desktop
+    system path: Termux has no /usr/bin, /bin/sh is only a stub there, /tmp is not writable.
+    The simulated HOME and PREFIX happen to live under this machine's /tmp; they are fine."""
+    for value in values:
+        for entry in str(value).split(":"):
+            if entry.startswith((str(test.root) + "/", str(test.home) + "/")) or entry in (str(test.root), str(test.home)):
+                continue
+            test.assertFalse(entry.startswith(("/usr/", "/bin/", "/sbin/", "/tmp/")) or entry in ("/bin", "/sbin", "/tmp"),
+                             f"desktop path {entry!r} in {value!r}")
+
+
+class TermuxCorePathsTests(TermuxWorld):
+    """S-13: every tool, shell and temporary path the core uses comes from $PREFIX."""
+
+    # What the PTY and the login simulators need, linked from this machine into $PREFIX/bin.
+    SYSTEM_TOOLS = ("setsid", "sh", "true", "sleep", "dirname", "mkdir", "cat")
+
+    def setUp(self):
+        super().setUp()
+        for name in self.SYSTEM_TOOLS:
+            real = shutil.which(name)
+            if real is None:
+                self.skipTest(f"{name} is not installed here")
+            (self.prefix / "bin" / name).symlink_to(real)
+        ConfigRepository(self.termux).save(Config())
+
+    def record_popen(self):
+        """Records what the pseudo-terminal launches (subprocess is one module: the
+        runner's calls, e.g. the login-shell probe, are left out)."""
+        import multicred.core.pty as pty_module
+        calls = []
+        real_popen = pty_module.subprocess.Popen
+
+        def recording(*args, **kwargs):
+            if args and list(args[0])[1:2] == ["--ctty"]:
+                calls.append((args, kwargs))
+            return real_popen(*args, **kwargs)
+        return calls, mock.patch.object(pty_module.subprocess, "Popen", recording)
+
+    def test_tool_locator_searches_the_prefix_by_default(self):
+        tools = ToolLocator(self.termux)
+        self.assertEqual(tools.search_directories(), [str(self.prefix / "bin"), str(self.home / ".local/bin")])
+        self.assertEqual(tools.locate(Tool.GH), str(self.prefix / "bin" / "gh"))
+
+    def test_desktop_tool_locator_is_unchanged(self):
+        tools = ToolLocator(dataclasses.replace(self.environment, runner=self.runner))
+        self.runner.on("bash", stdout="")
+        expected = [self.environment.expand_tilde(d) for d in DEFAULT_SEARCH_DIRECTORIES]
+        self.assertEqual(tools.search_directories(), expected)
+        probe = self.runner.requests[0]
+        self.assertEqual(probe.environment["PATH"], "/usr/bin:/bin:/usr/sbin:/sbin")
+        self.assertNotIn("PREFIX", probe.environment)
+
+    def test_login_shell_probe_runs_with_the_prefix_path_and_termux_variables(self):
+        env_dump = self.prefix / "tmp" / "probe-env"
+        self.write_tool("bash", f"""#!{self.prefix}/bin/sh
+printf 'PATH=%s PREFIX=%s TMPDIR=%s\\n' "$PATH" "$PREFIX" "$TMPDIR" > "{env_dump}"
+printf '{PATH_MARKER}%s{PATH_MARKER}' "$PATH:$HOME/.npm-global/bin"
+""")
+        tools = ToolLocator(self.termux)
+        directories = tools.search_directories()
+        self.assertEqual(directories, [str(self.prefix / "bin"), str(self.home / ".local/bin"),
+                                       str(self.home / ".npm-global/bin")])
+        probe = next(r for r in self.recording.requests if r.executable == str(self.prefix / "bin" / "bash"))
+        self.assertEqual(probe.environment["PATH"], str(self.prefix / "bin"))
+        self.assertEqual(probe.environment["PREFIX"], str(self.prefix))
+        self.assertEqual(probe.environment["TMPDIR"], str(self.prefix / "tmp"))
+        self.assertEqual(env_dump.read_text(),
+                         f"PATH={self.prefix}/bin PREFIX={self.prefix} TMPDIR={self.prefix}/tmp\n")
+        _assert_no_desktop_path(self, probe.environment.values())
+
+    def test_terminal_children_get_termux_exec(self):
+        # The world leaves LD_PRELOAD empty (no termux-exec on this machine); a real session has it.
+        from multicred.core.claude.login_flow import terminal_environment
+        library = f"{self.prefix}/lib/libtermux-exec-ld-preload.so"
+        platform = dataclasses.replace(self.termux.platform, ld_preload=library)
+        environment = dataclasses.replace(self.termux, platform=platform)
+        env = terminal_environment(environment, ToolLocator(environment))
+        self.assertEqual((env["PREFIX"], env["TMPDIR"], env["LD_PRELOAD"]),
+                         (str(self.prefix), str(self.prefix / "tmp"), library))
+
+    def test_missing_setsid_is_named_when_the_terminal_cannot_start(self):
+        from multicred.core.pty import PseudoTerminalProcess, PTYError
+        (self.prefix / "bin" / "setsid").unlink()  # util-linux not installed
+        setsid = self.termux.platform.setsid
+        with self.assertRaises(PTYError) as raised:
+            PseudoTerminalProcess(setsid=setsid).start(self.termux.platform.sh, ["-c", "exit 0"],
+                                                       {"PATH": str(self.prefix / "bin")})
+        self.assertEqual((raised.exception.kind, raised.exception.detail),
+                         ("launchFailed", f"{setsid}: No such file or directory"))
+
+    def test_simulated_claude_login_runs_setsid_sh_and_true_from_the_prefix(self):
+        from multicred.core.claude.login_flow import ClaudeAccountSaver, ClaudeLoginSession, LoginMode, LoginPhase
+        from multicred.core.claude.login_flow import NewClaudeAccount
+        repository = ConfigRepository(self.termux)
+        saver = ClaudeAccountSaver(self.termux, repository.load, repository.save)
+        dispatch, finished = SerialDispatcher(), []
+        session = ClaudeLoginSession(self.termux, ToolLocator(self.termux), LoginMode.LOGIN,
+                                     NewClaudeAccount("Celular", None, ProfileColor.TEAL), saver,
+                                     dispatch=dispatch, on_finished=finished.append, simulated=True)
+        self.addCleanup(session.stop)
+        calls, patch = self.record_popen()
+        with patch:
+            session.start()
+        self.assertIsNone(session.launch_error)
+        (argv,), kwargs = calls[0]
+        self.assertEqual(argv[:3], [str(self.prefix / "bin" / "setsid"), "--ctty", str(self.prefix / "bin" / "sh")])
+        env = kwargs["env"]
+        self.assertEqual(env["PATH"], str(self.prefix / "bin"))
+        self.assertEqual(env["BROWSER"], str(self.prefix / "bin" / "true"))
+        self.assertEqual((env["PREFIX"], env["TMPDIR"]), (str(self.prefix), str(self.prefix / "tmp")))
+        _assert_no_desktop_path(self, [argv[0], argv[2], *env.values()])
+
+        self.assertTrue(wait_until(lambda: session.phase == LoginPhase.WAITING_FOR_CODE, 8), session.output)
+        session.submit_code("ABC123")
+        self.assertTrue(wait_until(lambda: session.phase.is_finished, 10), session.output)
+        dispatch.drain()
+        self.assertEqual(session.phase, LoginPhase.CONNECTED, session.output)
+        self.assertEqual([a.id for a in repository.load().claude_accounts], [session.result.id])
+        self.assert_nothing_forbidden_ran()
+
+    def test_simulated_github_login_runs_from_the_prefix_and_switches_back_with_its_gh(self):
+        from multicred.core.adapters.github_login_flow import GitHubLoginPhase, GitHubLoginSession
+        dispatch, finished = SerialDispatcher(), []
+        (self.prefix / "bin" / "gh").unlink()  # the fallback gh path must be the prefix's too
+        session = GitHubLoginSession(self.termux, ToolLocator(self.termux), switch_back_to="dev-a",
+                                     dispatch=dispatch, on_finished=finished.append, simulated=True)
+        self.addCleanup(session.stop)
+        calls, patch = self.record_popen()
+        with patch:
+            session.start()
+        self.assertIsNone(session.launch_error)
+        (argv,), kwargs = calls[0]
+        self.assertEqual(argv[:3], [str(self.prefix / "bin" / "setsid"), "--ctty", str(self.prefix / "bin" / "sh")])
+        self.assertEqual(kwargs["env"]["PATH"], str(self.prefix / "bin"))
+        self.assertEqual(kwargs["env"]["PREFIX"], str(self.prefix))
+        _assert_no_desktop_path(self, [argv[0], argv[2], *kwargs["env"].values()])
+        self.assertTrue(wait_until(lambda: session.code == "TEST-1234", 5), session.output)
+        session.open_browser()
+        self.assertTrue(wait_until(lambda: bool(finished), 10), session.output)
+        dispatch.drain()
+        self.assertEqual(session.phase, GitHubLoginPhase.connected("usuario-teste"))
+        switch = [r for r in self.recording.requests if r.arguments[:2] == ["auth", "switch"]]
+        self.assertEqual([r.executable for r in switch], [str(self.prefix / "bin" / "gh")])
+        self.assert_nothing_forbidden_ran()
 
 
 class FileSecretStoreTests(SafeTestCase):
@@ -484,6 +645,16 @@ printf 'B:%s|%s\\n' "${OPENAI_API_KEY-unset}" "${GEMINI_API_KEY-unset}"
         self.assertIn("GitHub dev-a", lines)
         self.assertIn("Claude · ~/.claude · login da pasta", lines)
         self.assertIn("Chaves: OPENAI_API_KEY", lines)
+        self.assert_nothing_forbidden_ran()
+
+    def test_uninstall_never_touches_a_graphical_session(self):
+        from multicred.core.install.uninstaller import Uninstaller
+        self.assertEqual(self.cli("trocar", "Trabalho")[0], 0)
+        uninstaller = Uninstaller(self.termux, tools=self.termux_tools())
+        self.assertNotIn("session", [item.kind for item in uninstaller.preview()])
+        report = uninstaller.apply()
+        self.assertEqual(report.problems, [])
+        self.assertFalse((self.home / ".config/multicred").exists())
         self.assert_nothing_forbidden_ran()
 
 
