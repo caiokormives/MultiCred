@@ -1,13 +1,19 @@
-"""Verificar (design 06, approved Linux variant F; Mac MultiCred/Views/VerifyPage.swift).
+"""Verificar (design 06), laid out like the Mac's `MultiCred/Views/VerifyPage.swift`.
 
-Header "N de M ok para <perfil>", group "Sistema" with one row per check
-(status, title, expected/found/origin, "Corrigir" whose popover shows the command
-before it runs), group "Informativo", and a footer fixed outside the scrolling
-list ("Verificar de novo", "Corrigir tudo"). The verifier runs off the UI thread;
-results come back through `model.dispatch`.
+Top (:73-92): the active profile's 44 px badge and name (or "Nenhum perfil ativo"),
+"N de M itens de acordo · verificado às HH:MM", a spinner while checking and
+"Corrigir tudo". Then the sections "Ferramentas", "Integração" and "Sessões"
+(:21-23), each row with ✓ / ✗ / ! / i, the title, "Esperado **x**, encontrado y" or
+the detail, "definido em <origem>" and its fix: "Corrigir", "Entrar…" or "Abrir
+chave…" (:110-140). Every fix asks first, "Corrigir X?" with the command and
+"Cancelar / Executar" (:48-57); "Corrigir tudo?" lists "• comando" per line
+(:58-70). A fix that leads to a login or to a key opens that page (:148-160).
+A footer fixed outside the scrolling list: "“Corrigir” mostra o comando antes de
+executar." and "Verificar de novo" (:35-44).
 
-Standalone: the window plugs it into its navigation and listens to `on_report`
-(sidebar badge, tray) — S-06.
+The verifier runs off the UI thread; results come back through `model.dispatch`.
+The window plugs the page into its navigation and listens to `on_report` (the
+sidebar's Verificar dot, the Visão geral footer, the tray).
 """
 
 from __future__ import annotations
@@ -22,23 +28,29 @@ gi.require_version("Adw", "1")
 gi.require_version("Pango", "1.0")
 from gi.repository import Adw, Gdk, GLib, Gtk, Pango  # noqa: E402
 
-from ...core.engine.verifier import Check, CheckStatus, Verifier, VerifyReport  # noqa: E402
+from ...core.engine.verifier import (  # noqa: E402
+    Check, CheckSection, CheckStatus, Fix, FixKind, Verifier, VerifyReport,
+)
 from ...core.models import ProfileColor  # noqa: E402
 from ..model import _default_scanner  # noqa: E402
 
-STATUS_GLYPH = {CheckStatus.OK: "✓", CheckStatus.PROBLEM: "!", CheckStatus.INFO: "i"}
-STATUS_NAME = {CheckStatus.OK: "ok", CheckStatus.PROBLEM: "problema", CheckStatus.INFO: "informativo"}
+# Components.swift:100-135 (StatusIcon24): symbol and accessibility label.
+STATUS_GLYPH = {CheckStatus.OK: "✓", CheckStatus.ERROR: "✗", CheckStatus.WARNING: "!", CheckStatus.INFO: "i"}
+STATUS_NAME = {CheckStatus.OK: "De acordo", CheckStatus.ERROR: "Problema", CheckStatus.WARNING: "Atenção",
+               CheckStatus.INFO: "Informação"}
+NO_PROFILE = "Nenhum perfil ativo"
+FOOTER_NOTE = "“Corrigir” mostra o comando antes de executar."
 
 _CSS = """
-.mc-verify-status { min-width: 22px; min-height: 22px; border-radius: 999px; font-size: 12px; font-weight: 800; }
-.mc-verify-status.ok { background: alpha(@success_color, 0.16); color: @success_color; }
-.mc-verify-status.problem { background: alpha(@warning_color, 0.20); color: @warning_color; }
-.mc-verify-status.info { background: alpha(currentColor, 0.10); color: alpha(currentColor, 0.70); }
-.mc-verify-avatar { min-width: 40px; min-height: 40px; border-radius: 9px; color: white; font-weight: bold;
-                    font-size: 17px; background: #6E6E73; }
-.mc-verify-footer { padding: 10px 24px; }
-row.mc-verify-row label.title { font-weight: 600; }
-button.mc-verify-again { color: @accent_color; }
+.mc-verify-status { min-width: 24px; min-height: 24px; border-radius: 999px; font-size: 13px; font-weight: 900; }
+.mc-verify-status.ok { background: alpha(@success_color, 0.15); color: @success_color; }
+.mc-verify-status.error { background: alpha(@error_color, 0.15); color: @error_color; }
+.mc-verify-status.warning { background: alpha(@warning_color, 0.15); color: @warning_color; }
+.mc-verify-status.info { background: alpha(@blue_3, 0.15); color: @blue_3; }
+.mc-verify-avatar { min-width: 44px; min-height: 44px; border-radius: 11px; color: white; font-weight: 600;
+                    font-size: 24px; background: #6E6E73; }
+.mc-verify-header { padding: 16px 20px; }
+.mc-verify-footer { padding: 10px 20px; }
 """ + "".join(f".mc-verify-color-{color.value} {{ background: {color.hex}; }}\n" for color in ProfileColor)
 
 _css_loaded = False
@@ -55,61 +67,106 @@ def _load_css() -> None:
     _css_loaded = True
 
 
-def _mono(text: str, chip: bool = False) -> str:
-    """Monospace; a `chip` gets a faint background that works in light and dark."""
-    background = ' background="#808080" bgalpha="16%"' if chip else ""
-    return f'<span font_family="monospace"{background}>{GLib.markup_escape_text(text)}</span>'
-
-
 def subtitle_markup(check: Check) -> str:
-    """Pango markup under the row title: what was expected and found, and where from."""
+    """Pango markup under the row title (VerifyPage.swift:115-123): what was expected and
+    found, or the detail; then where it is defined. Linux adds the hint (what to do by
+    hand) when there is one."""
     escape = GLib.markup_escape_text
     lines = []
     if check.expected is not None:
-        lines.append(f"Esperado {_mono(check.expected, True)} · encontrado {_mono(check.found or 'nada', True)}")
+        lines.append(f"Esperado <b>{escape(check.expected)}</b>, encontrado {escape(check.found or 'nada')}")
     elif check.found:
-        monospace = check.id == "claude.shells" or check.id.startswith("shell.")
-        lines.append(_mono(check.found) if monospace and check.status == CheckStatus.OK else escape(check.found))
+        lines.append(escape(check.found))
     hint = check.hint
     if check.origin:
-        lines.append(f"Origem: {_mono(check.origin, True)}" + (f", {escape(hint)}" if hint else ""))
+        origin = f'<span font_family="monospace" size="small">definido em {escape(check.origin)}</span>'
+        lines.append(origin + (f", {escape(hint)}" if hint else ""))
         hint = None
     if hint:
         lines.append(escape(hint))
     return "\n".join(lines)
 
 
+def runnable_fixes(report: VerifyReport | None) -> list[Fix]:
+    """What "Corrigir tudo" runs, each repair once."""
+    fixes: list[Fix] = []
+    for check in (report.fixable if report else []):
+        if check.fix.key not in {f.key for f in fixes}:
+            fixes.append(check.fix)
+    return fixes
+
+
+def open_fix_in_window(window, fix: Fix) -> bool:
+    """VerifyPage.swift:155-158 with the Linux window's entry points: sign a Claude
+    account in again, a folder's own login, gh auth login, or the key's editor.
+    False when `window` cannot do it (the page is not inside the main window)."""
+    request = getattr(window, "on_login_requested", None)
+    if fix.kind == FixKind.LOGIN_CLAUDE:
+        config = getattr(getattr(window, "model", None), "config", None)
+        account = config.claude_account(fix.target) if config is not None else None
+        if request is None or account is None:
+            return False
+        request("login", account)
+    elif fix.kind == FixKind.LOGIN_CLAUDE_FOLDER:
+        if request is None:
+            return False
+        request("folder", fix.target)
+    elif fix.kind == FixKind.LOGIN_GITHUB:
+        if request is None:
+            return False
+        request("github", None, host=fix.target)
+    elif fix.kind == FixKind.OPEN_API_KEY:
+        show_section = getattr(window, "show_section", None)
+        if show_section is None:
+            return False
+        page = show_section("keys")
+        editor = getattr(page, "open_editor", None)  # APIKeysPage: the key's editor
+        if editor is not None:
+            editor(fix.target)
+    else:
+        return False
+    return True
+
+
 class VerifyRow(Adw.ActionRow):
-    """One check. `fix_button` is None when there is nothing to run automatically."""
+    """One check. `fix_button` is None when there is nothing to offer."""
 
     def __init__(self, page: "VerifyPage", check: Check):
-        super().__init__(title=GLib.markup_escape_text(check.title), subtitle=subtitle_markup(check),
+        subtitle = subtitle_markup(check)
+        super().__init__(title=GLib.markup_escape_text(check.title), subtitle=subtitle,
                          subtitle_lines=0, title_lines=0)
         self.check = check
+        self.subtitle_markup = subtitle
         self.add_css_class("mc-verify-row")
-        status = Gtk.Label(label=STATUS_GLYPH[check.status], valign=Gtk.Align.CENTER if not check.expected
-                           else Gtk.Align.START, margin_top=0 if not check.expected else 12)
+        status = Gtk.Label(label=STATUS_GLYPH[check.status], halign=Gtk.Align.CENTER,
+                           valign=Gtk.Align.START if subtitle else Gtk.Align.CENTER, margin_top=10 if subtitle else 0)
         status.add_css_class("mc-verify-status")
         status.add_css_class(check.status.value)
-        status.update_property([Gtk.AccessibleProperty.LABEL], [STATUS_NAME[check.status]])
+        self.status_name = STATUS_NAME[check.status]
+        status.update_property([Gtk.AccessibleProperty.LABEL], [self.status_name])
         self.status_label = status
         self.add_prefix(status)
         self.fix_button = None
-        self.confirm_button = None
         if check.fix is not None:
-            self.fix_button, self.confirm_button = page.make_fix_button(check)
+            self.fix_button = Gtk.Button(label=check.fix.button_title, valign=Gtk.Align.CENTER,
+                                         tooltip_text=check.fix.command, sensitive=not page.busy)
+            self.fix_button.connect("clicked", lambda *_: page.confirm_fix(check))
             self.add_suffix(self.fix_button)
 
 
 class VerifyPage(Adw.NavigationPage):
     def __init__(self, model, processes=None, verifier: Verifier | None = None,
-                 on_report: Callable[[VerifyReport], None] | None = None):
+                 on_report: Callable[[VerifyReport], None] | None = None,
+                 open_fix: Callable[[Fix], None] | None = None):
         super().__init__(title="Verificar", tag="verify")
         _load_css()
         self.model = model
         self.on_report = on_report
+        # Where a fix that leads to a login or a key goes; default: the main window.
+        self.open_fix = open_fix or self._open_fix_in_window
         self.last_report: VerifyReport | None = None
         self.busy = False
+        self.dialog: Adw.AlertDialog | None = None
         if processes is None:
             # The same scanner as the model (one place decides real /proc vs. test mode).
             processes = getattr(model, "processes", None) or _default_scanner(model.environment)
@@ -119,21 +176,22 @@ class VerifyPage(Adw.NavigationPage):
 
         view = Adw.ToolbarView()
         view.add_top_bar(Adw.HeaderBar())
+        self.header = self._build_header()
+        view.add_top_bar(self.header)
+        view.set_top_bar_style(Adw.ToolbarStyle.RAISED_BORDER)
 
-        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18, margin_top=20, margin_bottom=24,
-                          margin_start=16, margin_end=16)
-        content.append(self._build_header())
-        self.error_label = Gtk.Label(xalign=0, wrap=True, visible=False)
-        self.error_label.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
-        self.error_label.add_css_class("error")
-        content.append(self.error_label)
-        self.system_group = Adw.PreferencesGroup(title="Sistema")
-        self.info_group = Adw.PreferencesGroup(title="Informativo", visible=False)
-        content.append(self.system_group)
-        content.append(self.info_group)
-        clamp = Adw.Clamp(maximum_size=720, tightening_threshold=560, child=content)
-        self.scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, vexpand=True, child=clamp)
-        view.set_content(self.scroll)
+        self.stack = Gtk.Stack(vexpand=True)
+        self.stack.add_named(self._build_report(), "report")
+        loading = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, valign=Gtk.Align.CENTER,
+                          halign=Gtk.Align.CENTER)
+        spinner = Gtk.Spinner(spinning=True, width_request=24, height_request=24)
+        loading.append(spinner)
+        loading.append(Gtk.Label(label="Verificando…"))
+        self.stack.add_named(loading, "loading")
+        self.unconfigured = Adw.StatusPage(title="MultiCred ainda não foi configurado",
+                                           icon_name="view-list-bullet-symbolic")
+        self.stack.add_named(self.unconfigured, "unconfigured")
+        view.set_content(self.stack)
 
         # Fixed footer, outside the scrolling list (the Mac design overlapped the last row).
         self.footer = self._build_footer()
@@ -146,79 +204,99 @@ class VerifyPage(Adw.NavigationPage):
 
     def _build_header(self) -> Gtk.Widget:
         box = Gtk.Box(spacing=14)
-        self.avatar = Gtk.Label(label="?", valign=Gtk.Align.CENTER)
+        box.add_css_class("mc-verify-header")
+        self.avatar = Gtk.Label(label="?", valign=Gtk.Align.CENTER, visible=False)
         self.avatar.add_css_class("mc-verify-avatar")
         box.append(self.avatar)
         texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, valign=Gtk.Align.CENTER, hexpand=True)
-        self.headline_label = Gtk.Label(label="Verificando…", xalign=0, wrap=True)
-        self.headline_label.add_css_class("title-2")
-        texts.append(self.headline_label)
-        subtitle = Gtk.Label(label="Comparado com o que o perfil espera, agora", xalign=0, wrap=True)
-        subtitle.add_css_class("dim-label")
-        texts.append(subtitle)
+        self.title_label = Gtk.Label(label=NO_PROFILE, xalign=0, wrap=True)
+        self.title_label.add_css_class("title-2")
+        texts.append(self.title_label)
+        self.subtitle_label = Gtk.Label(xalign=0, wrap=True, visible=False)
+        self.subtitle_label.add_css_class("dim-label")
+        texts.append(self.subtitle_label)
         box.append(texts)
-        self.spinner = Gtk.Spinner(valign=Gtk.Align.CENTER)
+        self.spinner = Gtk.Spinner(valign=Gtk.Align.CENTER, visible=False)
         box.append(self.spinner)
+        self.fix_all_button = Gtk.Button(label="Corrigir tudo", valign=Gtk.Align.CENTER, sensitive=False)
+        self.fix_all_button.add_css_class("suggested-action")
+        self.fix_all_button.connect("clicked", lambda *_: self.confirm_fix_all())
+        box.append(self.fix_all_button)
         return box
+
+    def _build_report(self) -> Gtk.Widget:
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18, margin_top=20, margin_bottom=24,
+                          margin_start=16, margin_end=16)
+        self.error_label = Gtk.Label(xalign=0, wrap=True, visible=False)
+        self.error_label.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        self.error_label.add_css_class("error")
+        content.append(self.error_label)
+        self.groups: dict[CheckSection, Adw.PreferencesGroup] = {}
+        for section in CheckSection:
+            group = Adw.PreferencesGroup(title=section.title, visible=False)
+            content.append(group)
+            self.groups[section] = group
+        clamp = Adw.Clamp(maximum_size=720, tightening_threshold=560, child=content)
+        self.scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, vexpand=True, child=clamp)
+        return self.scroll
 
     def _build_footer(self) -> Gtk.Widget:
         footer = Gtk.Box(spacing=10)
         footer.add_css_class("mc-verify-footer")
+        self.footer_note = Gtk.Label(label=FOOTER_NOTE, xalign=0, hexpand=True, wrap=True, valign=Gtk.Align.CENTER)
+        self.footer_note.add_css_class("caption")
+        self.footer_note.add_css_class("dim-label")
+        footer.append(self.footer_note)
         self.again_button = Gtk.Button(label="Verificar de novo", valign=Gtk.Align.CENTER)
-        self.again_button.add_css_class("flat")
-        self.again_button.add_css_class("mc-verify-again")
         self.again_button.connect("clicked", lambda *_: self.refresh(deep=True))
         footer.append(self.again_button)
-        footer.append(Gtk.Box(hexpand=True))
-
-        popover_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin_top=8, margin_bottom=8,
-                              margin_start=8, margin_end=8)
-        popover_box.append(Gtk.Label(label="Vai executar, nesta ordem:", xalign=0))
-        self.fix_all_preview = Gtk.Label(xalign=0, wrap=True, max_width_chars=60, selectable=True)
-        self.fix_all_preview.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
-        popover_box.append(self.fix_all_preview)
-        self.fix_all_confirm = Gtk.Button(label="Executar tudo", halign=Gtk.Align.END)
-        self.fix_all_confirm.add_css_class("suggested-action")
-        self.fix_all_confirm.connect("clicked", self._on_fix_all_confirmed)
-        popover_box.append(self.fix_all_confirm)
-        self.fix_all_popover = Gtk.Popover(child=popover_box)
-
-        self.fix_all_button = Gtk.MenuButton(child=Gtk.Label(label="Corrigir tudo"), popover=self.fix_all_popover,
-                                             valign=Gtk.Align.CENTER, sensitive=False)
-        self.fix_all_button.add_css_class("suggested-action")
-        footer.append(self.fix_all_button)
         return footer
 
-    def make_fix_button(self, check: Check) -> tuple[Gtk.MenuButton, Gtk.Button]:
-        """"Corrigir": the tooltip and the popover show the command; it runs only on "Executar"."""
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin_top=8, margin_bottom=8,
-                      margin_start=8, margin_end=8)
-        box.append(Gtk.Label(label="Vai executar:", xalign=0))
-        command = Gtk.Label(label=check.fix.command, xalign=0, wrap=True, max_width_chars=60, selectable=True)
-        command.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
-        command.add_css_class("monospace")
-        box.append(command)
-        confirm = Gtk.Button(label="Executar", halign=Gtk.Align.END)
-        confirm.add_css_class("suggested-action")
-        box.append(confirm)
-        popover = Gtk.Popover(child=box)
-        button = Gtk.MenuButton(child=Gtk.Label(label="Corrigir"), popover=popover, valign=Gtk.Align.CENTER,
-                                tooltip_text=check.fix.command, sensitive=not self.busy)
+    # MARK: confirmations
 
-        def run(*_):
-            popover.popdown()
+    def _alert(self, heading: str, body: str, on_run: Callable[[], None]) -> Adw.AlertDialog:
+        dialog = Adw.AlertDialog(heading=heading, body=body)
+        dialog.add_response("cancel", "Cancelar")
+        dialog.add_response("run", "Executar")
+        dialog.set_response_appearance("run", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("run")
+        dialog.set_close_response("cancel")
+        dialog.connect("response", lambda _dialog, response: on_run() if response == "run" else None)
+        self.dialog = dialog
+        dialog.present(self)
+        return dialog
+
+    def confirm_fix(self, check: Check) -> None:
+        """"Corrigir X?" with the command (VerifyPage.swift:48-57); runs only on "Executar"."""
+        self._alert(f"Corrigir {check.title}?", check.fix.command, lambda: self._run_fix(check))
+
+    def confirm_fix_all(self) -> None:
+        fixes = runnable_fixes(self.last_report)
+        if not fixes or self.busy:
+            return
+        self._alert("Corrigir tudo?", "\n".join(f"• {fix.command}" for fix in fixes), self.fix_all)
+
+    def _run_fix(self, check: Check) -> None:
+        if check.fix.opens_page:
+            self.open_fix(check.fix)
+        else:
             self.fix(check)
 
-        confirm.connect("clicked", run)
-        return button, confirm
+    def _open_fix_in_window(self, fix: Fix) -> None:
+        if not open_fix_in_window(self.get_root(), fix):
+            self.error_label.set_label(f"Não consegui abrir: {fix.command}")
+            self.error_label.set_visible(True)
 
     # MARK: actions
 
-    def refresh(self, deep: bool = False) -> None:
-        """Runs the verifier off the UI thread. "Verificar de novo" also checks gh tokens."""
+    def refresh(self, deep: bool = True) -> None:
+        """Runs the verifier off the UI thread. Like the Mac page (`.task` and "Verificar de
+        novo" both use checkTokens: true), it also asks gh whether the token works."""
         config, state = self.model.config, self.model.state
         if config is None:
-            self.headline_label.set_label("MultiCred ainda não foi configurado")
+            self.title_label.set_label(NO_PROFILE)
+            self.subtitle_label.set_visible(False)
+            self.stack.set_visible_child_name("unconfigured")
             return
         tools = self.model.tools
 
@@ -237,10 +315,6 @@ class VerifyPage(Adw.NavigationPage):
         config, report = self.model.config, self.last_report
         self._start(lambda: self.verifier.fix_all(report, config))
 
-    def _on_fix_all_confirmed(self, *_):
-        self.fix_all_popover.popdown()
-        self.fix_all()
-
     def _start(self, work) -> None:
         if self.busy:
             return
@@ -258,6 +332,7 @@ class VerifyPage(Adw.NavigationPage):
     def _finish(self, report: VerifyReport | None, error: Exception | None):
         self._set_busy(False)
         if error is not None:
+            self.stack.set_visible_child_name("report")
             self.error_label.set_label(f"Não consegui verificar: {error}")
             self.error_label.set_visible(True)
             return False
@@ -282,9 +357,11 @@ class VerifyPage(Adw.NavigationPage):
     def _set_busy(self, busy: bool) -> None:
         self.busy = busy
         self.spinner.set_spinning(busy)
+        self.spinner.set_visible(busy)
+        if busy and self.last_report is None:
+            self.stack.set_visible_child_name("loading")
         self.again_button.set_sensitive(not busy)
-        fixable = bool(self.last_report and self.last_report.fixable)
-        self.fix_all_button.set_sensitive(not busy and fixable)
+        self.fix_all_button.set_sensitive(not busy and bool(runnable_fixes(self.last_report)))
         for row in self.rows.values():
             if row.fix_button is not None:
                 row.fix_button.set_sensitive(not busy)
@@ -293,10 +370,11 @@ class VerifyPage(Adw.NavigationPage):
 
     def _show(self, report: VerifyReport) -> None:
         self.last_report = report
-        if report.profile_name is not None:
-            self.headline_label.set_label(f"{report.ok_count} de {report.total} ok para {report.profile_name}")
-        else:
-            self.headline_label.set_label(f"{report.ok_count} de {report.total} ok · nenhum perfil ativo")
+        self.stack.set_visible_child_name("report")
+        self.title_label.set_label(report.profile_name or NO_PROFILE)
+        checked = report.checked_at.astimezone().strftime("%H:%M")
+        self.subtitle_label.set_label(f"{report.ok_count} de {report.total} itens de acordo · verificado às {checked}")
+        self.subtitle_label.set_visible(True)
         self._show_avatar(report)
         if report.errors:
             self.error_label.set_label("Não consegui corrigir: " + "; ".join(report.errors))
@@ -305,19 +383,16 @@ class VerifyPage(Adw.NavigationPage):
             self.error_label.set_visible(False)
 
         for row in self.rows.values():
-            (self.info_group if row.check.status == CheckStatus.INFO else self.system_group).remove(row)
+            self.groups[row.check.section].remove(row)
         self.rows = {}
         for check in report.checks:
             row = VerifyRow(self, check)
-            (self.info_group if check.status == CheckStatus.INFO else self.system_group).add(row)
+            self.groups[check.section].add(row)
             self.rows[check.id] = row
-        self.info_group.set_visible(bool(report.informative))
+        for section, group in self.groups.items():
+            group.set_visible(bool(report.in_section(section)))
 
-        fixes = []
-        for check in report.fixable:
-            if check.fix.key not in {f.key for f in fixes}:
-                fixes.append(check.fix)
-        self.fix_all_preview.set_label("\n".join(f"• {fix.command}" for fix in fixes))
+        fixes = runnable_fixes(report)
         self.fix_all_button.set_sensitive(bool(fixes) and not self.busy)
         self.fix_all_button.set_tooltip_text(None if fixes else "Nada para corrigir automaticamente")
 
@@ -326,9 +401,9 @@ class VerifyPage(Adw.NavigationPage):
         profile = config.profile(report.state.profile_id) if config else None
         for color in ProfileColor:
             self.avatar.remove_css_class(f"mc-verify-color-{color.value}")
+        self.avatar.set_visible(profile is not None)
         if profile is None:
-            self.avatar.set_label("?")
             return
-        self.avatar.set_label(profile.icon.value[:1] if profile.icon and profile.icon.kind == "letter"
-                              else profile.name[:1].upper())
+        letter = profile.icon.value if profile.icon and profile.icon.kind == "letter" else profile.name
+        self.avatar.set_label(letter[:1].upper())
         self.avatar.add_css_class(f"mc-verify-color-{profile.color.value}")

@@ -598,7 +598,7 @@ class AppModel:
     def verify(self, on_done: Callable[[object | None, Exception | None], None] | None = None,
                deep: bool = False) -> None:
         """Runs the checklist off the UI thread and keeps the report in `verification`
-        (the sidebar badge, the Perfis footer and the tray read it)."""
+        (the sidebar's Verificar dot, the Visão geral footer and the tray read it)."""
         from ..core.engine.verifier import Verifier
 
         config, state = self.config, self.state

@@ -319,7 +319,7 @@ class SidebarTests(unittest.TestCase):
             row = app.window.sidebar_row("verify")
             seen["ok"] = self.row_state(app.window, "verify")
             seen["ok_tooltip"] = row.dot.get_tooltip_text()
-            model.verification = report("ok", "problem")
+            model.verification = report("ok", "error")
             model.notify()
 
         def problems(app):
@@ -383,12 +383,12 @@ class SidebarTests(unittest.TestCase):
         def keys(app):
             window = app.window
             window.sidebar.select_row(window.sidebar_row("keys"))
-            seen["keys"] = (window.current_section, window.accounts_page.current_tab,
-                            window.content_page.get_title())
-            window.accounts_page.add_button.emit("clicked")  # an editor pushed on Chaves de API
+            keys_page = window.nav.get_visible_page()  # S-02: Chaves de API is a page of its own
+            seen["keys"] = (window.current_section, keys_page.get_tag(), window.content_page.get_title())
+            keys_page.add_button.emit("clicked")  # an editor pushed on Chaves de API
             seen["pushed"] = window.nav.get_visible_page().get_title()
             window.sidebar.emit("row-activated", window.sidebar_row("keys"))
-            seen["reclicked"] = (window.nav.get_visible_page() is window.accounts_page, window.selected_sidebar_key())
+            seen["reclicked"] = (window.nav.get_visible_page() is keys_page, window.selected_sidebar_key())
 
         self.run_steps(model, [self.mark_active(model, work.id), click_profile, editor_shown, click_new, click_overview, editor_back_selects_overview,
                                keys])
@@ -514,10 +514,9 @@ class SidebarTests(unittest.TestCase):
             page = window.nav.get_visible_page()
             seen["new-profile"] = (isinstance(page, ProfileEditorPage) and page.is_new, window.selected_sidebar_key())
             window.open_page("add-claude")
-            seen["add-claude"] = (window.current_section, window.new_account_form is not None)
-            if window.new_account_form is not None:
-                window.new_account_form.force_close()
-                window.new_account_form = None
+            # S-04: "Adicionar conta Claude" is a page pushed on Claude, as on the Mac.
+            seen["add-claude"] = (window.current_section,
+                                  window.nav.get_visible_page() is window.login_page is not None)
 
         self.run_steps(model, [walk])
         self.assertEqual(seen["accounts"], ("claude", "claude"), "Contas… opens Claude, as on the Mac")

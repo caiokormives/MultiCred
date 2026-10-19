@@ -242,20 +242,22 @@ class MainWindowSmokeTests(unittest.TestCase):
         def accounts(app):
             window = app.window
             window.open_page("accounts")
-            page = window.accounts_page
             seen["accounts_section"] = window.current_section
-            seen["tabs"] = page.tab_labels()
+            # S-02: Git, GitHub and Chaves de API are pages of their own.
             seen["tab_rows"] = {}
-            for tab in ("git", "github", "keys", "claude"):
-                page.select_tab(tab)
-                seen["tab_rows"][tab] = page.row_titles(tab)
+            for name in ("git", "github", "keys"):
+                window.open_page(name)
+                seen["tab_rows"][name] = [row.info()["title"] for row in window.nav.get_visible_page().rows]
+            window.open_page("accounts")
+            page = window.accounts_page
+            seen["tab_rows"]["claude"] = page.row_titles("claude")
             seen["folders"] = page.folder_titles()
 
         def shot_accounts(app):
             return self.screenshot(app.window, "contas")
 
         def git_tab(app):
-            app.window.accounts_page.select_tab("git")
+            app.window.open_page("git")
 
         def shot_accounts_git(app):
             return self.screenshot(app.window, "contas-git")
@@ -276,7 +278,7 @@ class MainWindowSmokeTests(unittest.TestCase):
             editor.name_entry.set_text("Empresa")
             editor.color_buttons["teal"].set_active(True)
             editor.save()
-            seen["after_save_page"] = app.window.nav.get_visible_page().get_tag()
+            seen["after_save_page"] = (app.window.nav.get_visible_page() is editor, editor.get_title())
 
         def wait_saved_switch(_app):
             return model.switching
@@ -301,9 +303,8 @@ class MainWindowSmokeTests(unittest.TestCase):
 
         def add_key(app):
             window = app.window
-            window.open_page("accounts")
-            page = window.accounts_page
-            page.select_tab("keys")
+            window.open_page("keys")
+            page = window.nav.get_visible_page()
             page.add_button.emit("clicked")
             editor = window.nav.get_visible_page()
             seen["key_editor"] = editor.get_title()
@@ -312,7 +313,7 @@ class MainWindowSmokeTests(unittest.TestCase):
             seen["default_var"] = editor.env_var_row.get_text()
             editor.secret_row.set_text(SECRET)
             editor.save()
-            seen["key_rows"] = page.row_titles("keys")
+            seen["key_rows"] = [row.info()["title"] for row in page.rows]
             new_key = next(k for k in saved_keys(self.saved()) if k["nickname"] == "Pessoal")
             seen["new_key_var"] = new_key["envVar"]
             seen["new_key_secret"] = self.environment.secrets.stored_value(new_key["id"])
@@ -321,9 +322,8 @@ class MainWindowSmokeTests(unittest.TestCase):
 
         def git_error(app):
             window = app.window
-            page = window.accounts_page
-            page.select_tab("git")
-            page.add_button.emit("clicked")
+            window.open_page("git")
+            window.nav.get_visible_page().add_button.emit("clicked")
             editor = window.nav.get_visible_page()
             editor.nickname_row.set_text("Novo")
             editor.name_row.set_text("Fulano")
@@ -334,30 +334,32 @@ class MainWindowSmokeTests(unittest.TestCase):
 
         def github_editor(app):
             window = app.window
-            page = window.accounts_page
-            page.select_tab("github")
-            editor = page.open_editor("github", self.config.github_accounts[1].id)
+            window.open_page("github")
+            editor = window.nav.get_visible_page().open_editor(self.config.github_accounts[1].id)
             seen["coauthor"] = editor.coauthor_row.get_active()
             window.nav.pop()
-            page.select_tab("claude")
+            window.open_page("accounts")
+            page = window.accounts_page
             page.request_login("add", None)
-            seen["login_form"] = window.new_account_form is not None
-            if window.new_account_form is not None:
-                window.new_account_form.force_close()
-                window.new_account_form = None
+            # S-04: a page pushed on Claude, as on the Mac (no dialog).
+            seen["login_form"] = window.nav.get_visible_page() is window.login_page is not None
+            if seen["login_form"]:
+                window.nav.pop()
 
         def other_actions(app):
             window = app.window
-            page = window.accounts_page
             folder = window.push(ClaudeFolderPage(
                 window, str(self.sandbox / ".claude-empresa")))
             seen["folder_page"] = folder.get_title()
             window.nav.pop()
             new_key = next(k for k in model.config.api_keys if k.nickname == "Pessoal")
-            page.replace_value(new_key)  # dialog opens and is dismissed below
+            # S-02: like the Mac, the value is replaced and the key removed in its editor.
+            window.open_page("keys")
+            key_editor = window.nav.get_visible_page().open_editor(new_key.id)
+            key_editor.remove_button.emit("clicked")  # the confirmation opens and is dismissed below
             seen["dialog"] = window.get_visible_dialog() is not None
             window.get_visible_dialog().force_close()
-            page._remove_key_now(new_key)
+            key_editor._remove()
             seen["key_secret_after_remove"] = self.environment.secrets.stored_value(new_key.secret_account)
             editor = window.show_profile_editor(model.config.profiles[-1].id)
             editor.delete()
@@ -392,7 +394,6 @@ class MainWindowSmokeTests(unittest.TestCase):
         self.assertEqual(seen["footer"], "Verificar")
 
         self.assertEqual(seen["accounts_section"], "claude", "Contas… opens the Claude entry, as on the Mac")
-        self.assertEqual(seen["tabs"], ["Git 2", "GitHub 2", "Claude 2 ⚠", "Chaves 2"])
         self.assertEqual(seen["tab_rows"]["git"], ["Trabalho", "Pessoal"])
         self.assertEqual(seen["tab_rows"]["github"], ["Empresa", "Pessoal"])
         self.assertEqual(seen["tab_rows"]["claude"], ["Empresa", "Cliente X"])
@@ -402,7 +403,7 @@ class MainWindowSmokeTests(unittest.TestCase):
         self.assertEqual(seen["editor_title"], "Editar perfil")
         self.assertEqual(seen["editor_keys"], ["OpenAI", "Gemini"])
         self.assertEqual(seen["editor_git"], 1, "Nenhuma, then the identities")
-        self.assertEqual(seen["after_save_page"], "main", "saving goes back to Perfis")
+        self.assertEqual(seen["after_save_page"], (True, "Editar perfil"), "saving stays in the editor (Mac)")
         saved = self.saved()
         self.assertEqual(saved["profiles"][0]["name"], "Empresa")
         self.assertEqual(saved["profiles"][0]["color"], "teal")
@@ -426,7 +427,7 @@ class MainWindowSmokeTests(unittest.TestCase):
         self.assertFalse(seen["coauthor"])
         self.assertTrue(seen["login_form"], "Adicionar conta Claude… asks for the new account")
         self.assertEqual(seen["folder_page"], "~/.claude-empresa")
-        self.assertTrue(seen["dialog"], "Trocar valor opens a dialog")
+        self.assertTrue(seen["dialog"], "Remover in the key editor asks first")
         self.assertIsNone(seen["key_secret_after_remove"], "removing a key deletes its secret")
         self.assertEqual(seen["profiles_after_delete"], ["Empresa", "Pessoal", "Cliente X"])
         self.assertTrue(seen["onboarding"])
