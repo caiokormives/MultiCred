@@ -30,12 +30,22 @@ class MultiCredApplication(Adw.Application):
         self.tray_available: bool | None = None
         # Page asked for from the tray menu ("verify", "accounts", ...), see window.PAGE_FACTORIES.
         self.requested_page: str | None = None
+        # Switch feedback and error notifications (S-09), built at startup.
+        self.feedback = None
         self._held = False
 
     def do_startup(self):
         Adw.Application.do_startup(self)
+        from .feedback import SwitchFeedbackPresenter
+
+        self.feedback = SwitchFeedbackPresenter(self)
+        self.model.switch_listeners.append(self._switched)
+        self.model.reapply_listeners.append(self._reapply_failed)
         self.model.load()
         self._start_tray()
+        # systemd forgets the user environment on reboot: put the active profile back
+        # (off the UI thread; a failure marks the model inconsistent, no retry).
+        self.model.reapply_active_profile()
 
     def do_activate(self):
         if self.background:
@@ -61,8 +71,26 @@ class MultiCredApplication(Adw.Application):
         self.window.open_page(page)
 
     def show_error(self, title: str, message: str) -> None:
-        self.present_window()
-        self.window.show_toast(f"{title}: {message}")
+        """A toast in the window when it is on screen; a desktop notification otherwise
+        (a switch from the tray must not pop the window open)."""
+        if self.window is not None and self.window.get_visible():
+            self.window.show_toast(f"{title}: {message}")
+        else:
+            self.feedback.notify_error(title, message)
+
+    def _switched(self, outcome) -> None:
+        """Every successful switch (window, tray, shortcuts): the configured feedback."""
+        config = self.model.config
+        if config is not None:
+            self.feedback.present(outcome, config.settings.switch_feedback)
+
+    def _reapply_failed(self, error) -> None:
+        from .widgets import describe_error
+
+        profile = self.model.active_profile
+        name = profile.name if profile else "o perfil ativo"
+        self.feedback.notify_error(f"Não consegui reaplicar {name}",
+                                   f"{describe_error(error).rstrip('.')}. Abra Verificar para corrigir.")
 
     def _start_tray(self) -> None:
         from ..tray.controller import TrayController

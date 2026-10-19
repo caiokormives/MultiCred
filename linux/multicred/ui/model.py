@@ -21,7 +21,10 @@ class ModelError(Exception):
 
 
 class AppModel:
-    def __init__(self, environment, tools, log=None, dispatch: Callable = lambda fn, *a: fn(*a)):
+    def __init__(self, environment, tools, log=None, dispatch: Callable = lambda fn, *a: fn(*a),
+                 processes=None, autostart=None):
+        from ..core.install.autostart import Autostart
+
         self.environment = environment
         self.tools = tools
         self.log = log
@@ -44,6 +47,14 @@ class AppModel:
         self._status_service = None
         # Last Verificar report (S-08): needs `ok_count` and `checks`; None = never ran.
         self.verification = None
+        # S-09: Claude Code sessions counted after each switch (the feedback warns about them),
+        # the XDG autostart entry, and listeners: switch_listeners(SwitchOutcome) after every
+        # successful switch from anywhere; reapply_listeners(error) when the re-apply at
+        # session start failed.
+        self.processes = processes if processes is not None else _default_scanner(environment)
+        self.autostart = autostart if autostart is not None else Autostart(environment)
+        self.switch_listeners: list[Callable] = []
+        self.reapply_listeners: list[Callable] = []
 
     @property
     def is_test_mode(self) -> bool:
@@ -79,27 +90,193 @@ class AppModel:
 
     def switch_profile(self, profile_id, on_done: Callable[[object | None, Exception | None], None]) -> None:
         """Runs the switch off the UI thread; `on_done(result, error)` runs on the UI thread."""
-        self._run_switch(lambda config: self.engine.switch_profile(profile_id, config), on_done)
+        self._run_switch(lambda config: self.engine.switch_profile(profile_id, config), on_done, claude_only=False)
 
     def switch_claude_only(self, account_id, on_done: Callable[[object | None, Exception | None], None]) -> None:
         """Switches only the Claude account (None = the profile folder's own login), like the
         Mac `switchClaudeOnly(to:)`: choosing the profile's own account clears the override."""
         override = ClaudeFolder.override_for(account_id, self.active_profile)
-        self._run_switch(lambda config: self.engine.switch_claude_only(override, config), on_done)
+        self._run_switch(lambda config: self.engine.switch_claude_only(override, config), on_done, claude_only=True)
 
-    def _run_switch(self, operation, on_done) -> None:
+    def _run_switch(self, operation, on_done, claude_only: bool) -> None:
+        config, previous = self.config, self.state
+        self.switching = True
+        self.notify()
+
+        def work():
+            outcome = None
+            try:
+                result, error = operation(config), None
+            except SwitchError as failure:
+                result, error = None, failure
+            if result is not None:
+                outcome = self._outcome(config, previous, result, claude_only)
+            self.dispatch(self._finish, result, error, on_done, outcome)
+
+        threading.Thread(target=work, name="multicred-switch", daemon=True).start()
+
+    def _outcome(self, config, previous, result, claude_only: bool):
+        """What the switch feedback shows; runs on the switch thread (it scans /proc)."""
+        from .feedback import SwitchOutcome
+
+        before = config.profile(previous.profile_id)
+        after = config.profile(result.state.profile_id)
+        claude_changed = (claude_only or before is None
+                          or before.claude_config_dir != (after.claude_config_dir if after else None)
+                          or previous.applied_claude_account_id != result.state.applied_claude_account_id)
+        try:
+            sessions = self.processes.claude_code_session_count()
+        except Exception:  # informative only; never fails a switch
+            sessions = 0
+        account = config.claude_account(result.state.applied_claude_account_id)
+        return SwitchOutcome(profile_name=after.name if after else None,
+                             claude_account_name=account.nickname if account else None,
+                             steps=tuple(result.applied_steps), claude_only=claude_only,
+                             claude_changed=claude_changed, running_claude_sessions=sessions)
+
+    # MARK: session start (S-09)
+
+    def reapply_active_profile(self, on_done: Callable[[object | None, Exception | None], None] | None = None) -> bool:
+        """At session start: systemd forgets the user environment on reboot, so the active
+        profile is applied again, off the UI thread. Any failure marks the machine
+        inconsistent and is reported once to `reapply_listeners`; there is no retry.
+        Returns False when there is nothing to re-apply."""
         config = self.config
+        if config is None or self.state.profile_id is None or self.switching:
+            return False
         self.switching = True
         self.notify()
 
         def work():
             try:
-                result, error = operation(config), None
-            except SwitchError as failure:
+                result, error = self.engine.reapply_active_profile(config), None
+            except Exception as failure:  # whatever it is, the machine may be half applied
                 result, error = None, failure
-            self.dispatch(self._finish, result, error, on_done)
+            self.dispatch(_once, self._reapplied, result, error, on_done)
 
-        threading.Thread(target=work, name="multicred-switch", daemon=True).start()
+        threading.Thread(target=work, name="multicred-reapply", daemon=True).start()
+        return True
+
+    def _reapplied(self, result, error, on_done) -> None:
+        self.switching = False
+        if error is None:
+            if result is not None:
+                self.state = result.state
+            self.inconsistent = False
+            self._log("info", "reapplied active profile at session start")
+        else:
+            self.inconsistent = True
+            self._log("error", f"reapply failed: {error}")
+            for listener in list(self.reapply_listeners):
+                listener(error)
+        if on_done is not None:
+            on_done(result, error)
+        self.notify()
+
+    def _log(self, level: str, message: str) -> None:
+        if self.log is not None:
+            self.log.log(level, message)
+
+    # MARK: settings (S-09)
+
+    def _update_settings(self, change: Callable) -> Config:
+        def edit(config: Config) -> Config:
+            updated = Config.from_dict(config.to_dict())
+            change(updated.settings)
+            return updated
+        return self.edit(edit)
+
+    def set_switch_feedback(self, feedback) -> None:
+        self._update_settings(lambda settings: setattr(settings, "switch_feedback", feedback))
+
+    def set_open_at_login(self, enabled: bool) -> None:
+        """Writes or removes the autostart entry, then saves the setting. Raises
+        AutostartUnavailable (nothing changed) when enabling outside the installed package."""
+        if enabled:
+            self.autostart.enable()
+        else:
+            self.autostart.disable()
+        self._update_settings(lambda settings: setattr(settings, "open_at_login", enabled))
+
+    @property
+    def is_installed(self) -> bool:
+        from ..core.install.installer import Installer
+        return Installer(self.environment).manifest() is not None
+
+    def set_enabled_shells(self, shells) -> None:
+        """Re-runs the installer for the chosen shells (only MultiCred's blocks change, with
+        backup), then saves the setting. An installer error leaves the setting as it was."""
+        from ..core.install.installer import Installer, InstallOptions
+
+        shells = sorted(set(shells), key=lambda shell: shell.value)
+        if self.is_installed:
+            Installer(self.environment).apply(InstallOptions(shells=list(shells)))
+        self._update_settings(lambda settings: setattr(settings, "enabled_shells", list(shells)))
+
+    def locate_tools(self, on_done: Callable[[object | None, Exception | None], None]) -> None:
+        """{Tool: path or None}, off the UI thread (the first lookup runs the login shell)."""
+        from ..core.tools import Tool
+
+        tools = self.tools
+        self._background("tools", lambda: {tool: tools.locate(tool) for tool in Tool}, on_done)
+
+    def _uninstaller(self):
+        from ..core.install.uninstaller import Uninstaller
+        return Uninstaller(self.environment, config=self.config, tools=self.tools, autostart=self.autostart)
+
+    def uninstall_preview(self, remove_claude_folders: bool = False):
+        return self._uninstaller().preview(remove_claude_folders)
+
+    def created_claude_folders(self) -> list[str]:
+        return self._uninstaller().created_claude_folders()
+
+    def uninstall(self, remove_claude_folders: bool,
+                  on_done: Callable[[object | None, Exception | None], None]) -> None:
+        """Runs the uninstaller off the UI thread; `on_done(report, error)`."""
+        uninstaller = self._uninstaller()
+
+        def finished(report, error):
+            if report is not None:
+                self._log("info", f"uninstalled: changed={report.changed_files} removed={report.removed_files} "
+                                  f"manual={report.unterminated} problems={len(report.problems)}")
+                # Nothing is configured any more; the app quits right after.
+                self.config, self.state, self.verification = None, ActiveState(), None
+            on_done(report, error)
+
+        self._background("uninstall", lambda: uninstaller.apply(remove_claude_folders), finished)
+
+    def diagnostics(self, on_done: Callable[[str], None]) -> None:
+        """"Copiar diagnóstico": versions, tool paths, distro and the last 50 log lines,
+        built off the UI thread (it runs `<tool> --version`). Never a secret value."""
+        from .. import VERSION
+        from ..core.log import redact_credential_like
+        from ..core.tools import Tool
+
+        config, tools, environment, log, autostart = self.config, self.tools, self.environment, self.log, self.autostart
+
+        def work():
+            lines = [f"MultiCred {VERSION} ({environment.mode})", f"Sistema: {os_release_name()}"]
+            for tool in Tool:
+                path = tools.locate(tool) if tools is not None else None
+                version = None
+                if path is not None and hasattr(tools, "version"):
+                    try:
+                        version = tools.version(tool)
+                    except Exception:
+                        version = None
+                where = environment.abbreviate(path) if path else "não encontrado"
+                lines.append(f"{tool.value}: {where}" + (f" ({version})" if version else ""))
+            shells = config.settings.enabled_shells if config is not None else []
+            lines.append(f"shells: {', '.join(s.value for s in shells) or 'nenhum'}")
+            if config is not None:
+                lines.append(f"retorno da troca: {config.settings.switch_feedback.value}")
+            lines.append(f"abrir ao iniciar a sessão: {'sim' if autostart.is_enabled() else 'não'}")
+            lines.append("--- log ---")
+            lines.extend(log.tail(50) if log is not None else [])
+            return redact_credential_like("\n".join(lines))
+
+        self._background("diagnostics", work,
+                         lambda text, error: on_done(text if text is not None else f"Erro: {error}"))
 
     # MARK: onboarding (S-05)
 
@@ -151,6 +328,13 @@ class AppModel:
     def _onboarding_saved(self, config, initial_profile_id, on_done) -> None:
         self.config = config
         self.load_error = None
+        # "Abrir ao iniciar a sessão" is on by default, like the Mac's login item at setup;
+        # only from the installed package (Ajustes explains otherwise).
+        if config.settings.open_at_login and self.autostart.is_available():
+            try:
+                self.autostart.enable()
+            except OSError as error:
+                self._log("error", f"autostart not written: {error}")
         self.notify()
         if initial_profile_id is None or config.profile(initial_profile_id) is None:
             on_done(None, None)
@@ -367,7 +551,7 @@ class AppModel:
 
         self._background("verify", lambda: verifier.run(config, state, deep=deep), finished)
 
-    def _finish(self, result, error, on_done):
+    def _finish(self, result, error, on_done, outcome=None):
         self.switching = False
         if result is not None:
             self.state = result.state
@@ -375,8 +559,32 @@ class AppModel:
         elif isinstance(error, StepFailed) and not error.rollback.complete:
             self.inconsistent = True
         on_done(result, error)
+        if outcome is not None:
+            for listener in list(self.switch_listeners):
+                listener(outcome)
         self.notify()
         return False  # GLib.idle_add: run once
+
+
+def _default_scanner(environment):
+    """The real /proc only for the real system; test mode's sandbox has no sessions."""
+    if environment.mode == "real":
+        from ..core import real_env
+        return real_env.make_process_scanner()
+    from ..core.adapters.process_scanner import FixedProcessScanner
+    return FixedProcessScanner(0)
+
+
+def os_release_name(path: str = "/etc/os-release") -> str:
+    """PRETTY_NAME from os-release (e.g. "Pop!_OS 24.04 LTS"), for the diagnostics."""
+    try:
+        with open(path, encoding="utf-8") as file:
+            for line in file:
+                if line.startswith("PRETTY_NAME="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return "desconhecido"
 
 
 def _once(fn, *args):

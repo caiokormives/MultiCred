@@ -81,6 +81,10 @@ def prepare_folder(choice: ClaudeFolderChoice, environment) -> str | None:
             os.chmod(directory, 0o700)
         except OSError as error:
             raise ClaudeAccountError("createFailed", error.strerror) from error
+        if config_dir is not None:
+            # Uninstall may offer to log it out and delete it (D12).
+            from ..install.uninstaller import remember_created_claude_folder
+            remember_created_claude_folder(environment, config_dir)
     return config_dir
 
 

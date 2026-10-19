@@ -56,6 +56,11 @@ def _verify_page(window):
     return page
 
 
+def _settings_page(window):
+    from .pages.settings import SettingsPage
+    return SettingsPage(window)
+
+
 def placeholder_page(title: str, icon: str, description: str) -> Adw.StatusPage:
     return Adw.StatusPage(title=title, icon_name=icon, description=description)
 
@@ -65,8 +70,7 @@ PAGE_FACTORIES: dict[str, Callable] = {
     "main": _profiles_page,
     "accounts": _accounts_page,
     "verify": _verify_page,
-    "settings": lambda window: placeholder_page(
-        "Ajustes", "emblem-system-symbolic", "Abrir ao iniciar a sessão, retorno da troca e desinstalar chegam em breve."),
+    "settings": _settings_page,
 }
 
 # Pages opened on top of a section: name → (section, callable(window)).
