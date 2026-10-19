@@ -410,6 +410,25 @@ class ClaudeAccountSaverTests(SafeTestCase):
             saver.save_login(NewClaudeAccount("Marco", None, ProfileColor.TEAL), self.record())
         self.assertEqual(self.claude_store.vault, {})
 
+    def test_signing_a_token_account_in_again_keeps_its_token_until_the_config_is_saved(self):
+        from multicred.core.claude.account_editor import add_token_account
+        config, account = add_token_account("Marco", None, ProfileColor.TEAL, "sk-ant-oat01-" + "a" * 30,
+                                            self.repository.load(), self.secrets)
+        self.repository.save(config)
+
+        def failing_save(_config):
+            raise OSError("disk full")
+        saver = ClaudeAccountSaver(self.environment, self.repository.load, failing_save)
+        with self.assertRaises(OSError):
+            saver.save_login(account, self.record())
+        self.assertEqual(self.repository.load().claude_account(account.id).kind.value, "token")
+        self.assertIsNotNone(self.secrets.stored_value(account.secret_account),
+                             "the config still says token account, so the token must still be there")
+
+        converted = self.saver.save_login(account, self.record())
+        self.assertEqual(converted.kind.value, "login")
+        self.assertIsNone(self.secrets.stored_value(account.secret_account), "deleted once the save succeeded")
+
     def test_unconfigured_app_is_refused(self):
         saver = ClaudeAccountSaver(self.environment, lambda: None, self.repository.save)
         with self.assertRaises(Exception):

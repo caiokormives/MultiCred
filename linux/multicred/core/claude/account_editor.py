@@ -149,7 +149,9 @@ def add_login_account(nickname: str, email: str | None, color: ProfileColor, rec
 
 def replace_login(account: ClaudeAccount, record, config: Config, switcher, secrets) -> Config:
     """Signs an existing account in again. A token account becomes a login account
-    (live switching) and its old token is deleted. The caller re-applies Claude
+    (live switching). Its old token is NOT deleted here: until the caller has saved
+    the converted config, the saved config still says "token account" and needs it.
+    The caller saves, then calls `discard_replaced_token`, then re-applies Claude
     when the token was the one in use, so shells stop exporting it."""
     switcher.replace_login(account.id, record)
     if account.kind == ClaudeAccountKind.LOGIN:
@@ -159,11 +161,17 @@ def replace_login(account: ClaudeAccount, record, config: Config, switcher, secr
     if target is not None:
         target.kind = ClaudeAccountKind.LOGIN
         target.email = target.email or record.email
+    return updated
+
+
+def discard_replaced_token(account: ClaudeAccount, secrets) -> None:
+    """Deletes the token of an account `replace_login` converted, after the save."""
+    if account.kind != ClaudeAccountKind.TOKEN:
+        return
     try:
         secrets.delete_item(account.secret_account)
     except Exception:
         pass  # a leftover token is harmless: login accounts never export it
-    return updated
 
 
 # MARK: removal

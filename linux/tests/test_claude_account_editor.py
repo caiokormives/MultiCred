@@ -6,8 +6,8 @@ import os
 import uuid
 
 from multicred.core.claude.account_editor import (
-    ClaudeAccountError, ClaudeFolderChoice, add_login_account, add_token_account, is_plausible_token, prepare_folder,
-    profiles_using, remove, replace_login, replace_token,
+    ClaudeAccountError, ClaudeFolderChoice, add_login_account, add_token_account, discard_replaced_token,
+    is_plausible_token, prepare_folder, profiles_using, remove, replace_login, replace_token,
 )
 from multicred.core.claude.login_vault import ClaudeLoginRecord, ClaudeLoginSwitcher
 from multicred.core.models import ClaudeAccountKind, Config, Profile, ProfileColor, uuid_text
@@ -130,7 +130,10 @@ class ClaudeAccountEditorTests(SafeTestCase):
         updated = replace_login(account, RECORD, config, switcher, self.secrets)
         converted = updated.claude_account(account.id)
         self.assertEqual((converted.kind, converted.email), (ClaudeAccountKind.LOGIN, "l@x.com"))
-        self.assertIsNone(self.secrets.stored_value(account.secret_account), "the old token is deleted")
+        self.assertIsNotNone(self.secrets.stored_value(account.secret_account),
+                             "the token stays until the caller saved the converted config")
+        discard_replaced_token(account, self.secrets)
+        self.assertIsNone(self.secrets.stored_value(account.secret_account))
         self.assertIsNotNone(self.claude_store.read_vault(uuid_text(account.id)))
 
     def test_removing_a_live_login_account_gives_the_folder_back(self):

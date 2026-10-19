@@ -411,6 +411,7 @@ class ClaudeAccountSaver:
             updated = account_editor.replace_login(target, record, config, self.switcher, self.environment.secrets)
             if updated is not config:
                 self._save(updated)
+                account_editor.discard_replaced_token(target, self.environment.secrets)
             return updated.claude_account(target.id) or target
         updated, account = account_editor.add_login_account(target.nickname, target.email, target.color, record,
                                                             config, self.switcher)
