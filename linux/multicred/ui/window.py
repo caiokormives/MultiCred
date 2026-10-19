@@ -89,6 +89,14 @@ def _accounts_entry(window):
     return window.accounts_page
 
 
+def _account_list_page(class_name: str) -> Callable:
+    """S-02: Git, GitHub and Chaves de API are pages of their own (pages/accounts.py)."""
+    def factory(window):
+        from .pages import accounts
+        return getattr(accounts, class_name)(window)
+    return factory
+
+
 def _verify_page(window):
     from .pages.verify import VerifyPage
     page = VerifyPage(window.model, on_report=window.verification_reported)
@@ -110,10 +118,10 @@ def placeholder_page(title: str, icon: str, description: str) -> Adw.StatusPage:
 # name → callable(window) returning the section's root widget.
 PAGE_FACTORIES: dict[str, Callable] = {
     "main": _profiles_page,
-    "git": _accounts_entry,
-    "github": _accounts_entry,
+    "git": _account_list_page("GitAccountsPage"),
+    "github": _account_list_page("GitHubAccountsPage"),
     "claude": _accounts_entry,
-    "keys": _accounts_entry,
+    "keys": _account_list_page("APIKeysPage"),
     "verify": _verify_page,
     "settings": _settings_page,
 }
@@ -121,7 +129,7 @@ PAGE_FACTORIES: dict[str, Callable] = {
 # Pages opened on top of a section: name → (section, callable(window)).
 PUSHED_PAGES: dict[str, tuple[str, Callable]] = {
     "new-profile": ("main", lambda window: window.show_profile_editor(None)),
-    "add-claude": ("claude", lambda window: window.accounts_page.request_login("add", None, tab="claude")),
+    "add-claude": ("claude", lambda window: window.on_login_requested("add", None)),
 }
 
 
@@ -137,9 +145,9 @@ class MainWindow(Adw.ApplicationWindow):
         widgets.load_icons()
         self.model = app.model
         self.last_toast = None
-        # Login flows (S-07) opened from Contas, the tray or the profile page.
-        self.new_account_form = None
-        self.login_dialog = None
+        # Login pages (S-04) opened from Contas, the tray or the profile page: the last
+        # one pushed, and what the last one reported.
+        self.login_page = None
         self.last_login_result = None
         self.folder_login_command = None
         self._toast = None
@@ -355,12 +363,22 @@ class MainWindow(Adw.ApplicationWindow):
             # The profile on screen no longer exists: back to the start page.
             self.show_section(self.start_section())
             return
+        if key is None and self.current_section is not None:
+            # A sub-page (login, account editor) keeps its section's row selected, also
+            # after a rebuild: otherwise the list box selects the focused row by itself
+            # later and that "click" would clear the stack.
+            key = _section_key(self.current_section)
         self._select_sidebar(key)
 
     def _sidebar_selected(self, _listbox, row) -> None:
-        if row is None or self._selecting:
+        key = row.item.key if row is not None else None
+        previous, self._selected_key = getattr(self, "_selected_key", None), key
+        # GTK emits row-selected again for the row already selected when it takes the
+        # focus: navigating then would clear the section's stack (a login page, an
+        # editor). Going back to the section's root on purpose is _sidebar_activated.
+        if key is None or self._selecting or key == previous:
             return
-        self._navigate(row.item.key)
+        self._navigate(key)
         self.split.set_show_content(True)
 
     def _sidebar_activated(self, _listbox, row) -> None:
@@ -463,94 +481,55 @@ class MainWindow(Adw.ApplicationWindow):
         self.nav.pop_to_tag("main")
         return self.push(ProfileEditorPage(self, profile_id))
 
-    # MARK: logins (pseudo-terminal flows of S-07)
+    # MARK: logins (pages pushed in the content, as on the Mac)
 
-    def on_login_requested(self, kind: str, account) -> None:
+    def on_login_requested(self, kind: str, account, host: str = "github.com") -> None:
         """kinds: "add" (new Claude account), "login" (sign an existing Claude account in
         again), "folder" (a Claude folder's own login; `account` is the folder or None),
-        "github" (gh auth login)."""
-        if kind == "add":
-            self._ask_new_claude_account()
-        elif kind == "login" and account is not None:
-            from ..core.models import ClaudeAccountKind
-            from .pages.login import LoginKind
-            mode = LoginKind.CLAUDE_TOKEN if account.kind == ClaudeAccountKind.TOKEN else LoginKind.CLAUDE_LOGIN
-            self._open_login(mode, target=account)
+        "github" (gh auth login on `host`).
+
+        Like MainNavigator.swift: Claude pages open in the Claude section and the GitHub
+        login in GitHub (switching section clears the stack); already there, the page is
+        pushed over what is shown."""
+        if kind == "add" or (kind == "login" and account is not None):
+            from .pages.add_claude import AddClaudeAccountPage
+            self._push_login("claude", AddClaudeAccountPage(self, account if kind == "login" else None))
         elif kind == "folder":
             self._show_folder_login(account)
         elif kind == "github":
-            from .pages.login import LoginKind
-            self._open_login(LoginKind.GITHUB)
+            from .pages.login import GitHubLoginPage
+            self._push_login("github", GitHubLoginPage(self, host))
 
-    def _ask_new_claude_account(self) -> None:
-        """Nickname, optional e-mail and the kind, then the login dialog (like the Mac's
-        AddClaudeAccountPage, as one small form)."""
-        rows = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
-        rows.add_css_class("boxed-list")
-        nickname = Adw.EntryRow(title="Apelido")
-        email = Adw.EntryRow(title="E-mail (opcional, só para exibir)")
-        kind = Adw.ComboRow(title="Tipo", model=Gtk.StringList.new(
-            ["Login completo (troca ao vivo, como o /login)", "Token (setup-token, só terminais novos)"]))
-        for row in (nickname, email, kind):
-            rows.append(row)
-        dialog = Adw.AlertDialog(heading="Adicionar conta Claude",
-                                 body="O login acontece numa pasta temporária; agents, skills e conversas "
-                                      "continuam na pasta de cada perfil.")
-        dialog.set_extra_child(rows)
-        dialog.add_response("cancel", "Cancelar")
-        dialog.add_response("continue", "Continuar")
-        dialog.set_response_appearance("continue", Adw.ResponseAppearance.SUGGESTED)
-        dialog.set_default_response("continue")
-
-        def responded(_dialog, response):
-            self.new_account_form = None
-            if response == "continue":
-                self.confirm_new_account(nickname.get_text(), email.get_text(),
-                                         "token" if kind.get_selected() == 1 else "login")
-
-        dialog.connect("response", responded)
-        self.new_account_form = dialog
-        dialog.present(self)
-
-    def confirm_new_account(self, nickname: str, email: str | None, kind: str) -> None:
-        from ..core.claude.login_flow import NewClaudeAccount
-        from ..core.models import ProfileColor
-        from .pages.login import LoginKind
-
-        nickname, email = nickname.strip(), (email or "").strip() or None
-        if not nickname:
-            self.show_toast("Dê um apelido para a conta")
+    def _push_login(self, section: str, page) -> None:
+        if self.onboarding is not None:
             return
-        palette = list(ProfileColor)
-        used = len(self.model.config.claude_accounts) if self.model.config else 0
-        target = NewClaudeAccount(nickname, email, palette[used % len(palette)])
-        self._open_login(LoginKind.CLAUDE_TOKEN if kind == "token" else LoginKind.CLAUDE_LOGIN, target=target)
-
-    def _open_login(self, kind, target=None) -> None:
-        from .pages.login import LoginDialog
-
+        if self.current_section != section:
+            self.show_section(section)
         self.last_login_result = None
-        self.login_dialog = LoginDialog(self.model, kind, self.login_finished, target=target)
-        self.login_dialog.present(self)
+        self.login_page = page
+        self.push(page)
+        self.split.set_show_content(True)
+
+    def pop_to_section_root(self) -> None:
+        """"Concluir" on a login page (Mac: navigator.path = [])."""
+        stack = self.nav.get_navigation_stack()
+        if stack.get_n_items() > 1:
+            self.nav.pop_to_page(stack.get_item(0))
 
     def login_finished(self, result) -> None:
-        """Called once per dialog: on success, or when it closes without one."""
+        """Called once per login page: on success, or when it is left without one."""
         from .pages.login import LoginKind
 
         self.last_login_result = result
         if not result.success:
             return
         if result.kind == LoginKind.GITHUB:
-            # The Mac adds the logins gh now knows (addMissingGitHubAccounts).
-            def imported(added, error):
-                if error is None and added:
-                    self.show_toast(f"Conta do GitHub {result.login} adicionada")
-            self.model.import_github_accounts(imported)
-            self.show_toast(f"Entrou no GitHub como {result.login}" if result.login else "Entrou no GitHub")
+            # Mac didLogInToGitHub: add the logins gh now knows (addMissingGitHubAccounts),
+            # then verify. The page itself says it is connected (no toast, as on the Mac).
+            self.model.import_github_accounts(lambda _added, _error: self.model.verify())
             return
         account = result.account
         self.model.notify()
-        self.show_toast(f"Conta Claude {account.nickname} conectada")
         # Signed in again while in use: the live login (or the token's removal) must reach the folder.
         if account is not None and self.model.state.applied_claude_account_id == account.id:
             self.model.switch_claude_only(account.id, lambda _result, _error: None)
@@ -696,11 +675,13 @@ class MainWindow(Adw.ApplicationWindow):
 
         self.model.switch_profile(profile_id, done)
 
-    def switch_claude_only(self, account_id) -> None:
+    def switch_claude_only(self, account_id, on_success: Callable[[], None] | None = None) -> None:
         def done(result, error):
             if error is not None:
                 self.show_toast(widgets.describe_error(error))
             else:
+                if on_success is not None:
+                    on_success()
                 applied = self.model.config.claude_account(self.model.state.applied_claude_account_id)
                 self.show_toast(f"Claude agora usa {applied.nickname if applied else 'o login da pasta'}")
 

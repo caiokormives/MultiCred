@@ -1,23 +1,21 @@
-"""Login dialog for Claude (full login or setup-token) and GitHub (approved Linux design H).
+"""Login pages pushed in the window's content, as on the Mac (MainNavigator.swift:18-125).
 
-Port of the macOS Login/{LoginWindowView,LoginSession,GitHubLoginSession,
-SetupTokenSession,BrowserChoice}.swift as one standalone `Adw.Dialog`: avatar
-and title, three steps, the code field (sent to the CLI with Enter separately),
-"Copiar link de novo", "Abrir em outro navegador", the collapsible terminal
-output, and Cancelar / Copiar log / Conectar. The CLI never opens a browser by
-itself (BROWSER is a no-op); the dialog opens the link in the default browser,
-or in the one picked from the menu.
+Shared pieces of the macOS login views, ported for the pages of this package:
+`BrowserChoice` / `AuthorizationLinkActions` (Login/BrowserChoice.swift), `StepRow`
+(AddClaudeAccountPage.swift:325-365), `TerminalOutput` (LoginWindowView.swift:209-235),
+plus the "Entrar no GitHub" page (`GitHubLoginPage`, AccountsPages.swift:340-446).
+"Adicionar conta Claude" / "Entrar de novo em X" lives in `add_claude.py`.
 
-`on_result(LoginResult)` runs exactly once: when the login is saved (connected),
-or when the dialog closes without success. In test mode the simulators run
-instead of the real `claude`/`gh` (D30) and the browser never opens.
+Sub-steps are pages, never dialogs: the window pushes them on the section's
+Adw.NavigationView (`MainWindow.on_login_requested`). Leaving a login page stops its
+process (Mac: stopSessionsNoLongerShown). In test mode the simulators run instead of
+the real `claude`/`gh` (D30) and the browser never opens.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable
 
 import gi
 
@@ -26,12 +24,8 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 
 from ...core.adapters.github_login_flow import GitHubLoginSession  # noqa: E402
-from ...core.claude.login_flow import (  # noqa: E402
-    ClaudeAccountSaver, ClaudeLoginSession, LoginMode, LoginPhase, NewClaudeAccount,
-)
-from ...core.engine.types import SwitchError  # noqa: E402
-from ...core.models import ClaudeAccount, ClaudeAccountKind, ProfileColor  # noqa: E402
-from ..messages import describe_switch_error  # noqa: E402
+from ...core.models import ClaudeAccount, ProfileColor  # noqa: E402
+from .. import widgets  # noqa: E402
 
 
 class LoginKind(str, Enum):
@@ -42,6 +36,9 @@ class LoginKind(str, Enum):
 
 @dataclass(frozen=True)
 class LoginResult:
+    """What a login page reports to the window, once: on success, or when it is left
+    without one."""
+
     kind: LoginKind
     success: bool
     # Claude: the account stored (new, or the existing one updated).
@@ -53,27 +50,34 @@ class LoginResult:
 
 
 _CSS = """
-.mc-login-avatar { min-width: 40px; min-height: 40px; border-radius: 10px; color: white; font-weight: 800;
-                   font-size: 17px; }
-.mc-login-title { font-weight: 800; font-size: 17px; }
-.mc-login-step { font-size: 13.5px; }
-.mc-login-step.todo { color: alpha(currentColor, 0.5); }
-.mc-login-badge { min-width: 22px; min-height: 22px; border-radius: 11px; font-size: 12px; font-weight: 800;
-                  background: alpha(currentColor, 0.1); }
-.mc-login-step.done .mc-login-badge { background: alpha(@success_color, 0.18); color: @success_color; }
-.mc-login-step.current .mc-login-badge { background: @accent_bg_color; color: @accent_fg_color; }
-.mc-login-step.failed .mc-login-badge { background: alpha(@error_color, 0.18); color: @error_color; }
-.mc-login-code { font-family: monospace; font-size: 22px; font-weight: 800; letter-spacing: 2px; }
-.mc-terminal-frame { border-radius: 9px; background: #1e1e1e; }
-textview.mc-terminal, textview.mc-terminal text { background-color: #1e1e1e; color: #d0d0d0; font-size: 11.5px; }
-""" + "".join(f".mc-login-{color.value} {{ background: {color.hex}; }}\n" for color in ProfileColor)
+.mc-login-page { font-size: 13.5px; }
+.mc-login-heading { font-size: 15px; font-weight: 700; }
+.mc-login-name { font-size: 17px; font-weight: 600; }
+.mc-login-round { border-radius: 999px; }
+.mc-login-icon-circle { min-width: 40px; min-height: 40px; border-radius: 999px; background: alpha(currentColor, 0.08); }
+.mc-login-steps { background: alpha(currentColor, 0.04); border-radius: 12px; padding: 16px; }
+.mc-step-badge { min-width: 24px; min-height: 24px; border-radius: 999px; font-size: 11px; font-weight: 800;
+                 background: alpha(currentColor, 0.08); color: alpha(currentColor, 0.6); }
+.mc-step.active .mc-step-badge { background: @accent_bg_color; color: @accent_fg_color; }
+.mc-step.done .mc-step-badge { background: @green_4; color: white; }
+.mc-step.failed .mc-step-badge { background: @red_3; color: white; }
+.mc-step-title { font-size: 13.5px; }
+.mc-step.active .mc-step-title { font-weight: 600; }
+.mc-step.pending .mc-step-title { color: alpha(currentColor, 0.55); }
+.mc-caption { font-size: 12px; color: alpha(currentColor, 0.6); }
+.mc-orange { color: @orange_4; }
+.mc-red { color: @red_3; }
+.mc-green { color: @green_5; }
+.mc-gh-code { font-family: monospace; font-size: 30pt; font-weight: 600; }
+expander-widget.mc-details > box > title { color: alpha(currentColor, 0.6); }
+.mc-terminal-frame { border-radius: 10px; background: #141414; }
+textview.mc-terminal, textview.mc-terminal text { background-color: #141414; color: #ebebeb; font-size: 12px; }
+"""
 
 _css_loaded = False
 
-STEP_SYMBOLS = {"done": "✓", "failed": "!"}
 
-
-def _load_css() -> None:
+def load_css() -> None:
     global _css_loaded
     display = Gdk.Display.get_default()
     if _css_loaded or display is None:
@@ -84,7 +88,7 @@ def _load_css() -> None:
     _css_loaded = True
 
 
-def _idle(fn, *args) -> None:
+def idle(fn, *args) -> None:
     """Hands a pseudo-terminal callback to the GTK main loop (runs once, in order)."""
     def run():
         fn(*args)
@@ -92,259 +96,407 @@ def _idle(fn, *args) -> None:
     GLib.idle_add(run)
 
 
-def https_browsers() -> list[Gio.AppInfo]:
-    """Installed apps that open https links, one per name."""
-    seen, browsers = set(), []
-    for app in Gio.AppInfo.get_all_for_type("x-scheme-handler/https"):
-        name = app.get_display_name()
-        if name not in seen:
-            seen.add(name)
-            browsers.append(app)
-    return browsers
+def copy_text(text: str | None) -> None:
+    display = Gdk.Display.get_default()
+    if display is not None and text:
+        display.get_clipboard().set(text)
 
 
-def default_browser_name() -> str | None:
-    app = Gio.AppInfo.get_default_for_uri_scheme("https")
-    return app.get_display_name() if app is not None else None
+def caption(text: str = "", *classes: str) -> Gtk.Label:
+    return widgets.label(text, "mc-caption", *classes, wrap=True)
 
+
+def notice(text: str, icon: str, *classes: str) -> tuple[Gtk.Box, Gtk.Label]:
+    """A label with a leading icon (SwiftUI `Label(text, systemImage:)`)."""
+    box = Gtk.Box(spacing=8)
+    image = Gtk.Image(icon_name=icon, valign=Gtk.Align.START)
+    text_label = widgets.label(text, wrap=True)
+    text_label.set_hexpand(True)
+    for css in classes:
+        box.add_css_class(css)
+    box.append(image)
+    box.append(text_label)
+    return box, text_label
+
+
+def round_avatar(name: str, color: ProfileColor, size: int = 40) -> Gtk.Label:
+    """AccountAvatar (Shared.swift:30-46): a circle in the account color with the initial."""
+    avatar = widgets.avatar((name[:1] or "?").upper(), color, size)
+    avatar.add_css_class("mc-login-round")
+    return avatar
+
+
+def in_navigation_stack(page: Adw.NavigationPage) -> bool:
+    """Whether `page` is still on its Adw.NavigationView (False once popped or replaced)."""
+    view = page.get_ancestor(Adw.NavigationView)
+    if view is None:
+        return False
+    stack = view.get_navigation_stack()
+    return any(stack.get_item(i) is page for i in range(stack.get_n_items()))
+
+
+# MARK: browser choice (BrowserChoice.swift)
+
+class BrowserChoice:
+    """Which browser opens Claude's authorization link. The CLI runs with a no-op
+    BROWSER, so the app opens the link itself, in the chosen browser, or only copies it.
+
+    `current`: "" = default browser, COPY_ONLY, or a desktop app id. Kept for the life
+    of the app (the Mac keeps it in @AppStorage)."""
+
+    COPY_ONLY = "copy"
+    current = ""
+
+    @staticmethod
+    def installed() -> list[Gio.AppInfo]:
+        """Installed apps that open https links, one per name (Mac: urlsForApplications)."""
+        seen, browsers = set(), []
+        for app in Gio.AppInfo.get_all_for_type("x-scheme-handler/https"):
+            name = app.get_display_name()
+            if name not in seen:
+                seen.add(name)
+                browsers.append(app)
+        return browsers
+
+    @staticmethod
+    def default() -> Gio.AppInfo | None:
+        return Gio.AppInfo.get_default_for_uri_scheme("https")
+
+    @classmethod
+    def _app(cls, choice: str) -> Gio.AppInfo | None:
+        return next((app for app in cls.installed() if app.get_id() == choice), None) if choice else None
+
+    @classmethod
+    def label(cls, choice: str) -> str:
+        if choice == cls.COPY_ONLY:
+            return "Não abrir, só copiar o link"
+        app = cls._app(choice)
+        if app is not None:
+            return app.get_display_name()
+        default = cls.default()
+        return "Navegador padrão" + (f" ({default.get_display_name()})" if default is not None else "")
+
+    @classmethod
+    def open(cls, url: str, choice: str) -> bool:
+        """Opens `url` by the choice; False when it only copies the link (or nothing opened it)."""
+        if choice == cls.COPY_ONLY:
+            copy_text(url)
+            return False
+        try:
+            app = cls._app(choice)
+            if app is not None:
+                app.launch_uris([url], None)
+            else:
+                Gio.AppInfo.launch_default_for_uri(url, None)
+            return True
+        except GLib.Error:
+            copy_text(url)  # no browser could open it: the link is on the clipboard
+            return False
+
+    @staticmethod
+    def open_in(url: str, app: Gio.AppInfo) -> None:
+        try:
+            app.launch_uris([url], None)
+        except GLib.Error:
+            copy_text(url)
+
+
+class BrowserChoiceRow(Adw.ComboRow):
+    """"Abrir o link em" (BrowserChoicePicker): default browser, the installed ones, and
+    "Não abrir, só copiar o link"."""
+
+    def __init__(self):
+        super().__init__(title="Abrir o link em")
+        self.choices = [""] + [app.get_id() for app in BrowserChoice.installed()] + [BrowserChoice.COPY_ONLY]
+        self.labels = [BrowserChoice.label(choice) for choice in self.choices]
+        self.set_model(Gtk.StringList.new(self.labels))
+        current = BrowserChoice.current if BrowserChoice.current in self.choices else ""
+        self.set_selected(self.choices.index(current))
+        self.connect("notify::selected", self._changed)
+
+    def _changed(self, *_args) -> None:
+        index = self.get_selected()
+        if 0 <= index < len(self.choices):
+            BrowserChoice.current = self.choices[index]
+
+
+class AuthorizationLinkActions(Gtk.Box):
+    """"Copiar link" (2 s "Link copiado") + "Abrir em" for a link already issued."""
+
+    def __init__(self):
+        super().__init__(spacing=8)
+        self.url: str | None = None
+        self.copy_button = Gtk.Button()
+        self.copy_content = Adw.ButtonContent(icon_name="edit-copy-symbolic", label="Copiar link")
+        self.copy_button.set_child(self.copy_content)
+        self.copy_button.connect("clicked", lambda _b: self._copy())
+        self.open_button = Gtk.MenuButton(child=Adw.ButtonContent(icon_name="web-browser-symbolic", label="Abrir em"))
+        self.open_button.set_popover(self._popover())
+        for button in (self.copy_button, self.open_button):
+            button.add_css_class("flat")
+            self.append(button)
+        self._reset_source = None
+        self.set_url(None)
+
+    def set_url(self, url: str | None) -> None:
+        self.url = url
+        self.set_sensitive(url is not None)
+
+    def _copy(self) -> None:
+        if not self.url:
+            return
+        copy_text(self.url)
+        self.copy_content.set_label("Link copiado")
+        self.copy_content.set_icon_name("object-select-symbolic")
+        if self._reset_source is not None:
+            GLib.source_remove(self._reset_source)
+        self._reset_source = GLib.timeout_add_seconds(2, self._reset)
+
+    def _reset(self) -> bool:
+        self._reset_source = None
+        self.copy_content.set_label("Copiar link")
+        self.copy_content.set_icon_name("edit-copy-symbolic")
+        return False
+
+    def _popover(self) -> Gtk.Popover:
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, margin_top=6, margin_bottom=6,
+                      margin_start=6, margin_end=6)
+        popover = Gtk.Popover(child=box)
+
+        def item(text, action):
+            button = Gtk.Button(label=text)
+            button.add_css_class("flat")
+            button.get_child().set_xalign(0)
+            button.connect("clicked", lambda _b: (popover.popdown(), self.url and action(self.url)))
+            box.append(button)
+
+        default = BrowserChoice.default()
+        if default is not None:
+            item(f"Navegador padrão ({default.get_display_name()})", lambda url: BrowserChoice.open(url, ""))
+            box.append(Gtk.Separator(margin_top=3, margin_bottom=3))
+        for app in BrowserChoice.installed():
+            item(app.get_display_name(), lambda url, a=app: BrowserChoice.open_in(url, a))
+        return popover
+
+
+# MARK: steps and terminal
 
 class StepRow(Gtk.Box):
-    """A numbered step: badge (number, ✓ or !) and title; state done/current/todo/failed."""
+    """A numbered step: circle (number, ✓ or ✗), the title and, while active or failed,
+    its detail. States: pending, active, done, failed."""
+
+    SYMBOLS = {"done": "✓", "failed": "✕"}
 
     def __init__(self, number: int, title: str):
-        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        super().__init__(spacing=12)
         self.number = number
-        self.state = "todo"
-        self.add_css_class("mc-login-step")
-        self.badge = Gtk.Label(label=str(number), halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
-        self.badge.add_css_class("mc-login-badge")
-        self.title = Gtk.Label(label=title, xalign=0, wrap=True, hexpand=True)
+        self.title_text = title
+        self.state = "pending"
+        self.add_css_class("mc-step")
+        self.badge = widgets.label(str(number), "mc-step-badge", xalign=0.5)
+        self.badge.set_valign(Gtk.Align.START)
+        column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, hexpand=True)
+        self.title = widgets.label(title, "mc-step-title", wrap=True)
+        self.title.set_margin_top(3)
+        self.detail = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, visible=False)
+        column.append(self.title)
+        column.append(self.detail)
         self.append(self.badge)
-        self.append(self.title)
-        self.set_state("todo")
+        self.append(column)
+        self.set_state("pending")
 
     def set_state(self, state: str) -> None:
-        for name in ("done", "current", "todo", "failed"):
+        for name in ("pending", "active", "done", "failed"):
             self.remove_css_class(name)
         self.add_css_class(state)
         self.state = state
-        self.badge.set_label(STEP_SYMBOLS.get(state, str(self.number)))
-
-    def set_title(self, title: str) -> None:
-        self.title.set_label(title)
+        self.badge.set_label(self.SYMBOLS.get(state, str(self.number)))
+        self.detail.set_visible(state in ("active", "failed"))
 
 
-class LoginDialog(Adw.Dialog):
-    """`model` is the AppModel (environment, tools, config, save, active profile).
-    `target`: a NewClaudeAccount or an existing ClaudeAccount (Claude kinds).
-    `host`: the GitHub host (GitHub kind)."""
+class TerminalOutput(Gtk.ScrolledWindow):
+    """The CLI's output: folder (gray), "$ command" and the masked text (dark box, 190 px)."""
 
-    def __init__(self, model, kind: LoginKind, on_result: Callable[[LoginResult], None], *,
-                 target: NewClaudeAccount | ClaudeAccount | None = None, host: str = "github.com"):
-        super().__init__()
-        _load_css()
-        self.model = model
-        self.kind = LoginKind(kind)
-        self.on_result = on_result
-        self.target = target
+    def __init__(self, directory: str, command: str = ""):
+        self.view = Gtk.TextView(editable=False, cursor_visible=False, monospace=True, wrap_mode=Gtk.WrapMode.CHAR,
+                                 top_margin=12, bottom_margin=12, left_margin=12, right_margin=12)
+        self.view.add_css_class("mc-terminal")
+        super().__init__(min_content_height=190, max_content_height=190, child=self.view)
+        self.add_css_class("mc-terminal-frame")
+        self.set_overflow(Gtk.Overflow.HIDDEN)
+        self.update_property([Gtk.AccessibleProperty.LABEL], ["Saída do terminal"])
+        buffer = self.view.get_buffer()
+        buffer.create_tag("dim", foreground="#8e8e93")
+        buffer.create_tag("prompt", foreground="#64a0ff")
+        self.directory = directory
+        self.command = command
+        self._output = None
+        self.set_output("")
+
+    def set_output(self, text: str, command: str | None = None) -> None:
+        text = (text or "").replace("\r", "")
+        command = self.command if command is None else command
+        if text == self._output and command == self.command:
+            return
+        self._output, self.command = text, command
+        buffer = self.view.get_buffer()
+        buffer.set_text("")
+        end = buffer.get_end_iter()
+        buffer.insert_with_tags_by_name(end, self.directory + "\n", "dim")
+        buffer.insert_with_tags_by_name(buffer.get_end_iter(), "$ ", "prompt")
+        buffer.insert(buffer.get_end_iter(), command + "\n" + text)
+        GLib.idle_add(self._scroll_to_end)
+
+    def text(self) -> str:
+        buffer = self.view.get_buffer()
+        return buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), False)
+
+    def _scroll_to_end(self) -> bool:
+        adjustment = self.get_vadjustment()
+        adjustment.set_value(adjustment.get_upper())
+        return False
+
+
+def set_pill(pill: Gtk.Label, text: str, tone: str) -> None:
+    for name in ("ok", "warning", "error", "neutral"):
+        pill.remove_css_class(name)
+    pill.add_css_class(tone)
+    pill.set_label(text)
+
+
+def page_body(content: Gtk.Widget) -> Adw.ToolbarView:
+    """The header bar (back button from the navigation view) over `content`."""
+    view = Adw.ToolbarView()
+    view.add_top_bar(Adw.HeaderBar())
+    view.set_content(content)
+    return view
+
+
+# MARK: Entrar no GitHub
+
+class GitHubLoginPage(Adw.NavigationPage):
+    """"Entrar no GitHub" (AccountsPages.swift:340-446): gh's one-time code, "Copiar
+    código e abrir o GitHub", a status pill, the collapsible output, and Concluir /
+    Voltar + Tentar de novo / Cancelar. Starts `gh auth login --web` when opened."""
+
+    STATUS = {"starting": ("Iniciando", "warning"), "showingCode": ("Aguardando você", "warning"),
+              "waitingForBrowser": ("Aguardando navegador", "warning"), "connected": ("Conectada", "ok"),
+              "failed": ("Erro", "error")}
+
+    def __init__(self, window, host: str = "github.com"):
+        super().__init__(title="Entrar no GitHub")
+        load_css()
+        self.window = window
+        self.model = window.model
         self.host = host
-        self.session: ClaudeLoginSession | None = None
-        self.github_session: GitHubLoginSession | None = None
-        self._reported = False
-        self._closed = False
-        self._opened_url: str | None = None
-        self._browser_name: str | None = None
-        if self.is_claude and target is None:
-            raise ValueError("a Claude login needs the account (new or existing)")
-        self.set_title("Entrar no GitHub" if self.kind == LoginKind.GITHUB else "Entrar no Claude")
-        self.set_content_width(560)
+        self.session: GitHubLoginSession | None = None
+        self.show_output = False
+        self.reported = False
+        self._left = False
         self._build()
-        self.connect("closed", self._on_closed)
+        self.connect("hidden", lambda _page: GLib.idle_add(self._check_left))
         GLib.idle_add(self._start)
-
-    @property
-    def is_claude(self) -> bool:
-        return self.kind != LoginKind.GITHUB
 
     @property
     def is_test_mode(self) -> bool:
         return self.model.environment.mode != "real"
 
-    # MARK: layout
-
     def _build(self) -> None:
-        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14, margin_top=22, margin_bottom=18,
-                       margin_start=28, margin_end=28)
-        root.append(body)
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16, margin_top=20, margin_bottom=20,
+                       margin_start=20, margin_end=20)
+        body.add_css_class("mc-login-page")
 
-        header = Gtk.Box(spacing=14)
-        name, color = self._identity()
-        self.avatar = Gtk.Label(label=(name[:1] or "?").upper(), halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
-        self.avatar.add_css_class("mc-login-avatar")
-        self.avatar.add_css_class(f"mc-login-{color.value}")
-        titles = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
-        self.title_label = Gtk.Label(label=self._title_text(name), xalign=0, wrap=True)
-        self.title_label.add_css_class("mc-login-title")
-        self.subtitle_label = Gtk.Label(label=self._subtitle_text(), xalign=0, wrap=True)
-        self.subtitle_label.add_css_class("dim-label")
-        titles.append(self.title_label)
-        titles.append(self.subtitle_label)
-        header.append(self.avatar)
+        header = Gtk.Box(spacing=12)
+        icon = Gtk.Image(icon_name="multicred-code-symbolic", pixel_size=20, halign=Gtk.Align.CENTER,
+                         valign=Gtk.Align.CENTER)
+        circle = Gtk.Box(halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
+        circle.add_css_class("mc-login-icon-circle")
+        icon.set_hexpand(True)
+        circle.set_hexpand(False)  # the icon centers itself; the circle keeps its 40 px
+        circle.append(icon)
+        titles = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER, hexpand=True)
+        self.heading_label = widgets.label("Entrar no GitHub", "mc-login-heading")
+        self.host_label = widgets.label(self.host, "dim-label")
+        titles.append(self.heading_label)
+        titles.append(self.host_label)
+        self.status_pill = widgets.pill("Iniciando", "warning")
+        header.append(circle)
         header.append(titles)
+        header.append(self.status_pill)
         body.append(header)
 
-        self.test_notice = Gtk.Label(label=self._test_notice_text(), xalign=0, wrap=True, visible=self.is_test_mode)
-        self.test_notice.add_css_class("warning")
+        self.test_notice, self.test_notice_label = notice(
+            "Simulação do modo de teste: o navegador não abre e nenhum login real acontece.",
+            "applications-science-symbolic", "mc-orange")
+        self.test_notice.set_visible(self.is_test_mode)
         body.append(self.test_notice)
 
-        steps_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        self.steps = [StepRow(i + 1, title) for i, title in enumerate(self._step_titles())]
-        for step in self.steps:
-            steps_box.append(step)
-        body.append(steps_box)
+        # Starting.
+        self.starting_box = Gtk.Box(spacing=8)
+        self.starting_box.append(Gtk.Spinner(spinning=True))
+        self.starting_box.append(widgets.label("Iniciando o GitHub CLI…", "dim-label"))
+        body.append(self.starting_box)
 
-        # Claude: the authorization code, masked as it is typed.
-        self.code_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, visible=self.is_claude)
-        self.code_list.add_css_class("boxed-list")
-        self.code_row = Adw.PasswordEntryRow(title="Código de autorização")
-        self.code_row.connect("entry-activated", lambda _row: self._send_code())
-        self.code_row.connect("changed", lambda _row: self._refresh())
-        self.code_list.append(self.code_row)
-        body.append(self.code_list)
-
-        # GitHub: the one-time code to type on github.com/login/device.
+        # The code (showingCode, waitingForBrowser).
+        self.code_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, visible=False)
+        self.instructions_label = widgets.label(
+            "1. Copie este código. 2. Abra o GitHub e cole o código. 3. Autorize o GitHub CLI.", "dim-label",
+            wrap=True)
+        line = Gtk.Box(spacing=14)
         # Not selectable: a selectable label takes the focus and shows the code selected;
-        # "Abrir o GitHub" copies it anyway.
-        self.github_code_label = Gtk.Label(label="", visible=False, halign=Gtk.Align.START)
-        self.github_code_label.add_css_class("mc-login-code")
-        body.append(self.github_code_label)
+        # the button copies it anyway.
+        self.code_label = widgets.label("", "mc-gh-code")
+        self.open_button = Gtk.Button(label="Copiar código e abrir o GitHub", valign=Gtk.Align.CENTER)
+        self.open_button.add_css_class("suggested-action")
+        self.open_button.connect("clicked", lambda _b: self._open_github())
+        line.append(self.code_label)
+        line.append(self.open_button)
+        self.waiting_box = Gtk.Box(spacing=8, visible=False)
+        self.waiting_box.append(Gtk.Spinner(spinning=True))
+        self.waiting_label = widgets.label("Aguardando a autorização no navegador…", "dim-label")
+        self.waiting_box.append(self.waiting_label)
+        for widget in (self.instructions_label, line, self.waiting_box):
+            self.code_box.append(widget)
+        body.append(self.code_box)
 
-        links = Gtk.Box(spacing=8)
-        self.copy_link_button = Gtk.Button(label="Copiar link de novo")
-        self.copy_link_button.add_css_class("flat")
-        self.copy_link_button.connect("clicked", lambda _b: self._copy_link())
-        self.browser_button = Gtk.MenuButton(label="Abrir em outro navegador")
-        self.browser_button.add_css_class("flat")
-        self.browser_button.set_popover(self._browser_popover())
-        self.terminal_toggle = Gtk.Button(label="▸ Mostrar terminal")
-        self.terminal_toggle.add_css_class("flat")
-        self.terminal_toggle.connect("clicked", lambda _b: self._toggle_terminal())
-        links.append(self.copy_link_button)
-        links.append(self.browser_button)
-        links.append(Gtk.Box(hexpand=True))
-        links.append(self.terminal_toggle)
-        body.append(links)
-
-        self.error_label = Gtk.Label(xalign=0, wrap=True, visible=False, selectable=True)
-        self.error_label.add_css_class("error")
+        # Connected / failed.
+        self.done_box, self.done_label = notice("", "emblem-ok-symbolic", "mc-green")
+        self.done_box.set_visible(False)
+        body.append(self.done_box)
+        self.error_label = widgets.label("", "mc-red", wrap=True, selectable=True)
+        self.error_label.set_visible(False)
         body.append(self.error_label)
-        self.done_label = Gtk.Label(xalign=0, wrap=True, visible=False)
-        self.done_label.add_css_class("success")
-        body.append(self.done_label)
 
-        self.terminal_view = Gtk.TextView(editable=False, cursor_visible=False, monospace=True,
-                                          wrap_mode=Gtk.WrapMode.CHAR, top_margin=10, bottom_margin=10,
-                                          left_margin=12, right_margin=12)
-        self.terminal_view.add_css_class("mc-terminal")
-        # Fixed height (like the macOS panel): a height that follows the text would
-        # make the dialog jump at every line.
-        self.terminal_scroll = Gtk.ScrolledWindow(min_content_height=170, child=self.terminal_view)
-        self.terminal_scroll.add_css_class("mc-terminal-frame")
-        self.terminal_scroll.set_overflow(Gtk.Overflow.HIDDEN)
-        self.terminal_revealer = Gtk.Revealer(child=self.terminal_scroll, reveal_child=False,
-                                              transition_type=Gtk.RevealerTransitionType.SLIDE_DOWN)
-        body.append(self.terminal_revealer)
+        self.terminal = TerminalOutput("~")
+        self.terminal.set_visible(False)
+        body.append(self.terminal)
 
-        root.append(Gtk.Separator())
-        footer = Gtk.Box(spacing=10, margin_top=14, margin_bottom=14, margin_start=28, margin_end=28)
-        self.cancel_button = Gtk.Button(label="Cancelar")
-        self.cancel_button.connect("clicked", lambda _b: self.close())
-        self.copy_log_button = Gtk.Button(label="Copiar log")
-        self.copy_log_button.add_css_class("flat")
-        self.copy_log_button.connect("clicked", lambda _b: self._copy(self.log_text()))
-        self.retry_button = Gtk.Button(label="Tentar de novo", visible=False)
-        self.retry_button.connect("clicked", lambda _b: self._retry())
-        self.connect_button = Gtk.Button(label="Abrir o GitHub" if self.kind == LoginKind.GITHUB else "Conectar")
-        self.connect_button.add_css_class("suggested-action")
-        self.connect_button.connect("clicked", lambda _b: self._primary())
-        self.done_button = Gtk.Button(label="Concluir", visible=False)
-        self.done_button.add_css_class("suggested-action")
-        self.done_button.connect("clicked", lambda _b: self.close())
-        footer.append(self.cancel_button)
+        body.append(Gtk.Box(vexpand=True))
+        footer = Gtk.Box(spacing=8)
+        self.output_toggle = Gtk.Button()
+        self.output_toggle.add_css_class("flat")
+        toggle = Gtk.Box(spacing=6)
+        self.output_toggle_icon = Gtk.Image(icon_name="pan-end-symbolic")
+        self.output_toggle_label = widgets.label("Mostrar saída")
+        toggle.append(self.output_toggle_icon)
+        toggle.append(self.output_toggle_label)
+        self.output_toggle.set_child(toggle)
+        self.output_toggle.add_css_class("dim-label")
+        self.output_toggle.connect("clicked", lambda _b: self._toggle_output())
+        footer.append(self.output_toggle)
         footer.append(Gtk.Box(hexpand=True))
-        for button in (self.copy_log_button, self.retry_button, self.connect_button, self.done_button):
+        self.done_button = widgets.button("Concluir", self._finish, "suggested-action")
+        self.back_button = widgets.button("Voltar", self._back)
+        self.retry_button = widgets.button("Tentar de novo", self._retry, "suggested-action")
+        self.cancel_button = widgets.button("Cancelar", self._cancel)
+        for button in (self.back_button, self.retry_button, self.cancel_button, self.done_button):
             footer.append(button)
-        root.append(footer)
+        body.append(footer)
 
-        self.set_child(root)
-        self.set_default_widget(self.connect_button)
+        self.set_child(page_body(Gtk.ScrolledWindow(child=body, hscrollbar_policy=Gtk.PolicyType.NEVER)))
         self._refresh()
 
-    def _identity(self) -> tuple[str, ProfileColor]:
-        if self.kind == LoginKind.GITHUB:
-            return "GitHub", ProfileColor.GRAPHITE
-        return self.target.nickname, self.target.color
-
-    def _title_text(self, name: str) -> str:
-        if self.kind == LoginKind.GITHUB:
-            return "Entrar no GitHub" if self.host == "github.com" else f"Entrar no GitHub ({self.host})"
-        return f"Entrar com {name}"
-
-    def _subtitle_text(self) -> str:
-        return {LoginKind.CLAUDE_LOGIN: "claude auth login numa pasta temporária",
-                LoginKind.CLAUDE_TOKEN: "claude setup-token numa pasta temporária",
-                LoginKind.GITHUB: "gh auth login no navegador"}[self.kind]
-
-    def _test_notice_text(self) -> str:
-        if self.kind == LoginKind.GITHUB:
-            return "Modo de teste: simulação do gh; o navegador não abre. Clique em “Abrir o GitHub” para conectar."
-        return ("Modo de teste: simulação; o navegador não abre. Digite qualquer código para conectar, "
-                "ou “erro” para ver a tela de erro.")
-
-    def _step_titles(self) -> list[str]:
-        if self.kind == LoginKind.GITHUB:
-            return ["Copie o código de uso único", "Abra o GitHub e cole o código", "Voltar para a conta do perfil"]
-        return ["Abrir o navegador", "Cole o código que apareceu na página", "Conectar e guardar no chaveiro"]
-
-    def _browser_popover(self) -> Gtk.Popover:
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, margin_top=6, margin_bottom=6,
-                      margin_start=6, margin_end=6)
-        popover = Gtk.Popover(child=box)
-        browsers = [] if self.is_test_mode else https_browsers()
-        if not browsers:
-            box.append(Gtk.Label(label="Nenhum navegador encontrado." if not self.is_test_mode
-                                 else "No modo de teste o navegador não abre.", margin_top=6, margin_bottom=6))
-        for app in browsers:
-            button = Gtk.Button(label=app.get_display_name())
-            button.add_css_class("flat")
-            button.connect("clicked", lambda _b, a=app: (popover.popdown(), self._open_in(a)))
-            box.append(button)
-        return popover
-
-    # MARK: sessions
-
-    def _start(self) -> bool:
-        if self._closed:
-            return False
-        environment, tools = self.model.environment, self.model.tools
-        log = getattr(self.model, "log", None)
-        if self.kind == LoginKind.GITHUB:
-            self.github_session = GitHubLoginSession(environment, tools, self.host, self._switch_back_user(),
-                                                     dispatch=_idle, on_change=self._session_changed,
-                                                     on_finished=self._session_finished, log=log)
-            self.github_session.start()
-        else:
-            engine = getattr(self.model, "engine", None)
-            saver = ClaudeAccountSaver(environment, lambda: self.model.config, self.model.save,
-                                       exclusive=engine.exclusive if engine is not None else None)
-            mode = LoginMode.LOGIN if self.kind == LoginKind.CLAUDE_LOGIN else LoginMode.SETUP_TOKEN
-            self.session = ClaudeLoginSession(environment, tools, mode, self.target, saver, dispatch=_idle,
-                                              on_change=self._session_changed, on_finished=self._session_finished,
-                                              log=log)
-            self.session.start()
-        self._refresh()
-        return False
+    # MARK: session
 
     def _switch_back_user(self) -> str | None:
         """The active profile's gh user on this host (D34); None leaves gh as the login left it."""
@@ -354,237 +506,114 @@ class LoginDialog(Adw.Dialog):
         account = config.github_account(profile.github_account_id)
         return account.username if account is not None and account.host == self.host else None
 
-    def _session_changed(self, _session) -> None:
-        if self._closed:
+    def _start(self) -> bool:
+        if self._left:
+            return False
+        self.reported = False
+        self.session = GitHubLoginSession(self.model.environment, self.model.tools, self.host,
+                                          self._switch_back_user(), dispatch=idle,
+                                          on_change=lambda _s: self._refresh(), on_finished=self._finished,
+                                          log=getattr(self.model, "log", None))
+        self.session.start()
+        self._refresh()
+        return False
+
+    def _finished(self, session) -> None:
+        if session is not self.session or self._left:
             return
-        if self.session is not None:
-            url = self.session.authorization_url
-            if url and url != self._opened_url and not self.is_test_mode:
-                # The CLI does not open a browser (BROWSER is a no-op): open it here, once per link.
-                self._opened_url = url
-                self._open_default(url)
+        self.reported = True
+        self._refresh()
+        if session.phase.kind == "connected":
+            self.window.login_finished(LoginResult(LoginKind.GITHUB, True, login=session.login,
+                                                   switched_back=session.switched_back,
+                                                   error=session.switch_back_error))
+
+    def _check_left(self) -> bool:
+        """After a pop or a section change: stop gh (Mac: stopSessionsNoLongerShown)."""
+        if self._left or in_navigation_stack(self):
+            return False
+        self._left = True
+        self.stop()
+        return False
+
+    def stop(self) -> None:
+        session = self.session
+        if session is None:
+            return
+        if not session.phase.is_finished:
+            session.cancel()
+        session.stop()
+
+    # MARK: actions
+
+    def _open_github(self) -> None:
+        session = self.session
+        if session is None or session.phase.kind != "showingCode":
+            return
+        copy_text(session.code)
+        session.open_browser()
         self._refresh()
 
-    def _session_finished(self, _session) -> None:
-        if self._closed:
-            return
+    def _toggle_output(self) -> None:
+        self.show_output = not self.show_output
         self._refresh()
-        if self.session is not None and self.session.phase == LoginPhase.CONNECTED:
-            self._report(LoginResult(self.kind, True, account=self.session.result))
-        elif self.github_session is not None and self.github_session.phase.kind == "connected":
-            gh = self.github_session
-            self._report(LoginResult(self.kind, True, login=gh.login, switched_back=gh.switched_back,
-                                     error=gh.switch_back_error))
 
-    def _report(self, result: LoginResult) -> None:
-        if self._reported:
-            return
-        self._reported = True
-        self.on_result(result)
+    def _finish(self) -> None:
+        self.window.pop_to_section_root()
 
-    def _on_closed(self, _dialog) -> None:
-        self._closed = True
+    def _back(self) -> None:
+        self.window.nav.pop()
+
+    def _cancel(self) -> None:
         if self.session is not None:
-            if not self.session.phase.is_finished:
-                self.session.cancel()
-            self.session.stop()
-        if self.github_session is not None:
-            if not self.github_session.phase.is_finished:
-                self.github_session.cancel()
-            self.github_session.stop()
-        self._report(LoginResult(self.kind, False, error=self._failure_reason() or "cancelado"))
+            self.session.cancel()
+        self.window.nav.pop()
 
     def _retry(self) -> None:
         if self.session is not None:
             self.session.stop()
-        if self.github_session is not None:
-            self.github_session.stop()
-        self.session = self.github_session = None
-        self._opened_url = None
-        self.code_row.set_text("")
         self._start()
-
-    # MARK: actions
-
-    def _primary(self) -> None:
-        if self.kind == LoginKind.GITHUB:
-            gh = self.github_session
-            if gh is None or gh.phase.kind != "showingCode":
-                return
-            self._copy(gh.code or "")
-            gh.open_browser()
-        else:
-            self._send_code()
-
-    def _send_code(self) -> None:
-        if self.session is None:
-            return
-        code = self.code_row.get_text()
-        self.session.submit_code(code)
-        self.code_row.set_text("")
-        self._refresh()
-
-    def _authorization_link(self) -> str | None:
-        if self.session is not None:
-            return self.session.authorization_url
-        if self.github_session is not None:
-            return self.github_session.device_url
-        return None
-
-    def _copy_link(self) -> None:
-        url = self._authorization_link()
-        if url:
-            self._copy(url)
-
-    def _copy(self, text: str) -> None:
-        display = Gdk.Display.get_default()
-        if display is not None and text:
-            display.get_clipboard().set(text)
-
-    def _open_default(self, url: str) -> None:
-        self._browser_name = default_browser_name()
-        try:
-            Gio.AppInfo.launch_default_for_uri(url, None)
-        except GLib.Error:
-            self._copy(url)  # no browser could open it: the link is on the clipboard
-
-    def _open_in(self, app: Gio.AppInfo) -> None:
-        url = self._authorization_link()
-        if not url or self.is_test_mode:
-            return
-        try:
-            app.launch_uris([url], None)
-            self._browser_name = app.get_display_name()
-        except GLib.Error:
-            self._copy(url)
-        self._refresh()
-
-    def _toggle_terminal(self) -> None:
-        self.terminal_revealer.set_reveal_child(not self.terminal_revealer.get_reveal_child())
-        self._refresh()
-
-    # MARK: texts for tests and "Copiar log"
-
-    def log_text(self) -> str:
-        """Masked output: codes and tokens never appear."""
-        if self.session is not None:
-            return self.session.redacted_log
-        if self.github_session is not None:
-            return self.github_session.output
-        return ""
-
-    def terminal_text(self) -> str:
-        buffer = self.terminal_view.get_buffer()
-        return buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), False)
 
     # MARK: state → widgets
 
-    def _phase_kind(self) -> str:
-        if self.session is not None:
-            return self.session.phase.kind
-        if self.github_session is not None:
-            return self.github_session.phase.kind
-        return "starting"
-
-    def _failure_reason(self) -> str | None:
-        session = self.session or self.github_session
-        if session is None or not session.phase.is_failure:
-            return None
-        save_error = getattr(session, "save_error", None)
-        if isinstance(save_error, SwitchError):  # e.g. Busy: a switch was running, nothing changed
-            return f"Não consegui guardar o login: {describe_switch_error(save_error)}"
-        if session.launch_error:
-            return session.launch_error
-        reason = session.phase.message if self.session is not None else session.phase.value
-        if self.is_claude and reason and "400" in reason:
-            return ("O Claude recusou o código. Ele vale uma vez e por poucos minutos, e só para o link aberto "
-                    "nesta tentativa. Tente de novo.")
-        return f"Não deu certo ({reason})."
+    def _done_text(self, session) -> str:
+        text = f"Pronto: {session.login or 'conta'} está logada no gh."
+        if session.switched_back:
+            text += " A conta ativa voltou para a do perfil atual."
+        elif session.switch_back_error:
+            text += f" Não consegui voltar a conta ativa para {session.switch_back_to}: {session.switch_back_error}"
+        return text
 
     def _refresh(self) -> None:
-        kind = self._phase_kind()
-        finished = kind in ("connected", "failed")
+        session = self.session
+        kind = session.phase.kind if session is not None else "starting"
+        text, tone = self.STATUS.get(kind, ("Iniciando", "warning"))
+        set_pill(self.status_pill, text, tone)
+        self.starting_box.set_visible(kind == "starting")
+        self.code_box.set_visible(kind in ("showingCode", "waitingForBrowser"))
+        code = session.code if session is not None else None
+        self.code_label.set_label(code or "")
+        self.open_button.set_sensitive(kind == "showingCode")
+        self.waiting_box.set_visible(kind == "waitingForBrowser")
+        self.done_box.set_visible(kind == "connected")
+        if kind == "connected":
+            self.done_label.set_label(self._done_text(session))
         failed = kind == "failed"
-        if self.kind == LoginKind.GITHUB:
-            self._refresh_github(kind)
-        else:
-            self._refresh_claude(kind)
+        self.error_label.set_visible(failed)
+        if failed:
+            self.error_label.set_label(session.launch_error or f"Não deu certo ({session.phase.value}).")
 
-        command = (self.session or self.github_session).command if (self.session or self.github_session) else None
-        output = self.log_text().replace("\r", "")
-        text = (f"$ {command.display}\n" if command is not None else "") + output
-        if self.terminal_text() != text:
-            self.terminal_view.get_buffer().set_text(text)
-            GLib.idle_add(self._scroll_terminal_to_end)
+        shown = self.show_output or failed
+        self.terminal.set_visible(shown)
+        if session is not None and session.command is not None:
+            self.terminal.set_output(session.output, session.command.display)
+        self.output_toggle_label.set_label("Ocultar saída" if self.show_output else "Mostrar saída")
+        self.output_toggle_icon.set_from_icon_name("pan-down-symbolic" if self.show_output else "pan-end-symbolic")
 
-        if failed and not self.terminal_revealer.get_reveal_child():
-            self.terminal_revealer.set_reveal_child(True)  # the output explains the failure
-        shown = self.terminal_revealer.get_reveal_child()
-        self.terminal_toggle.set_label("▾ Ocultar terminal" if shown else "▸ Mostrar terminal")
-
-        reason = self._failure_reason()
-        self.error_label.set_visible(reason is not None)
-        self.error_label.set_label(reason or "")
-        self.retry_button.set_visible(failed)
-        self.cancel_button.set_visible(kind != "connected")
-        self.cancel_button.set_label("Fechar" if failed else "Cancelar")
         self.done_button.set_visible(kind == "connected")
-        self.connect_button.set_visible(not finished)
-        has_link = self._authorization_link() is not None
-        self.copy_link_button.set_sensitive(has_link and not finished)
-        self.browser_button.set_sensitive(has_link and not finished and not self.is_test_mode)
+        self.back_button.set_visible(failed)
+        self.retry_button.set_visible(failed)
+        self.cancel_button.set_visible(kind not in ("connected", "failed"))
 
-    def _refresh_claude(self, kind: str) -> None:
-        phase = self.session.phase if self.session is not None else LoginPhase.STARTING
-        step1, step2, step3 = self.steps
-        step1.set_state("current" if kind == "starting" else "done")
-        if kind == "starting":
-            step1.set_title("Abrir o navegador")
-        elif self.is_test_mode:
-            step1.set_title("Navegador aberto (simulado)")
-        else:
-            step1.set_title(f"Navegador aberto ({self._browser_name})" if self._browser_name else "Navegador aberto")
-        step2.set_state("todo" if kind == "starting" else "current" if phase.accepts_code else "done")
-        step3.set_state({"connecting": "current", "connected": "done", "failed": "failed"}.get(kind, "todo"))
-        self.code_list.set_visible(kind not in ("connected", "failed"))
-        self.code_row.set_sensitive(phase.accepts_code)
-        self.connect_button.set_sensitive(phase.accepts_code and bool(self.code_row.get_text().strip()))
-        if kind == "connected" and self.session is not None and self.session.result is not None:
-            account = self.session.result
-            existing = isinstance(self.target, ClaudeAccount)
-            first = f"Login de {account.nickname} atualizado." if existing else f"Conta {account.nickname} adicionada."
-            rest = ("O login está só no chaveiro do MultiCred; até as conversas já abertas passam para esta conta "
-                    "quando ela for usada num perfil." if account.kind == ClaudeAccountKind.LOGIN else
-                    "O token está só no chaveiro e vale para terminais novos.")
-            self.done_label.set_label(f"{first} {rest}")
-        self.done_label.set_visible(kind == "connected")
-
-    def _refresh_github(self, kind: str) -> None:
-        gh = self.github_session
-        step1, step2, step3 = self.steps
-        step1.set_state("current" if kind in ("starting", "showingCode") else "done")
-        step2.set_state({"starting": "todo", "showingCode": "todo", "waitingForBrowser": "current",
-                         "connected": "done", "failed": "failed"}.get(kind, "todo"))
-        reported = self._reported or (gh is not None and gh.phase.kind == "connected" and not gh.is_running
-                                      and (gh.switched_back or gh.switch_back_error or not gh.switch_back_to))
-        step3.set_state("done" if reported else "current" if kind == "connected" else
-                        "failed" if kind == "failed" else "todo")
-        if gh is not None and not gh.switch_back_to:
-            step3.set_title("Guardar o login no gh")
-        code = gh.code if gh is not None else None
-        self.github_code_label.set_label(code or "")
-        self.github_code_label.set_visible(code is not None and kind not in ("connected", "failed"))
-        self.connect_button.set_sensitive(kind == "showingCode")
-        if kind == "connected" and gh is not None:
-            text = f"Entrou no GitHub como {gh.login or 'nova conta'}."
-            if gh.switched_back:
-                text += f" A conta ativa do gh voltou para {gh.switch_back_to}."
-            elif gh.switch_back_error:
-                text += f" Não consegui voltar a conta ativa para {gh.switch_back_to}: {gh.switch_back_error}"
-            self.done_label.set_label(text)
-        self.done_label.set_visible(kind == "connected")
-
-    def _scroll_terminal_to_end(self) -> bool:
-        adjustment = self.terminal_scroll.get_vadjustment()
-        adjustment.set_value(adjustment.get_upper())
-        return False
+    def refresh(self) -> None:
+        """Model changes (window.refresh): nothing on this page depends on them."""
