@@ -3,35 +3,12 @@ the window toasts and the notifications all use it."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 from ..core.engine.types import (
     Busy, InvalidConfiguration, Preflight, PreflightFailure, StateUnreadable, StepFailed, SwitchStepKind,
 )
-from ..core.platform import SecretBackend
+# The secret-store wording lives in the core (Verificar uses it too); re-exported for the UI.
+from ..core.platform import SYSTEM_KEYRING, SecretStoreWording, secret_store_wording  # noqa: F401
 from ..core.tools import Tool
-
-
-@dataclass(frozen=True)
-class SecretStoreWording:
-    """How the messages name the place secrets live. The desktop keeps them in the
-    Secret Service ("chaveiro do sistema", the Mac's Keychain); Termux has none, so
-    they are 0600 files in ~/.config/multicred/secrets and the messages say so."""
-
-    # "A chave X não está {located}."
-    located: str = "no chaveiro do sistema"
-    # "Não consegui consultar {store}: …"
-    store: str = "o chaveiro do sistema"
-
-
-SYSTEM_KEYRING = SecretStoreWording()
-
-
-def secret_store_wording(platform=None, folder: str = "~/.config/multicred/secrets") -> SecretStoreWording:
-    """The wording for `platform` (core/platform.py); the desktop's when None."""
-    if platform is not None and platform.secret_backend == SecretBackend.FILES:
-        return SecretStoreWording(located=f"em {folder}", store=f"a pasta {folder}")
-    return SYSTEM_KEYRING
 
 
 _STEP_NAMES = {

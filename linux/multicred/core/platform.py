@@ -132,6 +132,10 @@ class Platform:
     def secret_backend(self) -> SecretBackend:
         return SecretBackend.FILES if self.is_termux else SecretBackend.SECRET_SERVICE
 
+    def install_command(self, package: str) -> str:
+        """How the user installs a package (shown, never run): apt on the desktop, pkg on Termux."""
+        return f"pkg install {package}" if self.is_termux else f"sudo apt install {package}"
+
     def child_environment(self) -> dict[str, str]:
         """Variables the session sets that child processes need on this platform."""
         if not self.is_termux:
@@ -151,3 +155,33 @@ def detect(environ: Mapping[str, str]) -> Platform:
         return Platform.desktop()
     chosen = next((p for p in (prefix, termux_prefix) if p.startswith("/")), TERMUX_DEFAULT_PREFIX)
     return Platform.termux(chosen, tmpdir=environ.get("TMPDIR"), ld_preload=environ.get("LD_PRELOAD"))
+
+
+@dataclass(frozen=True)
+class SecretStoreWording:
+    """How the messages name the place secrets live. The desktop keeps them in the
+    Secret Service ("chaveiro do sistema", the Mac's Keychain); Termux has none, so
+    they are 0600 files in ~/.config/multicred/secrets and the messages say so.
+    Here (not in the UI) because Verificar's texts use it too; ui/messages.py re-exports it."""
+
+    # "A chave X não está {located}."
+    located: str = "no chaveiro do sistema"
+    # "Não consegui consultar {store}: …"
+    store: str = "o chaveiro do sistema"
+    # Verificar, when the store cannot be read: "{unavailable}: <erro>".
+    unavailable: str = "chaveiro indisponível"
+    # …and what to do about it.
+    unavailable_hint: str = "Desbloqueie o chaveiro e verifique de novo."
+
+
+SYSTEM_KEYRING = SecretStoreWording()
+
+
+def secret_store_wording(platform=None, folder: str = "~/.config/multicred/secrets") -> SecretStoreWording:
+    """The wording for `platform`; the desktop's when None."""
+    if platform is not None and platform.secret_backend == SecretBackend.FILES:
+        return SecretStoreWording(located=f"em {folder}", store=f"a pasta {folder}",
+                                  unavailable="pasta de segredos indisponível",
+                                  unavailable_hint=f"Confira as permissões de {folder} (pasta 0700, arquivos 0600) "
+                                                   "e verifique de novo.")
+    return SYSTEM_KEYRING
