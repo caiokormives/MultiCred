@@ -341,14 +341,31 @@ class AppModel:
 
         self._background("claude-folders", work, finished)
 
-    # MARK: Verificar (hook; S-08 replaces `verify` and fills `verification`)
+    # MARK: Verificar
 
-    def verify(self, on_done: Callable[[object | None, Exception | None], None] | None = None) -> None:
-        """Runs the checklist. Until S-08 there is nothing to run: `verification` stays
-        None and the window shows "Verificar" without numbers. The report S-08 stores
-        in `verification` needs `ok_count` and `checks` (the Mac VerificationReport)."""
-        if on_done is not None:
-            on_done(self.verification, None)
+    def verify(self, on_done: Callable[[object | None, Exception | None], None] | None = None,
+               deep: bool = False) -> None:
+        """Runs the checklist off the UI thread and keeps the report in `verification`
+        (the sidebar badge, the Perfis footer and the tray read it)."""
+        from ..core.engine.verifier import Verifier
+        from .pages.verify import VerifyPage
+
+        config, state = self.config, self.state
+        if config is None:
+            if on_done is not None:
+                on_done(None, None)
+            return
+        verifier = Verifier(self.environment, self.tools, VerifyPage._default_scanner(self.environment),
+                            engine=self.engine, log=self.log)
+
+        def finished(report, error):
+            if report is not None:
+                self.verification = report
+                self.notify()
+            if on_done is not None:
+                on_done(report, error)
+
+        self._background("verify", lambda: verifier.run(config, state, deep=deep), finished)
 
     def _finish(self, result, error, on_done):
         self.switching = False

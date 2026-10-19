@@ -198,7 +198,7 @@ class ProfilesPage(Adw.NavigationPage):
 
     def _verification_has_problems(self) -> bool:
         report = self.model.verification
-        return report is not None and report.ok_count < len(report.checks)
+        return report is not None and report.ok_count < report.total
 
     def _refresh_footer(self) -> None:
         report = self.model.verification
@@ -207,7 +207,7 @@ class ProfilesPage(Adw.NavigationPage):
         if report is None:
             self.footer_label.set_label("Verificar")
             return
-        ok, total = report.ok_count, len(report.checks)
+        ok, total = report.ok_count, report.total
         self.footer_label.set_label(f"Verificar: {ok} de {total} ok")
         self.footer_dot.add_css_class("ok" if ok == total else "warning")
 

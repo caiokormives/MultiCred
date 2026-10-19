@@ -47,6 +47,15 @@ def _accounts_page(window):
     return AccountsPage(window)
 
 
+def _verify_page(window):
+    from .pages.verify import VerifyPage
+    page = VerifyPage(window.model, on_report=window.verification_reported)
+    # Its refresh() runs the verifier: only when the section is opened or asked to,
+    # never on every model change (the report itself notifies the model).
+    page.refresh_on_notify = False
+    return page
+
+
 def placeholder_page(title: str, icon: str, description: str) -> Adw.StatusPage:
     return Adw.StatusPage(title=title, icon_name=icon, description=description)
 
@@ -55,8 +64,7 @@ def placeholder_page(title: str, icon: str, description: str) -> Adw.StatusPage:
 PAGE_FACTORIES: dict[str, Callable] = {
     "main": _profiles_page,
     "accounts": _accounts_page,
-    "verify": lambda window: placeholder_page(
-        "Verificar", "object-select-symbolic", "O checklist com esperado, encontrado e Corrigir chega em breve."),
+    "verify": _verify_page,
     "settings": lambda window: placeholder_page(
         "Ajustes", "emblem-system-symbolic", "Abrir ao iniciar a sessão, retorno da troca e desinstalar chegam em breve."),
 }
@@ -235,7 +243,16 @@ class MainWindow(Adw.ApplicationWindow):
         self.show_toast(f"Login {what} pela janela: em breve")
 
     def run_verification(self) -> None:
-        self.model.verify(lambda _report, _error: self.refresh())
+        """"Verificar de novo": a deep check (gh tokens too) on the page when it is open."""
+        page = self._section_pages.get("verify")
+        if page is not None and self.current_section == "verify":
+            page.refresh(deep=True)
+        else:
+            self.model.verify(lambda _report, _error: None)
+
+    def verification_reported(self, report) -> None:
+        self.model.verification = report
+        self.model.notify()
 
     # MARK: actions and shortcuts
 
@@ -267,8 +284,7 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _verify_shortcut(self) -> None:
         if self.onboarding is None:
-            self.open_page("verify")
-            self.run_verification()
+            self.open_page("verify")  # opening the section runs the checklist
 
     # MARK: state
 
@@ -282,7 +298,7 @@ class MainWindow(Adw.ApplicationWindow):
     def refresh(self) -> None:
         report = self.model.verification
         if report is not None:
-            ok, total = report.ok_count, len(report.checks)
+            ok, total = report.ok_count, report.total
             self.verify_badge.set_label(f"{ok}/{total}")
             if ok < total:
                 self.verify_badge.add_css_class("warning")
@@ -290,7 +306,8 @@ class MainWindow(Adw.ApplicationWindow):
                 self.verify_badge.remove_css_class("warning")
         self.verify_badge.set_visible(report is not None)
         for page in list(self._section_pages.values()):
-            if hasattr(page, "refresh") and page.get_parent() is not None:
+            if (hasattr(page, "refresh") and page.get_parent() is not None
+                    and getattr(page, "refresh_on_notify", True)):
                 page.refresh()
         visible = self.nav.get_visible_page()
         if visible is not None and visible not in self._section_pages.values() and hasattr(visible, "refresh"):
