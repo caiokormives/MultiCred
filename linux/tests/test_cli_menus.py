@@ -376,6 +376,19 @@ class CliMenuTests(_MenuWorld):
             self.assertIn(text, out)
         self.assertTrue((folder / ".credentials.json").exists())
         self.assertIn("Login da pasta · simulado@example.com", self.cli("claude")[1])
+        # S-14: the window's folder login session (LoginMode.FOLDER), so both run the Mac's
+        # `claude auth login` (LoginSession.swift) the same way.
+        self.assertIn("$ claude auth login (simulado)", out)
+
+    def test_entrar_pasta_in_test_mode_refuses_a_folder_outside_the_test_home(self):
+        """The shared folder session's guard (FOLDER_OUTSIDE_TEST_HOME): test mode never logs a
+        real folder in."""
+        outside = self.home / "fora"
+        outside.mkdir()
+        code, out, err = self.cli("entrar", "pasta", str(outside), inp=script("codigo"))
+        self.assertEqual(code, 1)
+        self.assertIn("No modo de teste, a pasta precisa ficar dentro do HOME de teste.", out + err)
+        self.assertFalse((outside / ".credentials.json").exists())
 
     def test_verificar_names_the_terminal_command_of_a_login_fix(self):
         ana = ClaudeAccount(nickname="Ana", color=ProfileColor.ORANGE)
@@ -578,6 +591,32 @@ class TermuxMenuTests(TermuxWorld):
     def assert_stayed_in_termux(self):
         self.assertEqual(self.guard.refused, [], [r.executable for r in self.guard.refused])
         self.assert_nothing_forbidden_ran()
+
+    def real_termux(self):
+        """The real (not test) mode of the simulated Termux: logins would run real programs, so
+        these tests stop before any starts (the program or setsid is missing)."""
+        real = dataclasses.replace(self.termux, mode="real")
+        ConfigRepository(real).save(Config(profiles=[Profile(name="Celular", color=ProfileColor.GREEN)]))
+        return real
+
+    def test_claude_code_missing_names_the_termux_install_not_the_curl_installer(self):
+        """S-14: on Termux Claude Code comes from npm, pinned to 2.1.112 (termux_support)."""
+        real = self.real_termux()
+        code, out, _ = run(["entrar", "pasta"], real, self.termux_tools(real))
+        self.assertEqual(code, 1)
+        self.assertIn("Claude Code não foi encontrado. Instale com: pkg install nodejs-lts && "
+                      "DISABLE_AUTOUPDATER=1 npm install -g @anthropic-ai/claude-code@2.1.112", out)
+        self.assertNotIn("curl", out)
+        self.assert_stayed_in_termux()
+
+    def test_missing_setsid_says_to_install_util_linux(self):
+        (self.prefix / "bin" / "setsid").unlink()
+        real = self.real_termux()
+        code, out, _ = run(["entrar", "github"], real, self.termux_tools(real), inp="\n")
+        self.assertEqual(code, 1)
+        self.assertIn("setsid: No such file or directory", out)
+        self.assertIn("Instale o setsid com: pkg install util-linux", out)
+        self.assert_stayed_in_termux()
 
     def test_configurar_on_termux(self):
         code, out, err = self.cli("configurar", inp=script("", "1", "2", "Dev A", "3", "dev@a.example", "0", "c", "",

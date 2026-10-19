@@ -1,0 +1,13 @@
+Package: multicred
+Version: @VERSION@
+Architecture: all
+Installed-Size: @SIZE@
+Depends: python, git
+Recommends: gh, nodejs-lts, util-linux
+Maintainer: MultiCred <noreply@multicred.app>
+Homepage: https://github.com/Rafael-Leivas/MultiCred
+Description: troca de identidade de dev pelo terminal do Termux
+ Troca, de forma transacional, a identidade do git, a conta ativa do GitHub
+ CLI, a pasta e a conta do Claude Code e as chaves de API dos shells, com o
+ comando multicred (trocar, status, perfis, contas, verificar, configurar).
+ Versão para o Termux (Android): sem janela nem bandeja.

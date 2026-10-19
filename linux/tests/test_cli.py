@@ -146,7 +146,8 @@ class CliTests(SafeTestCase):
     def test_help_lists_every_command(self):
         code, out, _ = run([], self.sandbox)
         self.assertEqual(code, 0)
-        for command in ("trocar", "status", "perfis", "claude", "verificar"):
+        for command in ("trocar", "status", "perfis", "claude", "verificar", "configurar", "contas", "entrar",
+                        "desinstalar"):
             self.assertIn(command, out)
 
     # perfis: the menu's "Perfis" section (AppDelegate.swift:99-120)
@@ -519,6 +520,193 @@ class TermuxCliTests(TermuxWorld):
             self.assertEqual(result.returncode, code, (argv, result.stdout, result.stderr))
             self.assertEqual(result.stdout.splitlines()[0], first, argv)
             self.assertNotIn("Traceback", result.stderr, argv)
+
+
+# MARK: S-14 · `multicred desinstalar` (UninstallPage, SettingsPage.swift:114-174)
+
+UNINSTALL_INTRO = ("Estas são as mudanças. Só o bloco do MultiCred é removido de cada arquivo; o resto fica como "
+                   "você deixou.")
+
+
+def install_bash_block(environment):
+    from multicred.core.install.installer import Installer, InstallOptions
+    from multicred.core.models import ShellKind
+    (Path(environment.home) / ".bashrc").write_text("alias ll='ls -l'\n")
+    Installer(environment).apply(InstallOptions(shells=[ShellKind.BASH]))
+
+
+class DesktopUninstallCliTests(SafeTestCase):
+    """The desktop app's test mode (dry-run runner, in-memory secrets)."""
+
+    def setUp(self):
+        super().setUp()
+        self.sandbox = real_env.make_sandbox(self.home / "sandbox")
+        config = real_env.seed_sandbox(self.sandbox)
+        self.key = APIKeyAccount(nickname="Empresa", provider=APIProvider.OPENAI, color=ProfileColor.INDIGO)
+        self.sandbox.secrets.set_secret(b"sk-x", self.key.secret_account)
+        config.api_keys.append(self.key)
+        ConfigRepository(self.sandbox).save(config)
+        install_bash_block(self.sandbox)
+        self.assertEqual(run(["trocar", "Trabalho"], self.sandbox)[0], 0)
+        self.bashrc = self.sandbox.home / ".bashrc"
+        self.app_dir = self.sandbox.home / ".config/multicred"
+
+    def commands(self):
+        return [entry.command for entry in self.sandbox.runner.entries]
+
+    def test_preview_lists_every_change_and_cancel_changes_nothing(self):
+        before = self.bashrc.read_text()
+        code, out, err = run(["desinstalar"], self.sandbox, inp="n\n")
+        self.assertEqual((code, err), (1, ""))
+        lines = out.splitlines()
+        self.assertEqual(lines[:2], ["Desinstalar o MultiCred", UNINSTALL_INTRO])
+        self.assertIn("~/.bashrc · −3 linhas", lines)
+        self.assertIn("  − # >>> MultiCred >>>", lines)
+        self.assertIn("  − # <<< MultiCred <<<", lines)
+        self.assertIn("~/.config/multicred · será apagado", lines)
+        also = next(line for line in lines if line.startswith("Também: "))
+        self.assertIn("systemctl --user unset-environment CLAUDE_CONFIG_DIR", also)
+        self.assertIn("apagar do chaveiro do sistema as chaves de API e os tokens das contas Claude (pastas e "
+                      "conversas do Claude ficam)", also)
+        self.assertEqual(lines[-2:], ["Desinstalar? [s/N] ", "Nada foi alterado."])
+        self.assertEqual(self.bashrc.read_text(), before)
+        self.assertTrue((self.app_dir / "config.json").exists())
+        self.assertTrue(self.sandbox.secrets.contains_item(self.key.secret_account))
+        self.assertFalse([c for c in self.commands() if "unset-environment" in c])
+
+    def test_no_answer_is_no(self):
+        code, out, _ = run(["desinstalar"], self.sandbox, inp="")
+        self.assertEqual(code, 1)
+        self.assertEqual(out.splitlines()[-1], "Nada foi alterado.")
+        self.assertTrue((self.app_dir / "config.json").exists())
+
+    def test_confirming_restores_the_files_and_shows_the_result(self):
+        before = len(self.commands())
+        code, out, err = run(["desinstalar"], self.sandbox, inp="s\n")
+        self.assertEqual((code, err), (0, ""), out)
+        result = out.split("Desinstalar? [s/N] ", 1)[1].lstrip("\n").splitlines()
+        self.assertEqual(result[0], "MultiCred desinstalado")
+        restored = next(line for line in result if line.startswith("Arquivos restaurados: "))
+        self.assertIn("~/.bashrc", restored)
+        self.assertIn("~/.gitconfig", restored)
+        self.assertIn("Abra um novo terminal para que os shells deixem de carregar o MultiCred. "
+                      "Para tirar o app: sudo apt remove multicred.", result)
+        self.assertEqual(self.bashrc.read_text(), "alias ll='ls -l'\n")
+        self.assertFalse(self.app_dir.exists())
+        self.assertFalse(self.sandbox.secrets.contains_item(self.key.secret_account))
+        # The graphical-session step ran through the dry-run runner (recorded, never executed): it
+        # asks systemctl what is set and unsets CLAUDE_CONFIG_DIR only if it is there.
+        self.assertTrue([c for c in self.commands()[before:] if "systemctl --user" in c], self.commands())
+
+    def test_created_claude_folders_are_deleted_only_when_asked(self):
+        from multicred.core.install.uninstaller import remember_created_claude_folder
+        from tests.login_support import ToolsAt
+        folder = self.sandbox.home / ".claude-celular"
+        folder.mkdir()
+        remember_created_claude_folder(self.sandbox, str(folder))
+        tools = ToolsAt(claude="/usr/bin/claude", git="/usr/bin/git", gh="/usr/bin/gh")
+        code, out, _ = run(["desinstalar"], self.sandbox, tools, inp="n\nn\n")
+        self.assertIn("Também sair e apagar as pastas do Claude criadas pelo MultiCred (~/.claude-celular)? [s/N] ",
+                      out)
+        self.assertEqual(code, 1)
+        self.assertTrue(folder.exists())
+        code, out, _ = run(["desinstalar"], self.sandbox, tools, inp="s\ns\n")
+        self.assertEqual(code, 0, out)
+        self.assertIn("sair (claude auth logout) e apagar ~/.claude-celular", out)
+        self.assertIn("Pastas do Claude apagadas: ~/.claude-celular.", out)
+        self.assertFalse(folder.exists())
+        self.assertTrue([c for c in self.commands() if "auth logout" in c], "claude auth logout recorded (dry run)")
+
+    def test_nothing_to_uninstall(self):
+        empty = real_env.make_sandbox(self.home / "vazio")
+        code, out, err = run(["desinstalar"], empty, inp="s\n")
+        self.assertEqual((code, out, err),
+                         (0, "Nada para desinstalar: o MultiCred não deixou nada nesta máquina.\n", ""))
+
+    def test_a_block_without_its_end_marker_is_a_manual_step(self):
+        from multicred.core.install import managed_block
+        zshrc = self.sandbox.home / ".zshrc"
+        zshrc.write_text(f"{managed_block.BEGIN}\nsource algo\n")
+        code, out, _ = run(["desinstalar"], self.sandbox, inp="s\n")
+        self.assertIn("~/.zshrc · bloco sem o marcador de fim; fica como está e você remove à mão", out)
+        self.assertIn(f"! Remova à mão, em ~/.zshrc, as linhas a partir de \"{managed_block.BEGIN}\".", out)
+        self.assertEqual(code, 1, "something is left for the user to do")
+        self.assertEqual(zshrc.read_text(), f"{managed_block.BEGIN}\nsource algo\n")
+
+
+class TermuxUninstallCliTests(TermuxWorld):
+    """`multicred desinstalar` in the simulated Termux: no graphical session, the secret files go,
+    nothing outside $PREFIX runs."""
+
+    def setUp(self):
+        super().setUp()
+        self.guard = _PrefixOnlyRunner(self.recording, self.prefix)
+        self.termux = dataclasses.replace(self.termux, runner=self.guard)
+        self.key = APIKeyAccount(nickname="O", provider=APIProvider.OPENAI, color=ProfileColor.INDIGO)
+        self.termux.secrets.set_secret(b"sk", self.key.secret_account)
+        ConfigRepository(self.termux).save(Config(api_keys=[self.key], profiles=[
+            Profile(name="Celular", color=ProfileColor.GREEN, api_key_ids=[self.key.id])]))
+        install_bash_block(self.termux)
+        self.secrets_dir = self.home / ".config/multicred/secrets"
+        self.assertTrue((self.secrets_dir / self.key.secret_account).exists())
+
+    def cli(self, *argv, inp=""):
+        return run(argv, self.termux, self.termux_tools(), inp=inp)
+
+    def test_preview_names_the_secret_files_and_no_graphical_session(self):
+        code, out, err = self.cli("desinstalar", inp="n\n")
+        self.assertEqual((code, err), (1, ""))
+        self.assertIn("~/.bashrc · −3 linhas", out)
+        also = next(line for line in out.splitlines() if line.startswith("Também: "))
+        self.assertIn("apagar da pasta ~/.config/multicred/secrets as chaves de API e os tokens das contas Claude",
+                      also)
+        for absent in ("systemctl", "chaveiro", "sessão"):
+            self.assertNotIn(absent, out)
+        self.assertEqual(out.splitlines()[-1], "Nada foi alterado.")
+        self.assertTrue((self.secrets_dir / self.key.secret_account).exists())
+
+    def test_confirming_removes_the_block_and_the_secret_files(self):
+        code, out, err = self.cli("desinstalar", inp="s\n")
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertIn("MultiCred desinstalado", out)
+        self.assertIn("Abra um novo terminal para que os shells deixem de carregar o MultiCred. "
+                      "Para tirar o app: apt remove multicred.", out)
+        self.assertNotIn("sudo", out)
+        self.assertNotIn("bandeja", out)
+        self.assertEqual((self.home / ".bashrc").read_text(), "alias ll='ls -l'\n")
+        self.assertFalse((self.home / ".config/multicred").exists())
+        self.assertEqual(self.guard.refused, [], [r.executable for r in self.guard.refused])
+        self.assert_nothing_forbidden_ran()
+
+
+class TestModeSandboxTests(TermuxWorld):
+    """S-14 · D(3): test mode on Termux keeps its HOME under $TMPDIR (never /tmp) and the
+    Termux platform; the desktop's is unchanged."""
+
+    def test_termux_test_mode_lives_under_tmpdir_with_the_termux_platform(self):
+        platform = detect(self.termux_environ)
+        environment = cli.build_environment(cli.parse_args(["--test-mode", "status"]), platform=platform)
+        self.assertEqual(environment.home, (self.prefix / "tmp" / "multicred-sandbox").resolve())
+        self.assertTrue(environment.platform.is_termux)
+        self.assertEqual(environment.mode, "dryRun")
+        self.assertEqual(environment.platform.temp_directory, str(self.prefix / "tmp"))
+
+    def test_termux_fresh_test_mode_makes_its_home_under_tmpdir(self):
+        from contextlib import redirect_stderr
+        platform = detect(self.termux_environ)
+        said = io.StringIO()
+        with redirect_stderr(said):
+            environment = cli.build_environment(cli.parse_args(["--fresh", "status"]), platform=platform)
+        self.assertTrue(str(environment.home).startswith(str((self.prefix / "tmp").resolve()) + "/"), environment.home)
+        self.assertIn("HOME de teste vazio em", said.getvalue())
+        self.assertTrue(environment.platform.is_termux)
+
+    def test_desktop_test_mode_keeps_the_desktop_platform(self):
+        sandbox = self.home / "mesa"
+        environment = cli.build_environment(cli.parse_args(["--test-mode", "--sandbox", str(sandbox), "status"]),
+                                            platform=Platform.desktop())
+        self.assertEqual(environment.home, sandbox.resolve())
+        self.assertFalse(environment.platform.is_termux)
 
 
 class EntryPointTests(SafeTestCase):

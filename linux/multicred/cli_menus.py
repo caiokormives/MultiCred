@@ -42,6 +42,8 @@ YES = {"s", "sim", "y", "yes"}
 NO = {"n", "nao", "não", "no"}
 SHELL_ORDER = (ShellKind.BASH, ShellKind.ZSH, ShellKind.FISH)
 FIELD_NAMES = {"nickname": "apelido", "name": "nome", "email": "e-mail"}
+# After a folder login that did not end connected (the code was typed late or mistyped).
+FOLDER_LOGIN_FAILURE_SUFFIX = " O código vale por poucos minutos: gere outro no navegador e tente de novo."
 
 
 def make_autostart(environment):
@@ -658,7 +660,7 @@ class Menus:
             return False
         phase = session.phase
         if phase.kind != "connected":
-            self.t.say(session.launch_error or f"Não deu certo ({phase.value}).")
+            self.t.say(self._launch_error(session.launch_error) or f"Não deu certo ({phase.value}).")
             return False
         self.t.say(f"Pronto: {session.login or 'conta'} está logada no gh. A conta ativa voltou para a do perfil "
                    "atual.")
@@ -1058,7 +1060,7 @@ class Menus:
                    "3. Salvar o login")
         return self._drive_claude(session, pump, finished, lambda: session.result)
 
-    def _drive_claude(self, session, pump, finished, result):
+    def _drive_claude(self, session, pump, finished, result, failure_suffix=""):
         session.start()
         if session.command is not None:
             self.t.say(f"$ {session.command.display}")
@@ -1086,33 +1088,51 @@ class Menus:
         if isinstance(getattr(session, "save_error", None), SwitchError):
             self.t.say(f"Não consegui guardar o login: {self.session._describe(session.save_error)}")
         elif session.launch_error:
-            self.t.say(session.launch_error)
+            self.t.say(self._launch_error(session.launch_error))
         elif "400" in (phase.message or ""):
             self.t.say("O Claude recusou o código. Ele vale uma vez e por poucos minutos, e só para o link aberto "
                        "nesta tentativa. Tente de novo.")
         else:
-            self.t.say(f"Não deu certo ({phase.message})." + self._folder_failure_suffix(session))
+            self.t.say(f"Não deu certo ({phase.message})." + failure_suffix)
         return None
 
-    @staticmethod
-    def _folder_failure_suffix(session) -> str:
-        return getattr(session, "failure_suffix", "")
+    def _launch_error(self, message: str | None) -> str | None:
+        """Why a login could not start, in Termux's terms: Claude Code comes from npm pinned to
+        the last version that runs on Android (not the desktop's curl installer), and the
+        pseudo-terminal's setsid from util-linux."""
+        if not message or not self.termux:
+            return message
+        from .core.claude.login_flow import CLAUDE_NOT_INSTALLED
+        from .core.install.setup_detector import install_command
+        from .core.tools import Tool
+
+        platform = self.environment.platform
+        if message == CLAUDE_NOT_INSTALLED:
+            return f"Claude Code não foi encontrado. Instale com: {install_command(Tool.CLAUDE, platform)}"
+        if f"{platform.setsid}:" in message:
+            return f"{message}. Instale o setsid com: {platform.install_command('util-linux')}"
+        return message
 
     def folder_login(self, config_dir) -> bool:
         """"Entrar no Claude" for a folder (LoginWindowView.swift): `claude auth login` with
-        CLAUDE_CONFIG_DIR set to the folder itself; Claude Code keeps the login there."""
+        CLAUDE_CONFIG_DIR set to the folder itself; Claude Code keeps the login there. The
+        same session as the window's folder page (login_flow.LoginMode.FOLDER): no throwaway
+        folder, nothing stored by MultiCred, and in test mode the simulator inside the test HOME."""
+        from .core.claude.login_flow import ClaudeLoginSession, LoginMode
+
         config = self._load()[0]
         name = self._folder_name(config_dir)
         profiles = self._folder_profiles(config, config_dir)
         pump, finished = _Pump(), []
-        session = _FolderLogin(self.environment, self.tools, config_dir, pump, finished.append)
+        session = ClaudeLoginSession(self.environment, self.tools, LoginMode.FOLDER, config_dir, None,
+                                     dispatch=pump, on_finished=finished.append, log=self.session.log)
         self.t.say("", f"Login da pasta {name}", "Perfis: " + (", ".join(p.name for p in profiles) or "nenhum"))
         if session.simulated:
             self.t.say("Simulação do modo de teste: o navegador não abre. Digite qualquer código para conectar, ou "
                        "\"erro\" para ver a tela de erro.")
         self.t.say("O navegador vai abrir. A conta em que você entrar lá vira o login desta pasta. Se o navegador já "
                    "estiver logado em outra conta Claude, saia dela antes ou abra o link numa janela anônima.")
-        if self._drive_claude(session, pump, finished, lambda: True) is None:
+        if self._drive_claude(session, pump, finished, lambda: True, FOLDER_LOGIN_FAILURE_SUFFIX) is None:
             return False
         self.session.forget_folder_status()
         self.t.say(f"Pronto. Os perfis que usam {name} entram com esta conta quando não escolhem outra conta Claude.",
@@ -1362,13 +1382,14 @@ class Menus:
             return 1
 
     def _install_command(self, tool) -> str | None:
-        """Shown, never run. On Termux, Claude Code's commands come from termux_support (None here)."""
+        """Shown, never run. On Termux, Claude Code's commands come with the guidance lines below
+        (termux_support), so none here."""
         from .core.install.setup_detector import install_command
         from .core.tools import Tool
 
-        if not self.termux:
-            return install_command(tool)
-        return None if tool == Tool.CLAUDE else self.environment.platform.install_command(tool.value)
+        if self.termux and tool == Tool.CLAUDE:
+            return None
+        return install_command(tool, self.environment.platform)
 
     def _claude_guidance(self, folder) -> list[str]:
         """R-12 (core/claude/termux_support.py): Claude Code on Android, what was found and what
@@ -1699,107 +1720,3 @@ class Menus:
 def _join(items) -> str:
     items = list(items)
     return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " e " + items[-1]
-
-
-class _FolderLogin:
-    """`claude auth login` with CLAUDE_CONFIG_DIR = the folder itself, in a pseudo-terminal, built
-    from the core's pieces (resolve_login_tool, terminal_environment, the parser and the state
-    machine of login_flow, the LoginSimulator in test mode). The same surface as
-    ClaudeLoginSession for Menus._drive_claude. TODO(S-14): use S-03's folder login session
-    (core/claude/login_flow.py) once it lands, so the window and the terminal share one."""
-
-    failure_suffix = " O código vale por poucos minutos: gere outro no navegador e tente de novo."
-
-    def __init__(self, environment, tools, config_dir, dispatch, on_finished):
-        from .core.claude.login_flow import LoginOutputParser, LoginStateMachine
-        from .core.pty import PseudoTerminalProcess
-
-        self.environment, self.tools, self.config_dir = environment, tools, config_dir
-        self.simulated = environment.mode != "real"
-        self._dispatch, self._on_finished = dispatch, on_finished
-        self._pty = PseudoTerminalProcess(setsid=environment.platform.setsid)
-        self._parser, self._machine = LoginOutputParser(), LoginStateMachine()
-        self._reported = False
-        self.command = None
-        self.launch_error = None
-        self.save_error = None
-
-    @property
-    def phase(self):
-        return self._machine.phase
-
-    @property
-    def authorization_url(self):
-        return self._machine.authorization_url
-
-    def start(self) -> None:
-        import os
-
-        from .core import claude_paths
-        from .core.claude.login_flow import LoginCommand, LoginEvent, LoginLaunchError, resolve_login_tool, \
-            terminal_environment
-        from .core.claude.login_simulator import LoginSimulator
-        from .core.pty import PTYError
-        from .core.tools import Tool
-
-        platform = self.environment.platform
-        try:
-            path = resolve_login_tool(self.environment, self.tools, Tool.CLAUDE, self.simulated)
-        except LoginLaunchError as error:
-            self._fail(str(error), LoginEvent)
-            return
-        env = terminal_environment(self.environment, self.tools)
-        env["BROWSER"] = platform.true  # the link is shown here; the terminal opens it on a tap
-        if self.config_dir is not None:
-            env["CLAUDE_CONFIG_DIR"] = self.config_dir
-        if path is None:
-            executable, arguments = LoginSimulator.executable(platform), LoginSimulator.arguments()
-            env["PATH"] = ":".join(platform.system_path)
-            display = "claude auth login --claudeai (simulado)"
-        else:
-            executable, arguments = path, ["auth", "login", "--claudeai"]
-            env["PATH"] = ":".join([os.path.dirname(path), env["PATH"]])
-            display = "claude auth login --claudeai"
-        if self.config_dir is not None:
-            display = f"CLAUDE_CONFIG_DIR={self.environment.abbreviate(self.config_dir)} {display}"
-        self.command = LoginCommand(executable, arguments, env, str(self.environment.home), None, display)
-        os.makedirs(claude_paths.effective_directory(self.config_dir, self.environment), mode=0o700, exist_ok=True)
-        try:
-            self._pty.start(executable, arguments, env, cwd=str(self.environment.home),
-                            on_output=lambda data: self._dispatch(self._received, data),
-                            on_exit=lambda status: self._dispatch(self._exited, status))
-        except PTYError as error:
-            self._fail(f"Não consegui iniciar o {display}: {error}", LoginEvent)
-
-    def submit_code(self, code: str) -> None:
-        self._pty.submit_line(code.strip())
-        self._machine.code_submitted()
-
-    def cancel(self) -> None:
-        self._machine.cancelled()
-        self._pty.terminate()
-        self._report()
-
-    def _fail(self, message, LoginEvent) -> None:
-        self.launch_error = message
-        self._machine.handle(LoginEvent.failed(message))
-        self._report()
-
-    def _received(self, data: bytes) -> None:
-        for event in self._parser.consume(data):
-            if event.kind != "succeeded":  # connected once the CLI exits with 0 and the login is there
-                self._machine.handle(event)
-        self._report()
-
-    def _exited(self, status: int) -> None:
-        from .core import claude_paths
-        if status == 0 and not claude_paths.credentials_file(self.config_dir, self.environment).exists():
-            self.launch_error = "O login terminou, mas não encontrei a credencial. Tente de novo."
-            status = 1
-        self._machine.process_exited(status)
-        self._report()
-
-    def _report(self) -> None:
-        if self._machine.phase.is_finished and not self._reported:
-            self._reported = True
-            self._on_finished(self)

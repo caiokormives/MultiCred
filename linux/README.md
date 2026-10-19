@@ -5,8 +5,10 @@ git, a conta ativa do GitHub CLI, a pasta e a conta do Claude Code (`CLAUDE_CONF
 chaves de API dos terminais. Se um passo falha, os anteriores são desfeitos na ordem inversa; se
 nem isso dá certo, o app marca o estado como inconsistente e oferece **Verificar › Corrigir**.
 
-É o mesmo app do macOS (mesmas regras, mesmo formato de `config.json`), escrito em Python com
-GTK 4 e libadwaita. O código fica em `linux/`; o app do macOS não muda.
+É o mesmo app do macOS (mesmas regras, mesmas telas e textos, mesmo formato de `config.json`),
+escrito em Python com GTK 4 e libadwaita, mais o comando `multicred` para o terminal. O código
+fica em `linux/`; o app do macOS não muda. Para o celular, veja [MultiCred no Termux
+(Android)](README-termux.md): o mesmo comando, num pacote próprio, sem janela.
 
 ## Requisitos
 
@@ -39,11 +41,54 @@ Abra **MultiCred** pelo lançador. O onboarding tem três passos, dentro da jane
 
 1. **Preparar**: mostra o que foi encontrado (git, gh, Claude Code, com versão ou o comando para
    instalar), as contas que já existem e a versão antiga em scripts (`~/Perfis`), se houver.
-2. **Perfis**: perfis sugeridos a partir do que foi encontrado, para editar.
-3. **Aplicar**: escolha dos shells (bash, zsh, fish) e o diff exato de cada arquivo antes de
-   aplicar. Depois disso, terminais já abertos adotam o perfil no próximo prompt.
+2. **Perfis**: perfis sugeridos a partir do que foi encontrado, para editar ("Completo" ou
+   "Falta N item" em cada cartão).
+3. **Aplicar**: escolha dos shells (bash, zsh, fish), o diff exato de cada arquivo, a pasta dos
+   backups, o perfil inicial e "Abrir ao iniciar a sessão"; **Aplicar e começar**. Depois disso,
+   terminais já abertos adotam o perfil no próximo prompt.
 
-Na janela: Ctrl+1…Ctrl+9 ativam os nove primeiros perfis e Ctrl+R abre Verificar.
+No terminal, `multicred configurar` faz os mesmos passos.
+
+## A janela
+
+Organizada como a do macOS, com a barra lateral em três seções:
+
+- **Perfis**: **Visão geral** (extra do Linux e página inicial: o cartão do perfil ativo, "Outros
+  perfis" com **Ativar** e o resumo do Verificar), um item por perfil (✓ no ativo) e **Novo
+  perfil**. Clicar num perfil abre o editor dele, sem trocar: Git, GitHub, pasta e conta do Claude,
+  chaves de API, ícone (letra ou símbolo), e no rodapé **Apagar perfil… / Cancelar / Ativar este
+  perfil / Salvar**. Sem perfis, a página inicial é Claude, como no Mac.
+- **Contas**: **Git**, **GitHub** (com "Conferir logins" e "Entrar…"), **Claude** (as pastas dos
+  perfis, com o login de cada pasta, e as contas Claude com **Usar agora**, que troca só o Claude)
+  e **Chaves de API**, cada uma com a contagem e ⚠ quando falta algo.
+- **Sistema**: **Verificar** (ponto verde ou laranja depois da primeira verificação; **Corrigir
+  tudo** no topo) e **Ajustes** ("Abrir ao iniciar a sessão", o retorno da troca — Notificação
+  breve, Só notificação ou Nada —, shells, ferramentas encontradas, diagnóstico e, depois de aplicada a configuração, a desinstalação).
+
+O menu do app tem **Configurar de novo…** e **Sair do MultiCred**. Atalhos, com a janela em foco:
+Ctrl+1…Ctrl+9 ativam os nove primeiros perfis, Ctrl+R abre Verificar, Ctrl+, abre Ajustes e Ctrl+Q
+sai. A bandeja mostra o perfil ativo e o status, os perfis com ícone e ✓, o submenu "Trocar só a
+conta Claude", Verificar, Contas… e Ajustes….
+
+## Pelo terminal
+
+O mesmo pacote instala o comando `multicred`, com as mensagens do app:
+
+| Comando | Exemplo | O que faz |
+|---|---|---|
+| `status` | `multicred status` | Perfil ativo, desde quando, git, GitHub, pasta e conta do Claude e chaves. |
+| `trocar <perfil>` | `multicred trocar Trabalho` ou `multicred trocar 2` | Troca para o perfil (nome sem diferenciar maiúsculas, ou o número 1–9 do Ctrl+N). |
+| `perfis` | `multicred perfis` | Lista os perfis; num terminal abre o menu para criar, editar, ativar e apagar (`--menu` força o menu). |
+| `contas` | `multicred contas` | Lista Git, GitHub, Claude e Chaves de API; num terminal abre o menu para cadastrar, editar e remover (`--menu` também). |
+| `claude [conta]` | `multicred claude Marco` | Troca só a conta Claude; sem argumento lista as contas; `multicred claude pasta` volta para o login da pasta. |
+| `entrar claude\|pasta\|github` | `multicred entrar pasta ~/.claude-pessoal` | Entrar de novo numa conta Claude, no login de uma pasta (`claude auth login`) ou no GitHub (`gh auth login --web`), no próprio terminal. |
+| `verificar [--corrigir]` | `multicred verificar --corrigir` | A página Verificar como texto; `--corrigir` mostra os comandos e pergunta antes. |
+| `configurar` | `multicred configurar` | O onboarding no terminal. |
+| `desinstalar` | `multicred desinstalar` | A página de desinstalar: o diff de cada arquivo e "Desinstalar? [s/N]". |
+
+Sem comando, `multicred` abre a janela. Todos aceitam `--test-mode` (veja abaixo). Códigos de
+saída: 0 deu certo (no `verificar`, tudo de acordo), 1 falhou ou ficou algo para resolver, 2 uso
+errado, 130 interrompido com Ctrl+C num menu.
 
 ## Modo de teste
 
@@ -102,28 +147,30 @@ O app também nunca mostra tokens na tela.
 
 ## Desinstalar
 
-1. **Ajustes › Desinstalar o MultiCred…**: a confirmação lista tudo antes. Remove só os blocos
+1. **Ajustes › Desinstalar e restaurar arquivos originais › Desinstalar…** (ou
+   `multicred desinstalar` no terminal): a página lista o diff de cada arquivo e o resto antes de
+   **Cancelar / Desinstalar**. Remove só os blocos
    marcados (um bloco sem o marcador de fim fica como está e o app avisa para remover à mão), o
    arquivo do fish, o `environment.d`, a entrada de autostart, a variável do `systemctl --user`
    (se foi o MultiCred que a definiu) e os segredos do app no chaveiro. Cada pasta do Claude volta
    para o próprio login, a co-autoria desligada é desfeita e os logins guardados são apagados.
    Opcional: também sair (`claude auth logout`) e apagar as pastas do Claude que o MultiCred criou.
    Os backups vão para `~/.config/multicred-backups-<data>` e `~/.config/multicred/` é apagada.
-   As contas continuam logadas no `gh` e no Claude. O app fecha no fim.
+   As contas continuam logadas no `gh` e no Claude. Na janela, o app fecha no fim.
 2. `sudo apt remove multicred`.
 
 ## Diferenças em relação ao macOS
 
 | No macOS | No Linux |
 |---|---|
-| HUD flutuante depois da troca | Notificação da área de trabalho (o Wayland não permite janela flutuante posicionada). "Notificação curta" some em uns 2 s; com sessões do Claude Code abertas, a notificação fica. |
+| HUD flutuante depois da troca | Notificação da área de trabalho (o Wayland não permite janela flutuante posicionada). "Notificação breve" some em uns 2 s; com sessões do Claude Code abertas, a notificação fica. |
 | `launchctl setenv`: apps gráficos abertos depois da troca já veem a pasta do Claude | `systemctl --user` vale para o que o systemd/D-Bus abrir a partir dali; para os apps do lançador e do dock, a pasta vale a partir do próximo login (`environment.d`). Terminais trocam no próximo prompt, como no Mac. |
 | Ícone na barra de menus sempre disponível | Bandeja via StatusNotifierItem: nativa no COSMIC; no GNOME puro precisa da extensão AppIndicator. Sem ela, a janela abre com um aviso e fechá-la encerra o app. |
 | Chaveiro do macOS (Keychain) | Secret Service (libsecret). O login de cada pasta do Claude é o arquivo `<pasta>/.credentials.json`. |
 | `~/Library/Application Support/MultiCred/` e `~/Library/Logs/MultiCred/` | `~/.config/multicred/` e `~/.local/state/multicred/` |
 | Item de login (`SMAppService`) | Autostart XDG em `~/.config/autostart/` |
 | `.bash_profile` + `.bashrc` | `.bashrc` (o `.profile` do Ubuntu já o carrega); `.bash_profile` só se já existir |
-| Atalhos ⌘1…⌘9 e ⌘R | Ctrl+1…Ctrl+9 e Ctrl+R, só com a janela em foco: o Wayland não permite atalho global |
+| Atalhos ⌘1…⌘9, ⌘R, ⌘, e ⌘Q | Ctrl+1…Ctrl+9, Ctrl+R, Ctrl+, e Ctrl+Q, só com a janela em foco: o Wayland não permite atalho global |
 | Cabeçalho do menu em SwiftUI | Menu da bandeja com o cabeçalho em linhas de texto e perfis com ícone colorido |
 
 ## Desenvolvimento
@@ -134,6 +181,7 @@ python3 -m multicred --test-mode                  # roda do código-fonte, sem i
 tests/run-ui-tests.sh                             # suíte inteira num Xvfb e num D-Bus privados
 python3 -m unittest discover -s tests -t .        # sem tela: os testes de janela/bandeja/chaveiro pulam
 python3 -m unittest tests.test_packaging -v       # gera o .deb num diretório temporário e o confere
+python3 -m unittest tests.test_packaging_termux -v   # o .deb do Termux, e a CLI dele num Termux simulado
 ```
 
 - Testes de janela, D-Bus e chaveiro só rodam pelo `tests/run-ui-tests.sh` (variável

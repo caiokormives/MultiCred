@@ -36,9 +36,16 @@ PALETTE = [ProfileColor.INDIGO, ProfileColor.ORANGE, ProfileColor.TEAL, ProfileC
            ProfileColor.PINK, ProfileColor.RED, ProfileColor.GRAPHITE]
 
 
-def install_command(tool: Tool) -> str:
-    """Shown, never run: the app does not install tools (R-08 out of scope)."""
-    return INSTALL_COMMANDS[tool]
+def install_command(tool: Tool, platform=None) -> str:
+    """Shown, never run: the app does not install tools (R-08 out of scope). On Termux,
+    git and gh come from `pkg` and Claude Code from npm, pinned to the last version that
+    runs on Android with the auto-updater off (claude/termux_support.py)."""
+    if platform is None or not platform.is_termux:
+        return INSTALL_COMMANDS[tool]
+    if tool == Tool.CLAUDE:
+        from ..claude.termux_support import PIN_COMMAND
+        return f"{platform.install_command('nodejs-lts')} && {PIN_COMMAND}"
+    return platform.install_command(tool.value)
 
 
 @dataclass(frozen=True)

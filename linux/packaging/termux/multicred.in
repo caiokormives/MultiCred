@@ -1,0 +1,6 @@
+#!@PREFIX@/bin/sh
+# MultiCred for Termux: the app lives in $PREFIX/lib/multicred. -P keeps the current
+# directory off sys.path (a folder named "multicred" there must not shadow the app);
+# the user's directory stays where it is.
+PREFIX="${PREFIX:-@PREFIX@}"
+exec "$PREFIX/bin/python3" -P -c 'import sys; sys.path.insert(0, sys.argv.pop(1)); from multicred.__main__ import main; sys.exit(main())' "$PREFIX/lib/multicred" "$@"

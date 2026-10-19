@@ -12,6 +12,7 @@ from multicred.core.install.setup_detector import (
     DetectedSetup, SetupDetector, default_shells, install_command, suggested_config,
 )
 from multicred.core.models import ShellKind
+from multicred.core.platform import Platform
 from multicred.core.runner import DryRunCommandRunner
 from multicred.core.tools import Tool
 from multicred.core.validation import issues_in
@@ -167,6 +168,21 @@ class SetupDetectorTests(SafeTestCase):
         self.assertEqual(install_command(Tool.CLAUDE), "curl -fsSL https://claude.ai/install.sh | bash")
         self.assertEqual(install_command(Tool.GIT), "sudo apt install git")
         self.assertEqual(install_command(Tool.GH), "sudo apt install gh")
+        desktop = Platform.desktop()
+        self.assertEqual([install_command(tool, desktop) for tool in (Tool.CLAUDE, Tool.GIT, Tool.GH)],
+                         [install_command(Tool.CLAUDE), install_command(Tool.GIT), install_command(Tool.GH)])
+
+    def test_install_commands_on_termux(self):
+        """S-14: pkg, never sudo apt; Claude Code from npm pinned to the last version that runs
+        on Android, with the auto-updater off (core/claude/termux_support.py)."""
+        termux = Platform.termux()
+        self.assertEqual(install_command(Tool.GIT, termux), "pkg install git")
+        self.assertEqual(install_command(Tool.GH, termux), "pkg install gh")
+        self.assertEqual(install_command(Tool.CLAUDE, termux),
+                         "pkg install nodejs-lts && DISABLE_AUTOUPDATER=1 npm install -g @anthropic-ai/claude-code@2.1.112")
+        for tool in Tool:
+            self.assertNotIn("sudo", install_command(tool, termux))
+            self.assertNotIn("curl", install_command(tool, termux))
 
     def test_test_mode_touches_nothing_real(self):
         """With the app's dry-run runner nothing runs: every command is only recorded."""

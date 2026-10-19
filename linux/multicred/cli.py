@@ -17,6 +17,8 @@ conta Claude") and its Verificar page (VerifyPage.swift).
     contas [--menu]           the Contas pages as text; in a terminal (or --menu) their menus
     entrar claude|pasta|github  the "Entrar…" buttons (a Claude account again, a folder's own
                               login, gh auth login)
+    desinstalar               Ajustes › "Desinstalar e restaurar arquivos originais" (the uninstall
+                              page: the diff of each file, then "Desinstalar?")
 
 `perfis` and `contas` print a listing when the input is not a terminal (scripts, pipes), so
 their output stays stable; `--menu` asks for the menus anyway (scripted input).
@@ -92,6 +94,10 @@ def build_parser() -> argparse.ArgumentParser:
                     "github [servidor]: gh auth login.")
     sign_in.add_argument("tipo", choices=["claude", "pasta", "github"])
     sign_in.add_argument("alvo", nargs="?", help="a conta Claude, a pasta ou o servidor do GitHub")
+    commands.add_parser(
+        "desinstalar", help="mostra o que volta ao original e, se você confirmar, desinstala",
+        description="Desinstalar e restaurar arquivos originais: remove só o bloco do MultiCred de cada arquivo, "
+                    "os segredos guardados e ~/.config/multicred (os backups ficam). Pergunta antes.")
     return parser
 
 
@@ -102,19 +108,27 @@ def parse_args(argv) -> argparse.Namespace:
     return args
 
 
-def build_environment(args):
-    """The real system, or the test-mode sandbox (seeded with the demo profiles unless --fresh)."""
+def build_environment(args, platform=None):
+    """The real system, or the test-mode sandbox (seeded with the demo profiles unless --fresh).
+    `platform` None = detected from the real environment. On Termux the sandbox lives under
+    $TMPDIR (never /tmp, which Android does not have) and keeps the Termux platform, so the
+    simulated logins run $PREFIX's programs."""
+    import dataclasses
+
     from .core import real_env
     from .core.storage import ConfigRepository
 
     if not args.test_mode:
         return real_env.make_real()
-    sandbox = args.sandbox or real_env.default_sandbox()
+    platform = platform or real_env.detect_platform()
+    sandbox = args.sandbox or real_env.default_sandbox(platform)
     if args.fresh and args.sandbox is None:
         # A new empty home every time: the default sandbox may hold an earlier setup.
-        sandbox = Path(tempfile.mkdtemp(prefix="multicred-fresh-"))
+        sandbox = Path(tempfile.mkdtemp(prefix="multicred-fresh-", dir=platform.temp_directory))
         print(f"MultiCred: HOME de teste vazio em {sandbox}", file=sys.stderr)
     environment = real_env.make_sandbox(sandbox)
+    if platform.is_termux:
+        environment = dataclasses.replace(environment, platform=platform)
     repository = ConfigRepository(environment)
     if not args.fresh and repository.load() is None:
         repository.save(real_env.seed_sandbox(environment))
@@ -167,6 +181,7 @@ def run(args, environment=None, tools=None, out=None, err=None, inp=None) -> int
         "perfis": session.profiles,
         "claude": lambda: session.claude(args.conta),
         "verificar": lambda: session.verify(args.corrigir),
+        "desinstalar": session.uninstall,
     }[args.command]()
 
 
@@ -323,6 +338,96 @@ def terminal_command_for(fix, config, environment) -> str | None:
     if kind == FixKind.OPEN_API_KEY:
         return "multicred contas (Chaves de API)"
     return None
+
+
+# MARK: Desinstalar as text (UninstallPage, SettingsPage.swift:114-174; ui/pages/uninstall.py, which
+# needs GTK, builds the same lines for the window)
+
+UNINSTALL_TITLE = "Desinstalar o MultiCred"
+UNINSTALL_INTRO = ("Estas são as mudanças. Só o bloco do MultiCred é removido de cada arquivo; o resto fica como "
+                   "você deixou.")
+UNINSTALL_D12 = "Também sair e apagar as pastas do Claude criadas pelo MultiCred"
+NOTHING_TO_UNINSTALL = "Nada para desinstalar: o MultiCred não deixou nada nesta máquina."
+UNINSTALL_DONE = "MultiCred desinstalado"
+UNINSTALL_NEW_TERMINAL = "Abra um novo terminal para que os shells deixem de carregar o MultiCred."
+# The window quits after uninstalling (the Mac's "Sair do MultiCred"); from a terminal, the
+# tray app may still be running on the desktop.
+UNINSTALL_QUIT_TRAY = "Se o MultiCred estiver aberto na bandeja, saia dele (Sair do MultiCred)."
+
+
+def _lines_count(count: int) -> str:
+    return f"{count} {'linha' if count == 1 else 'linhas'}"
+
+
+def uninstall_file_lines(items, autostart_path: str) -> list[str]:
+    """Each file the uninstall changes, as the page's FileChangeView: "path · −N linhas" and
+    the removed lines, "· será apagado", or the manual step of a block without its end marker."""
+    lines = []
+    for item in items:
+        if item.kind == "block":
+            lines.append(f"{item.path} · −{_lines_count(len(item.lines))}")
+            lines += [f"  − {line}" for line in item.lines]
+        elif item.kind == "manual":
+            lines.append(f"{item.path} · bloco sem o marcador de fim; fica como está e você remove à mão")
+        elif item.kind in ("file", "appDir") and item.path != autostart_path:
+            lines.append(f"{item.path} · será apagado")
+    return lines
+
+
+def _from_store(store: str) -> str:
+    """"o chaveiro do sistema" → "do chaveiro do sistema"; "a pasta X" → "da pasta X"."""
+    article, _, rest = store.partition(" ")
+    return {"o": "do", "a": "da"}.get(article, "de") + " " + rest if rest else f"de {store}"
+
+
+def uninstall_also_text(items, autostart_path: str, store: str) -> str:
+    """The page's "Também: …" line, from what this uninstall really does (`store`: where the
+    secrets live, "o chaveiro do sistema" or Termux's secrets folder); empty when nothing."""
+    pieces: list[str] = []
+    autostart, backups = False, None
+    for item in items:
+        if item.kind == "session":
+            pieces.append(f"systemctl --user unset-environment {item.path}")
+        elif item.kind == "secrets":
+            pieces.append(f"apagar {_from_store(store)} as chaves de API e os tokens das contas Claude "
+                          "(pastas e conversas do Claude ficam)")
+        elif item.kind == "claudeVault":
+            plural = "s" if item.count != 1 else ""
+            pieces.append(f"apagar {item.count} login{plural} do Claude guardado{plural} pelo MultiCred")
+        elif item.kind == "claudeLogin":
+            pieces.append(f"devolver a {item.path} o próprio login do Claude")
+        elif item.kind == "claudeFolder":
+            pieces.append(f"sair (claude auth logout) e apagar {item.path}")
+        elif item.kind == "file" and item.path == autostart_path:
+            autostart = True
+        elif item.kind == "backups":
+            backups = item.path
+    if autostart:  # last, as on the Mac
+        pieces.append("desligar a abertura ao iniciar a sessão")
+    text = f"Também: {', '.join(pieces)}." if pieces else ""
+    if backups:
+        text = f"{text} Os backups vão para {backups}.".strip()
+    return text
+
+
+def uninstall_result_lines(report, platform) -> list[str]:
+    """The page's result: restored files, backups, deleted folders, "!" manual steps, "✗"
+    problems, then what is left to do (`apt remove`; no sudo on Termux)."""
+    lines = [UNINSTALL_DONE]
+    restored = report.changed_files + report.removed_files
+    if restored:
+        lines.append("Arquivos restaurados: " + ", ".join(restored))
+    if report.backups_kept_at:
+        lines.append(f"Backups guardados em {report.backups_kept_at}.")
+    if report.deleted_folders:
+        lines.append("Pastas do Claude apagadas: " + ", ".join(report.deleted_folders) + ".")
+    lines += [f"! {step}" for step in report.manual_steps]
+    lines += [f"✗ {problem}" for problem in report.problems]
+    if platform.has_graphical_session:
+        lines.append(UNINSTALL_QUIT_TRAY)
+    remove = "apt remove multicred" if platform.is_termux else "sudo apt remove multicred"
+    lines.append(f"{UNINSTALL_NEW_TERMINAL} Para tirar o app: {remove}.")
+    return lines
 
 
 def make_verifier(environment, tools, processes=None, engine=None, log=None):
@@ -613,6 +718,47 @@ class _Session:
         if report.errors:
             self._say("Não consegui corrigir: " + "; ".join(report.errors), error=True)
         return 0 if report.is_consistent and not report.errors else 1
+
+    def uninstall(self) -> int:
+        """Ajustes › "Desinstalar e restaurar arquivos originais": the page's preview, the D12
+        question when MultiCred created Claude folders, then "Desinstalar? [s/N]". Works
+        without a configuration too (blocks left behind). The uninstaller skips the
+        graphical session where there is none (Termux)."""
+        from .core.install.autostart import Autostart
+        from .core.install.uninstaller import Uninstaller
+
+        uninstaller = Uninstaller(self.environment, tools=self.tools, autostart=Autostart(self.environment))
+        autostart = self.environment.abbreviate(str(uninstaller.autostart.file))
+        items = uninstaller.preview()
+        folders = uninstaller.created_claude_folders()
+        if not items and not folders:
+            self._say(NOTHING_TO_UNINSTALL)
+            return 0
+        files = uninstall_file_lines(items, autostart)
+        self._say(UNINSTALL_TITLE, UNINSTALL_INTRO, *([""] + files if files else []))
+        remove_folders = False
+        if folders:
+            names = ", ".join(self.environment.abbreviate(folder) for folder in folders)
+            self._say("")
+            remove_folders = self._confirm(f"{UNINSTALL_D12} ({names})? [s/N] ")
+            if remove_folders:
+                items = uninstaller.preview(remove_claude_folders=True)
+        also = uninstall_also_text(items, autostart, self.store.store)
+        if also:
+            self._say("", also)
+        if not self._confirm("Desinstalar? [s/N] "):
+            self._say("Nada foi alterado.")
+            return 1
+        try:
+            report = uninstaller.apply(remove_folders)
+        except Exception as error:
+            self._say(f"Não consegui desinstalar: {error}", error=True)
+            return 1
+        self.log.log("info", f"uninstalled from the terminal: changed={report.changed_files} "
+                             f"removed={report.removed_files} manual={report.unterminated} "
+                             f"problems={len(report.problems)}")
+        self._say("", *uninstall_result_lines(report, self.environment.platform))
+        return 1 if report.problems or report.unterminated else 0
 
     # MARK: helpers
 
