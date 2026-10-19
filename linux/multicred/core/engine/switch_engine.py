@@ -4,7 +4,8 @@
         -> claudeLogin -> envFiles -> state   <- commit point: generation bump
 
 A failure at step k undoes k-1 … 1 in reverse order and reports the step and
-whether the rollback was complete. One switch at a time: a second request
+whether the rollback was complete. Platforms without a graphical session (Termux)
+have no `session` step. One switch at a time: a second request
 while one runs gets Busy instead of queueing behind it.
 """
 
@@ -12,6 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import threading
 import uuid
 
@@ -23,7 +25,9 @@ from ..claude.login_vault import ClaudeLoginSwitcher, OccupancyUnreadable
 from ..models import ActiveState, ClaudeAccountKind, ClaudeFolder, Config, uuid_text
 from ..paths import AppPaths
 from ..rendering import gitconfig
-from ..rendering.envfile import SECRET_TOOL, APIKeyExport, ShellEnvironment, render_fish, render_posix
+from ..rendering.envfile import (
+    SECRET_TOOL, APIKeyExport, ShellEnvironment, render_fish, render_posix, secret_reader_for,
+)
 from ..storage import AtomicFileWriter, StateStore, read_bytes, restore_file
 from ..tools import Tool
 from ..validation import RESERVED_ENV_VARS, is_valid_env_var_name, issues_in
@@ -33,6 +37,9 @@ from .types import (
 )
 
 CLAUDE_VARIABLE = "CLAUDE_CONFIG_DIR"
+# A key line of env.sh starts with `NAME=` (`NAME="$(…secret-tool…)"` on the desktop,
+# `NAME=''; … read -r NAME …` on Termux) and exports NAME.
+_KEY_LINE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=")
 
 
 class _Operation:
@@ -54,6 +61,8 @@ class SwitchEngine:
         self.state_store = StateStore(self.paths, environment.clock)
         self.log = log
         self.secret_tool = secret_tool
+        # secret-tool on the desktop; the key's 0600 file, read with builtins, on Termux.
+        self.secret_reader = secret_reader_for(environment.platform, secret_tool)
         self._lock = threading.Lock()
 
     # MARK: public API
@@ -230,8 +239,10 @@ class SwitchEngine:
             steps.append(self._git_step(gitconfig.render(identity, self.environment)))
         if github_plan is not None:
             steps.append(self._github_step(*github_plan))
-        # Switching only the Claude account never moves the folder.
-        if touches_git_and_github and claude_target.kind != "unchanged":
+        # Switching only the Claude account never moves the folder. Termux has no
+        # graphical session (no systemd, no environment.d): only the shells carry it.
+        if (touches_git_and_github and claude_target.kind != "unchanged"
+                and self.environment.platform.has_graphical_session):
             steps.append(self._session_step(claude_target, SessionEnvironment(self.environment, child_environment)))
         # Claude as co-author follows the profile's GitHub account, written to the
         # profile's Claude folder (Claude Code reads it only from settings).
@@ -269,7 +280,8 @@ class SwitchEngine:
         return SwitchResult(new_state, claude_target, [s.kind for s in steps])
 
     def _previously_managed_vars(self) -> set[str]:
-        """The names the current env.sh EXPORTS (`NAME="$(…secret-tool…)" && … export NAME`):
+        """The names the current env.sh EXPORTS (`NAME="$(…secret-tool…)" && … export NAME`, or
+        the Termux `NAME=''; … read -r NAME … && export NAME`):
         a key removed since it was written must be unset once more, or open terminals keep
         exporting it. Only exported names are carried, so a removed name is unset by the
         next generation and then leaves the file: a variable the user later exports on
@@ -280,9 +292,9 @@ class SwitchEngine:
             return set()
         names = set()
         for line in data.decode("utf-8", "replace").splitlines():
-            name, separator, rest = line.partition('="$(')
-            if separator and f"export {name}" in rest:
-                names.add(name)
+            match = _KEY_LINE.match(line)
+            if match and f"export {match.group(1)}" in line[match.end():]:
+                names.add(match.group(1))
         # (CLAUDE_CODE_OAUTH_TOKEN is reserved but always managed: it comes from the config.)
         return {n for n in names if is_valid_env_var_name(n) and n not in RESERVED_ENV_VARS}
 
@@ -366,8 +378,8 @@ class SwitchEngine:
 
     def _env_files_step(self, shell_environment: ShellEnvironment) -> SwitchStep:
         sh, fish = self.paths.env_sh, self.paths.env_fish
-        posix = render_posix(shell_environment, self.secret_tool).encode()
-        fish_text = render_fish(shell_environment, self.secret_tool).encode()
+        posix = render_posix(shell_environment, reader=self.secret_reader).encode()
+        fish_text = render_fish(shell_environment, reader=self.secret_reader).encode()
 
         def apply():
             previous_sh, previous_fish = read_bytes(sh), read_bytes(fish)

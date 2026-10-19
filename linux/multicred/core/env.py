@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from .platform import Platform
+
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -40,6 +42,8 @@ class SystemEnvironment:
     # "Failed to connect to bus: No medium found"); the Secret Service clients too.
     xdg_runtime_dir: str | None = None
     dbus_session_bus_address: str | None = None
+    # Linux desktop or Termux (tool locations, temp folder, graphical session, secrets).
+    platform: Platform = field(default_factory=Platform.desktop)
 
     def __post_init__(self):
         object.__setattr__(self, "home", Path(self.home))
@@ -100,4 +104,6 @@ class SystemEnvironment:
             env["XDG_RUNTIME_DIR"] = self.xdg_runtime_dir
         if self.dbus_session_bus_address:
             env["DBUS_SESSION_BUS_ADDRESS"] = self.dbus_session_bus_address
+        # Termux: PREFIX, TMPDIR and LD_PRELOAD (termux-exec) from the session.
+        env.update(self.platform.child_environment())
         return env

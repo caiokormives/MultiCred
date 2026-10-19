@@ -1,0 +1,124 @@
+"""Which kind of machine MultiCred runs on: a Linux desktop or Termux on Android.
+
+Carried by SystemEnvironment (desktop by default), so the core asks the platform
+for tool locations, the temporary folder, whether a graphical session exists and
+where secrets live, instead of assuming a desktop. `detect` is pure: it gets the
+process environment as a mapping from real_env.py, the only module allowed to
+read it.
+
+Termux facts this relies on (researched; there is no device in the test suite):
+- Termux is recognised by `TERMUX_VERSION` (set by the Termux app), by
+  `TERMUX__PREFIX` (newer termux-exec / app builds), or by a `PREFIX` under
+  `/com.termux/` (the standard `PREFIX=/data/data/com.termux/files/usr`).
+- Every tool lives in `$PREFIX/bin`; there is no /usr/bin or /bin/sh.
+- /tmp is not writable; TMPDIR (normally `$PREFIX/tmp`) is.
+- No systemd, no D-Bus session, no Secret Service, no graphical session.
+- Child processes need `PREFIX`, `TMPDIR` and `LD_PRELOAD` (termux-exec, which
+  rewrites `#!/usr/bin/env` style shebangs) from the session to behave.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum
+from typing import Mapping
+
+DESKTOP = "desktop"
+TERMUX = "termux"
+
+# The standard Termux prefix (app id com.termux).
+TERMUX_DEFAULT_PREFIX = "/data/data/com.termux/files/usr"
+TERMUX_PATH_MARKER = "/com.termux/"
+
+
+class SecretBackend(str, Enum):
+    # libsecret / GNOME Keyring; the shell hook reads values with `secret-tool`.
+    SECRET_SERVICE = "secretService"
+    # One 0600 file per secret in ~/.config/multicred/secrets (dir 0700), read by
+    # the shell hook with builtins (Termux has no Secret Service).
+    FILES = "files"
+
+
+@dataclass(frozen=True)
+class Platform:
+    kind: str = DESKTOP
+    # Termux only: $PREFIX, $TMPDIR and $LD_PRELOAD of the session.
+    prefix: str | None = None
+    tmpdir: str | None = None
+    ld_preload: str | None = None
+
+    @classmethod
+    def desktop(cls) -> "Platform":
+        return cls(DESKTOP)
+
+    @classmethod
+    def termux(cls, prefix: str = TERMUX_DEFAULT_PREFIX, tmpdir: str | None = None,
+               ld_preload: str | None = None) -> "Platform":
+        return cls(TERMUX, prefix=prefix.rstrip("/") or TERMUX_DEFAULT_PREFIX,
+                   tmpdir=tmpdir if tmpdir and tmpdir.startswith("/") else None,
+                   ld_preload=ld_preload or None)
+
+    @property
+    def is_termux(self) -> bool:
+        return self.kind == TERMUX
+
+    def _bin(self, name: str) -> str:
+        return f"{self.prefix}/bin/{name}"
+
+    @property
+    def tool_search_directories(self) -> list[str]:
+        """Where tools are looked for, in order (`~` is expanded against the injected home).
+        On Termux, npm globals (Claude Code) also land in $PREFIX/bin; ~/.local/bin is
+        where pip --user and Claude Code's own installer put things."""
+        if self.is_termux:
+            return [f"{self.prefix}/bin", "~/.local/bin"]
+        from .tools import DEFAULT_SEARCH_DIRECTORIES  # local: tools may come to depend on this module
+        return list(DEFAULT_SEARCH_DIRECTORIES)
+
+    @property
+    def sh(self) -> str:
+        return self._bin("sh") if self.is_termux else "/bin/sh"
+
+    @property
+    def true(self) -> str:
+        return self._bin("true") if self.is_termux else "/usr/bin/true"
+
+    @property
+    def setsid(self) -> str:
+        # util-linux setsid(1); Termux ships it in the util-linux package.
+        return self._bin("setsid") if self.is_termux else "/usr/bin/setsid"
+
+    @property
+    def temp_directory(self) -> str:
+        if self.is_termux:
+            return self.tmpdir or f"{self.prefix}/tmp"
+        return "/tmp"
+
+    @property
+    def has_graphical_session(self) -> bool:
+        """Whether the `session` switch step (systemd user manager + environment.d) exists."""
+        return not self.is_termux
+
+    @property
+    def secret_backend(self) -> SecretBackend:
+        return SecretBackend.FILES if self.is_termux else SecretBackend.SECRET_SERVICE
+
+    def child_environment(self) -> dict[str, str]:
+        """Variables the session sets that child processes need on this platform."""
+        if not self.is_termux:
+            return {}
+        env = {"PREFIX": self.prefix, "TMPDIR": self.temp_directory}
+        if self.ld_preload:
+            env["LD_PRELOAD"] = self.ld_preload
+        return env
+
+
+def detect(environ: Mapping[str, str]) -> Platform:
+    """Termux when the environment says so (see the module docstring), else desktop."""
+    prefix = environ.get("PREFIX") or ""
+    termux_prefix = environ.get("TERMUX__PREFIX") or ""
+    is_termux = bool(environ.get("TERMUX_VERSION")) or bool(termux_prefix) or TERMUX_PATH_MARKER in prefix
+    if not is_termux:
+        return Platform.desktop()
+    chosen = next((p for p in (prefix, termux_prefix) if p.startswith("/")), TERMUX_DEFAULT_PREFIX)
+    return Platform.termux(chosen, tmpdir=environ.get("TMPDIR"), ld_preload=environ.get("LD_PRELOAD"))
