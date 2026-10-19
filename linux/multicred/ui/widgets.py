@@ -70,6 +70,17 @@ row.mc-detail, row.mc-detail > box.header { min-height: 38px; padding-top: 0; pa
 .mc-new-row label { color: @accent_color; font-weight: 600; }
 .mc-swatch { min-width: 24px; min-height: 24px; border-radius: 999px; padding: 0; margin: 0 2px; }
 .mc-swatch:checked { box-shadow: 0 0 0 2px @window_bg_color, 0 0 0 4px @accent_color; }
+.mc-avatar-34 { min-width: 34px; min-height: 34px; font-size: 15px; }
+/* Accounts are circles, profiles rounded squares (Mac AccountAvatar vs ProfileBadge). */
+.mc-avatar.mc-avatar-round { border-radius: 999px; }
+.mc-page-header { padding: 16px 20px; }
+.mc-info-note { background: alpha(currentColor, 0.05); border-radius: 10px; padding: 14px; }
+.mc-info-note label, .mc-info-note image { color: alpha(currentColor, 0.65); }
+.mc-account-row { padding: 6px 12px; }
+.mc-editor-footer { padding: 12px 20px; }
+/* SwiftUI .controlSize(.small) buttons inside list rows. */
+button.mc-small-button { min-height: 24px; padding: 2px 10px; font-size: 12px; }
+.mc-section-footer { margin: 0 12px; }
 """ + "".join(f".mc-color-{color.value} {{ background: {color.hex}; }}\n" for color in ProfileColor)
 
 _css_loaded = False
@@ -135,6 +146,95 @@ def avatar(letter: str, color: ProfileColor, size: int = 40) -> Gtk.Label:
     widget.set_valign(Gtk.Align.CENTER)
     widget.set_halign(Gtk.Align.CENTER)
     return widget
+
+
+def account_avatar(letter: str, color: ProfileColor, size: int = 34) -> Gtk.Label:
+    """An account's avatar: a circle in its color with the white initial (Mac
+    `AccountAvatar`, Shared.swift:30-46, 34 px in the account rows)."""
+    widget = avatar(letter, color, size)
+    widget.add_css_class("mc-avatar-round")
+    return widget
+
+
+def page_header(title: str, subtitle: str | None, actions: list[Gtk.Widget]) -> tuple[Gtk.Box, Gtk.Label, Gtk.Label]:
+    """The Mac's `PageHeader` (Components.swift:141-160) inside the content: title (title2
+    semibold), gray subtitle and, on the right, the page's buttons."""
+    box = Gtk.Box(spacing=8)
+    box.add_css_class("mc-page-header")
+    texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True, valign=Gtk.Align.CENTER)
+    title_label = label(title, "title-2")
+    subtitle_label = label(subtitle or "", "dim-label", wrap=True)
+    subtitle_label.set_visible(bool(subtitle))
+    texts.append(title_label)
+    texts.append(subtitle_label)
+    box.append(texts)
+    for widget in actions:
+        widget.set_valign(Gtk.Align.CENTER)
+        box.append(widget)
+    return box, title_label, subtitle_label
+
+
+def icon_button(text: str, icon: str, on_click: Callable, *classes: str) -> Gtk.Button:
+    """A button with a leading symbol and a label (SwiftUI `Label(text, systemImage:)`)."""
+    widget = Gtk.Button(child=Adw.ButtonContent(label=text, icon_name=icon), valign=Gtk.Align.CENTER)
+    for css in classes:
+        widget.add_css_class(css)
+    widget.connect("clicked", lambda *_: on_click())
+    return widget
+
+
+def button_text(widget: Gtk.Button) -> str:
+    child = widget.get_child()
+    if isinstance(child, Adw.ButtonContent):
+        return child.get_label()
+    return widget.get_label() or ""
+
+
+def info_note(text: str, icon: str) -> Gtk.Box:
+    """The Mac's `InfoNote` (Components.swift:169-181): gray box, leading symbol, callout text."""
+    box = Gtk.Box(spacing=10)
+    box.add_css_class("mc-info-note")
+    image = Gtk.Image.new_from_icon_name(icon)
+    image.set_valign(Gtk.Align.START)
+    box.append(image)
+    text_label = label(text, wrap=True)
+    text_label.set_hexpand(True)
+    box.append(text_label)
+    box.icon_name, box.text_label = icon, text_label
+    return box
+
+
+class FormEntryRow(Adw.ActionRow):
+    """A text field of a Mac grouped Form: the label on the left and, on the right, the
+    field showing the example (`prompt:`) while empty. Adw.EntryRow has no placeholder in
+    libadwaita 1.5, so this is an ActionRow with a Gtk.Entry (or Gtk.PasswordEntry)."""
+
+    def __init__(self, title: str, text: str = "", placeholder: str = "", password: bool = False,
+                 monospace: bool = False):
+        super().__init__(title=escape(title))
+        self.plain_title, self.placeholder, self.password = title, placeholder, password
+        if password:
+            self.entry = Gtk.PasswordEntry(show_peek_icon=True, placeholder_text=placeholder)
+        else:
+            self.entry = Gtk.Entry(text=text, placeholder_text=placeholder)
+        # Same width in every row, so the fields line up like the Mac form's.
+        self.entry.set_valign(Gtk.Align.CENTER)
+        self.entry.set_width_chars(30)
+        self.entry.set_max_width_chars(30)
+        if monospace:
+            self.entry.add_css_class("monospace")
+        self.add_suffix(self.entry)
+        self.set_activatable_widget(self.entry)
+
+    def get_text(self) -> str:
+        return self.entry.get_text()
+
+    def set_text(self, text: str) -> None:
+        self.entry.set_text(text)
+
+    def set_title_text(self, title: str) -> None:
+        self.plain_title = title
+        self.set_title(escape(title))
 
 
 def set_avatar(widget: Gtk.Label, letter: str, color: ProfileColor) -> None:
