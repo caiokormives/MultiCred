@@ -341,7 +341,10 @@ class MainWindowSmokeTests(unittest.TestCase):
             window.nav.pop()
             page.select_tab("claude")
             page.request_login("add", None)
-            seen["login_toast"] = window.last_toast
+            seen["login_form"] = window.new_account_form is not None
+            if window.new_account_form is not None:
+                window.new_account_form.force_close()
+                window.new_account_form = None
 
         def other_actions(app):
             window = app.window
@@ -420,7 +423,7 @@ class MainWindowSmokeTests(unittest.TestCase):
 
         self.assertEqual(seen["email_error"], "E-mail inválido.")
         self.assertFalse(seen["coauthor"])
-        self.assertEqual(seen["login_toast"], "Login do Claude pela janela: em breve")
+        self.assertTrue(seen["login_form"], "Adicionar conta Claude… asks for the new account")
         self.assertEqual(seen["folder_page"], "~/.claude-empresa")
         self.assertTrue(seen["dialog"], "Trocar valor opens a dialog")
         self.assertIsNone(seen["key_secret_after_remove"], "removing a key deletes its secret")

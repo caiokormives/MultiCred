@@ -86,6 +86,11 @@ class MainWindow(Adw.ApplicationWindow):
         widgets.load_css()
         self.model = app.model
         self.last_toast = None
+        # Login flows (S-07) opened from Contas, the tray or the profile page.
+        self.new_account_form = None
+        self.login_dialog = None
+        self.last_login_result = None
+        self.folder_login_command = None
         self._toast = None
         self.toasts = Adw.ToastOverlay()
         view = Adw.ToolbarView()
@@ -237,14 +242,121 @@ class MainWindow(Adw.ApplicationWindow):
         self.nav.pop_to_tag("main")
         return self.push(ProfileEditorPage(self, profile_id))
 
-    # MARK: hooks for later slices
+    # MARK: logins (pseudo-terminal flows of S-07)
 
     def on_login_requested(self, kind: str, account) -> None:
-        """Login flows in a pseudo-terminal (S-07) plug in here. kinds: "add" (new Claude
-        account), "login" (sign an existing Claude account in again), "folder" (a Claude
-        folder's own login; `account` is the folder or None), "github" (gh auth login)."""
-        what = "do GitHub" if kind == "github" else "do Claude"
-        self.show_toast(f"Login {what} pela janela: em breve")
+        """kinds: "add" (new Claude account), "login" (sign an existing Claude account in
+        again), "folder" (a Claude folder's own login; `account` is the folder or None),
+        "github" (gh auth login)."""
+        if kind == "add":
+            self._ask_new_claude_account()
+        elif kind == "login" and account is not None:
+            from ..core.models import ClaudeAccountKind
+            from .pages.login import LoginKind
+            mode = LoginKind.CLAUDE_TOKEN if account.kind == ClaudeAccountKind.TOKEN else LoginKind.CLAUDE_LOGIN
+            self._open_login(mode, target=account)
+        elif kind == "folder":
+            self._show_folder_login(account)
+        elif kind == "github":
+            from .pages.login import LoginKind
+            self._open_login(LoginKind.GITHUB)
+
+    def _ask_new_claude_account(self) -> None:
+        """Nickname, optional e-mail and the kind, then the login dialog (like the Mac's
+        AddClaudeAccountPage, as one small form)."""
+        rows = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        rows.add_css_class("boxed-list")
+        nickname = Adw.EntryRow(title="Apelido")
+        email = Adw.EntryRow(title="E-mail (opcional, só para exibir)")
+        kind = Adw.ComboRow(title="Tipo", model=Gtk.StringList.new(
+            ["Login completo (troca ao vivo, como o /login)", "Token (setup-token, só terminais novos)"]))
+        for row in (nickname, email, kind):
+            rows.append(row)
+        dialog = Adw.AlertDialog(heading="Adicionar conta Claude",
+                                 body="O login acontece numa pasta temporária; agents, skills e conversas "
+                                      "continuam na pasta de cada perfil.")
+        dialog.set_extra_child(rows)
+        dialog.add_response("cancel", "Cancelar")
+        dialog.add_response("continue", "Continuar")
+        dialog.set_response_appearance("continue", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("continue")
+
+        def responded(_dialog, response):
+            self.new_account_form = None
+            if response == "continue":
+                self.confirm_new_account(nickname.get_text(), email.get_text(),
+                                         "token" if kind.get_selected() == 1 else "login")
+
+        dialog.connect("response", responded)
+        self.new_account_form = dialog
+        dialog.present(self)
+
+    def confirm_new_account(self, nickname: str, email: str | None, kind: str) -> None:
+        from ..core.claude.login_flow import NewClaudeAccount
+        from ..core.models import ProfileColor
+        from .pages.login import LoginKind
+
+        nickname, email = nickname.strip(), (email or "").strip() or None
+        if not nickname:
+            self.show_toast("Dê um apelido para a conta")
+            return
+        palette = list(ProfileColor)
+        used = len(self.model.config.claude_accounts) if self.model.config else 0
+        target = NewClaudeAccount(nickname, email, palette[used % len(palette)])
+        self._open_login(LoginKind.CLAUDE_TOKEN if kind == "token" else LoginKind.CLAUDE_LOGIN, target=target)
+
+    def _open_login(self, kind, target=None) -> None:
+        from .pages.login import LoginDialog
+
+        self.last_login_result = None
+        self.login_dialog = LoginDialog(self.model, kind, self.login_finished, target=target)
+        self.login_dialog.present(self)
+
+    def login_finished(self, result) -> None:
+        """Called once per dialog: on success, or when it closes without one."""
+        from .pages.login import LoginKind
+
+        self.last_login_result = result
+        if not result.success:
+            return
+        if result.kind == LoginKind.GITHUB:
+            # The Mac adds the logins gh now knows (addMissingGitHubAccounts).
+            def imported(added, error):
+                if error is None and added:
+                    self.show_toast(f"Conta do GitHub {result.login} adicionada")
+            self.model.import_github_accounts(imported)
+            self.show_toast(f"Entrou no GitHub como {result.login}" if result.login else "Entrou no GitHub")
+            return
+        account = result.account
+        self.model.notify()
+        self.show_toast(f"Conta Claude {account.nickname} conectada")
+        # Signed in again while in use: the live login (or the token's removal) must reach the folder.
+        if account is not None and self.model.state.applied_claude_account_id == account.id:
+            self.model.switch_claude_only(account.id, lambda _result, _error: None)
+
+    def _show_folder_login(self, config_dir: str | None) -> None:
+        """A folder's own login: the user runs Claude Code's login in a terminal."""
+        from ..core.quoting import single_quoted
+
+        command = "claude auth login" if config_dir is None else \
+            f"CLAUDE_CONFIG_DIR={single_quoted(config_dir)} claude auth login"
+        self.folder_login_command = command
+        dialog = Adw.AlertDialog(heading="Entrar na pasta do Claude",
+                                 body="Rode este comando num terminal e conclua o login no navegador:")
+        label = Gtk.Label(label=command, selectable=True, wrap=True, xalign=0)
+        label.add_css_class("monospace")
+        dialog.set_extra_child(label)
+        dialog.add_response("close", "Fechar")
+        dialog.add_response("copy", "Copiar comando")
+        dialog.set_response_appearance("copy", Adw.ResponseAppearance.SUGGESTED)
+
+        def responded(_dialog, response):
+            if response == "copy":
+                self.get_clipboard().set(command)
+                self.show_toast("Comando copiado")
+
+        dialog.connect("response", responded)
+        dialog.present(self)
 
     def run_verification(self) -> None:
         """"Verificar de novo": a deep check (gh tokens too) on the page when it is open."""
