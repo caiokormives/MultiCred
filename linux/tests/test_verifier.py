@@ -5,6 +5,7 @@ write them, git is the real git (GIT_CONFIG_NOSYSTEM, temporary HOME), gh and
 `systemctl --user` are the stateful fakes of tests/test_engine.FakeSystem.
 """
 
+import os
 import subprocess
 
 from multicred.core.adapters.process_scanner import FixedProcessScanner
@@ -202,6 +203,21 @@ class VerifierTests(VerifierTestCase):
         self.assertTrue(self.verifier.fix(item).is_consistent)
         self.assertIn(f"CLAUDE_CONFIG_DIR={self.claude_dir}",
                       (self.home / ".config/environment.d/90-multicred.conf").read_text())
+
+    def test_a_folder_environment_d_cannot_hold_is_a_problem_without_automatic_fix(self):
+        """S-19: offering "Corrigir" would never help: systemd drops the variable at the
+        next login whatever MultiCred does. The user must rename the folder."""
+        folder = f"{self.home}/.claude-$cliente"
+        os.makedirs(folder)
+        self.profile.claude_config_dir = folder
+        SwitchEngine(self.environment, FakeTools()).switch_profile(self.profile.id, self.config)
+        report = self.verify()
+        item = self.check(report, "claude.session")
+        self.assertEqual(item.status, CheckStatus.PROBLEM)
+        self.assertIsNone(item.fix)
+        self.assertIn("Renomeie a pasta", item.hint)
+        self.assertIn("environment.d", item.hint)
+        self.assertNotIn("claude.session", [c.id for c in report.fixable])
 
     def test_stale_env_file_is_fixed_by_reapplying(self):
         text = self.paths.env_sh.read_text().replace(f"generation={self.state.generation}", "generation=0")

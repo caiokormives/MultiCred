@@ -73,6 +73,22 @@ class ValidationTests(unittest.TestCase):
         key.env_var = "PATH"
         self.assertIn(Issue("reservedEnvVar", key.id, "PATH"), issues_in(config))
 
+    def test_shell_and_loader_control_variables_are_reserved(self):
+        """S-16: env.sh exports API keys into every shell; a key named after a variable
+        that controls the shell, the dynamic loader or the desktop session would let a
+        "secret" run code or break every terminal."""
+        names = ["PROMPT_COMMAND", "IFS", "BASH_ENV", "ENV", "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT",
+                 "PS0", "PS1", "PS2", "PS3", "PS4", "ZDOTDIR", "SHELLOPTS", "BASHOPTS", "CDPATH", "HISTFILE",
+                 "PWD", "OLDPWD", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_RUNTIME_DIR", "SSH_AUTH_SOCK",
+                 "DISPLAY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS", "FPATH", "GLOBIGNORE"]
+        for name in names:
+            with self.subTest(name=name):
+                config = sample_config()
+                key = config.api_keys[0]
+                key.env_var = name
+                self.assertIn(Issue("reservedEnvVar", key.id, name), issues_in(config))
+        self.assertEqual(issues_in(sample_config()), [], "ordinary key names still pass")
+
     def test_two_keys_with_same_variable_in_one_profile(self):
         config = sample_config()
         second = APIKeyAccount(nickname="Pessoal", provider=APIProvider.OPENAI, color=ProfileColor.ORANGE)

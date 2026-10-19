@@ -13,7 +13,7 @@ import unittest
 from multicred.core.adapters.github_cli import GitHubLogin
 from multicred.core.editors import ConfigEditor, EditorError
 from multicred.core.models import (APIKeyAccount, APIProvider, ClaudeAccount, ClaudeAccountKind, Config,
-                                   GitHubAccount, GitIdentity, Profile, ProfileColor)
+                                   GitHubAccount, GitIdentity, Profile, ProfileColor, uuid_text)
 from multicred.core.storage import ConfigRepository, dumps
 from multicred.core.tools import Tool
 from multicred.core.validation import issues_in
@@ -261,6 +261,28 @@ class AppModelEditTests(SafeTestCase):
         self.assertEqual(self.model.config.profiles[0].name, "Empresa")
         self.assertTrue(self.notified)
 
+    def test_removing_a_key_of_the_active_profile_reapplies_it_so_terminals_drop_it(self):
+        from multicred.core.models import APIKeyAccount, APIProvider, ActiveState
+        key = APIKeyAccount(nickname="O", provider=APIProvider.OPENAI, color=ProfileColor.INDIGO)
+        self.secrets.set_secret(b"sk", key.secret_account)
+        config = self.model.config
+        config.api_keys.append(key)
+        config.profiles[0].api_key_ids.append(key.id)
+        self.repository.save(config)
+        self.model.state = ActiveState(profile_id=self.profile.id, generation=1)
+        reapplied = []
+        self.model.reapply_active_profile = lambda on_done=None: reapplied.append(True) or True
+        self.model.remove_api_key(key.id)
+        self.assertEqual(reapplied, [True], "the active profile's env files drop the key now")
+
+        other = APIKeyAccount(nickname="G", provider=APIProvider.GEMINI, color=ProfileColor.ORANGE)
+        self.secrets.set_secret(b"g", other.secret_account)
+        config = self.model.config
+        config.api_keys.append(other)
+        self.repository.save(config)
+        self.model.remove_api_key(other.id)
+        self.assertEqual(reapplied, [True], "a key no profile in use exported needs no re-apply")
+
     def test_failed_edit_keeps_config_and_file(self):
         before = self.repository.path.read_bytes()
         with self.assertRaises(EditorError):
@@ -326,6 +348,53 @@ class AppModelEditTests(SafeTestCase):
         self.assertEqual(self.saved()["claudeAccounts"], [])
         self.assertNotIn("claudeAccountId", self.saved()["profiles"][0])
         self.assertEqual(self.secrets.all_accounts(), [])
+
+    # MARK: S-13: removing a login account is transactional
+
+    def live_login_account(self):
+        from multicred.core.claude.login_vault import ClaudeLoginRecord, ClaudeLoginSwitcher
+        account = ClaudeAccount(nickname="Dev", color=ProfileColor.BLUE, kind=ClaudeAccountKind.LOGIN)
+        self.secrets.set_secret(b"sk-ant-oat01-leftover-token-xxxxxxxx", account.secret_account)
+        folder = str(self.home / ".claude-p")
+        (self.home / ".claude-p").mkdir()
+        self.claude_store.write_folder_item(folder, b'{"claudeAiOauth":{"accessToken":"own"}}')
+        switcher = ClaudeLoginSwitcher(self.environment)
+        switcher.store_new_account(account.id, ClaudeLoginRecord(b'{"accessToken":"sk-ant-oat01-dev"}', None))
+        switcher.place(account.id, folder)
+        self.model.edit(lambda c: ConfigEditor.update_claude_account(account, c))
+        return account, folder, switcher
+
+    def test_remove_login_account_keeps_everything_when_saving_fails(self):
+        account, folder, switcher = self.live_login_account()
+        self.repository.path.unlink()
+        self.repository.path.mkdir()  # config.json is now a directory: the atomic write refuses it
+        with self.assertRaises(OSError):
+            self.model.remove_claude_account(account.id)
+        self.assertEqual([a.id for a in self.model.config.claude_accounts], [account.id])
+        self.assertIsNotNone(self.claude_store.read_vault(uuid_text(account.id)), "the login is not lost")
+        self.assertIsNotNone(self.secrets.stored_value(account.secret_account))
+        live = json.loads(self.claude_store.read_folder_item(folder))["claudeAiOauth"]["accessToken"]
+        self.assertEqual(live, "sk-ant-oat01-dev", "the folder holds the account again, as the config says")
+        self.assertEqual(switcher.occupancy().account_in(folder), account.id)
+
+    def test_remove_login_account_with_an_unreadable_claude_folders_file_removes_nothing(self):
+        from multicred.core.claude import login_vault
+        from multicred.core.paths import AppPaths
+        account, folder, _switcher = self.live_login_account()
+        AppPaths(self.environment).claude_folders.write_text("{broken")
+        with self.assertRaises(login_vault.OccupancyUnreadable):
+            self.model.remove_claude_account(account.id)
+        self.assertEqual([a["id"] for a in self.saved()["claudeAccounts"]], [uuid_text(account.id)])
+        self.assertIsNotNone(self.claude_store.read_vault(uuid_text(account.id)))
+
+    def test_remove_login_account_gives_the_folder_back_then_deletes_the_login(self):
+        account, folder, switcher = self.live_login_account()
+        self.model.remove_claude_account(account.id)
+        self.assertEqual(self.saved()["claudeAccounts"], [])
+        self.assertIsNone(self.claude_store.read_vault(uuid_text(account.id)))
+        self.assertIsNone(self.secrets.stored_value(account.secret_account))
+        self.assertEqual(json.loads(self.claude_store.read_folder_item(folder))["claudeAiOauth"], {"accessToken": "own"})
+        self.assertIsNone(switcher.occupancy().account_in(folder))
 
 
 if __name__ == "__main__":

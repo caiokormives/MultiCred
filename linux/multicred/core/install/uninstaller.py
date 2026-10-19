@@ -26,7 +26,7 @@ from pathlib import Path
 
 from ..adapters.session_env import ENVIRONMENT_D_FILE, SYSTEMCTL
 from ..claude import attribution
-from ..claude.login_vault import ClaudeFolderOccupancy, ClaudeLoginSwitcher
+from ..claude.login_vault import ClaudeFolderOccupancy, ClaudeLoginSwitcher, OccupancyUnreadable
 from ..models import ClaudeAccount, ClaudeAccountKind, Config, uuid_text
 from ..paths import AppPaths
 from ..runner import CommandRequest, run_checked
@@ -160,11 +160,25 @@ class Uninstaller:
         for profile in self.config.profiles:
             if profile.claude_config_dir not in folders:
                 folders.append(profile.claude_config_dir)
-        for key in ClaudeLoginSwitcher(self.environment).occupancy().account_by_folder:
+        for key in self._occupancy().account_by_folder:
             folder = ClaudeFolderOccupancy.config_dir_for_key(key)
             if folder not in folders:
                 folders.append(folder)
         return folders
+
+    def _occupancy(self) -> ClaudeFolderOccupancy:
+        """Unreadable reads as empty here; `_restore_claude` reports it and keeps the vault."""
+        try:
+            return ClaudeLoginSwitcher(self.environment).occupancy()
+        except OccupancyUnreadable:
+            return ClaudeFolderOccupancy()
+
+    def _occupancy_readable(self) -> bool:
+        try:
+            ClaudeLoginSwitcher(self.environment).occupancy()
+            return True
+        except OccupancyUnreadable:
+            return False
 
     def _login_accounts(self) -> list[ClaudeAccount]:
         return [a for a in self.config.claude_accounts if a.kind == ClaudeAccountKind.LOGIN]
@@ -202,7 +216,7 @@ class Uninstaller:
     def preview(self, remove_claude_folders: bool = False) -> list[UninstallItem]:
         """Everything apply() would remove, for the confirmation. Changes nothing, runs nothing."""
         items: list[UninstallItem] = []
-        for key in ClaudeLoginSwitcher(self.environment).occupancy().account_by_folder:
+        for key in self._occupancy().account_by_folder:
             folder = ClaudeFolderOccupancy.config_dir_for_key(key)
             items.append(UninstallItem("claudeLogin", self._folder_name(folder)))
         if remove_claude_folders:
@@ -229,7 +243,7 @@ class Uninstaller:
         if count:
             items.append(UninstallItem("secrets", count=count))
         logins = self._login_accounts()
-        if logins:
+        if logins and self._occupancy_readable():
             items.append(UninstallItem("claudeVault", count=len(logins)))
         if self._has_backups():
             items.append(UninstallItem("backups", self._abbreviate(self._backups_destination())))
@@ -260,14 +274,30 @@ class Uninstaller:
 
     def _restore_claude(self, report: UninstallReport) -> None:
         switcher = ClaudeLoginSwitcher(self.environment)
+        try:
+            occupancy = switcher.occupancy()
+        except OccupancyUnreadable as error:
+            # Which folder holds which account is unknown: the vault may hold the only
+            # copy of a folder's own login, so it is kept whole.
+            occupancy = None
+            report.problems.append(
+                f"{error} Os logins do Claude guardados pelo MultiCred foram mantidos no chaveiro do sistema "
+                "(serviço app.multicred.claude-login), e as pastas do Claude ficaram como estão.")
         # A folder holding a MultiCred login gets its own login back first: the own
-        # login lives in the vault that is emptied right after.
-        for key in list(switcher.occupancy().account_by_folder):
+        # login lives in the vault that is emptied right after. A folder whose restore
+        # fails keeps both vault entries it still needs: its own login (the only copy)
+        # and the account that is still live in it.
+        kept: set[str] = set()
+        for key, account in list(occupancy.account_by_folder.items() if occupancy else ()):
             folder = ClaudeFolderOccupancy.config_dir_for_key(key)
             try:
                 switcher.place(None, folder)
             except Exception as error:
-                report.problems.append(f"{self._folder_name(folder)}: {error}")
+                kept.update({ClaudeLoginSwitcher.own_login_key(folder), uuid_text(account)})
+                report.problems.append(
+                    f"{self._folder_name(folder)}: não foi possível devolver o login próprio da pasta ({error}). "
+                    f"Ela continua logada na conta {self._account_name(account)}; o login original dela e o "
+                    "dessa conta foram mantidos no chaveiro do sistema, nada foi perdido.")
         folders = self._claude_folders()
         # Undo the co-author opt-out MultiCred wrote (only that exact value, D38).
         for folder in folders:
@@ -282,15 +312,21 @@ class Uninstaller:
                 continue
             except OSError as error:
                 report.problems.append(f"{self._abbreviate(path)}: {error}")
+        if occupancy is None:
+            return
         keys = [uuid_text(a.id) for a in self._login_accounts()]
         keys += [ClaudeLoginSwitcher.own_login_key(folder) for folder in folders]
         store = self.environment.claude_credentials
-        for key in keys:
+        for key in (k for k in keys if k not in kept):
             try:
                 store.delete_vault(key)
             except Exception as error:
                 report.problems.append(f"Cofre de logins do Claude: {error}")
                 break
+
+    def _account_name(self, account) -> str:
+        found = next((a for a in self.config.claude_accounts if a.id == account), None)
+        return f"\"{found.nickname}\"" if found is not None else uuid_text(account)
 
     def _log_out_and_delete(self, folder: str, report: UninstallReport) -> None:
         """D12: Claude Code logs the folder out itself, then the folder goes. A failed

@@ -5,6 +5,7 @@ import json
 import os
 import uuid
 
+from multicred.core.claude import account_editor
 from multicred.core.claude.account_editor import (
     ClaudeAccountError, ClaudeFolderChoice, add_login_account, add_token_account, discard_replaced_token,
     is_plausible_token, prepare_folder, profiles_using, remove, replace_login, replace_token,
@@ -106,12 +107,15 @@ class ClaudeAccountEditorTests(SafeTestCase):
                                        claude_config_dir=f"{self.home}/.claude-pessoal", claude_account_id=account.id))
         self.assertEqual([p.name for p in profiles_using(account.id, config)], ["Pessoal"])
 
-        updated = remove(account.id, config, self.secrets)
+        updated = remove(account.id, config)
         self.assertEqual(updated.claude_accounts, [])
         self.assertIsNone(updated.profiles[0].claude_account_id)
         self.assertEqual(updated.profiles[0].claude_config_dir, f"{self.home}/.claude-pessoal", "the profile keeps its folder")
-        self.assertIsNone(self.secrets.stored_value(account.secret_account))
+        self.assertIsNotNone(self.secrets.stored_value(account.secret_account),
+                             "S-13: remove is pure; the token goes only after the caller saved")
         self.assertEqual(config.profiles[0].claude_account_id, account.id, "the input config is not mutated")
+        account_editor.discard_removed_account(account, self.secrets, ClaudeLoginSwitcher(self.environment))
+        self.assertIsNone(self.secrets.stored_value(account.secret_account))
 
     # MARK: login accounts (D39)
 
@@ -143,10 +147,38 @@ class ClaudeAccountEditorTests(SafeTestCase):
         folder.mkdir()
         self.claude_store.write_folder_item(str(folder), b'{"claudeAiOauth":{"accessToken":"own"},"mcpOAuth":{}}')
         switcher.place(account.id, str(folder))
-        updated = remove(account.id, config, self.secrets, switcher)
-        self.assertEqual(updated.claude_accounts, [])
+        # S-13: (1) the folder gets its own login back, (2) the caller saves, (3) only then
+        # the vault entry goes.
+        account_editor.release_login(account, switcher)
         self.assertEqual(json.loads(self.claude_store.read_folder_item(str(folder)))["claudeAiOauth"], {"accessToken": "own"})
+        self.assertIsNotNone(self.claude_store.read_vault(uuid_text(account.id)), "kept until the save")
+        updated = remove(account.id, config)
+        self.assertEqual(updated.claude_accounts, [])
+        self.assertIsNotNone(self.claude_store.read_vault(uuid_text(account.id)), "remove is pure")
+        account_editor.discard_removed_account(account, self.secrets, switcher)
         self.assertIsNone(self.claude_store.read_vault(uuid_text(account.id)))
+
+    def test_releasing_a_live_login_can_be_undone_when_the_save_fails(self):
+        switcher = ClaudeLoginSwitcher(self.environment)
+        config, account = add_login_account("Dev", None, ProfileColor.BLUE, RECORD, Config(), switcher)
+        folder = self.home / ".claude-p"
+        folder.mkdir()
+        self.claude_store.write_folder_item(str(folder), b'{"claudeAiOauth":{"accessToken":"own"},"mcpOAuth":{}}')
+        switcher.place(account.id, str(folder))
+        undo = account_editor.release_login(account, switcher)
+        undo()
+        live = json.loads(self.claude_store.read_folder_item(str(folder)))["claudeAiOauth"]
+        self.assertEqual(live["accessToken"], "sk-ant-oat01-login", "the account is live there again")
+        self.assertEqual(switcher.occupancy().account_in(str(folder)), account.id)
+
+    def test_releasing_an_account_that_lives_nowhere_changes_nothing(self):
+        switcher = ClaudeLoginSwitcher(self.environment)
+        _config, account = add_login_account("Dev", None, ProfileColor.BLUE, RECORD, Config(), switcher)
+        _config, token_account = add_token_account("Marco", None, ProfileColor.TEAL, TOKEN, Config(), self.secrets)
+        account_editor.release_login(account, switcher)()
+        account_editor.release_login(token_account, switcher)()
+        self.assertEqual(self.claude_store.folders, {})
+        self.assertIsNotNone(self.claude_store.read_vault(uuid_text(account.id)))
 
     def test_real_mode_allows_folders_outside_home(self):
         environment = dataclasses.replace(self.environment, mode="real")

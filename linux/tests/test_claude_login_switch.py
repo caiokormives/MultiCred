@@ -12,6 +12,7 @@ from multicred.core import claude_paths
 from multicred.core.claude.credentials import (
     CLAUDE_LOGIN_SERVICE, FileClaudeCredentialStore, InMemoryClaudeCredentialStore, InMemoryVaultBackend,
 )
+from multicred.core.claude import login_vault
 from multicred.core.claude.login_vault import (
     ClaudeFolderOccupancy, ClaudeLoginRecord, ClaudeLoginSwitcher, NoLoginInFolder,
 )
@@ -131,6 +132,36 @@ class LoginSwitchCases:
         self.assertEqual(self.folder_access_token(self.personal_dir), "sk-ant-oat01-own")
         self.assertEqual(self.displayed_email(self.personal_dir), "own@x.com")
         self.assertEqual(self.item(self.personal_dir)["mcpOAuth"], {}, "the folder's current MCP logins stay")
+
+    def own_login_without_displayed_account(self):
+        """The folder is logged in, but its .claude.json has no oauthAccount (yet)."""
+        Path(f"{self.personal_dir}/.claude.json").write_bytes(as_json({"numStartups": 7}))
+        engine = self.engine()
+        engine.switch_profile(self.personal.id, self.config)
+        engine.switch_claude_only(self.dev.id, self.config)
+        self.assertEqual(self.displayed_email(self.personal_dir), "dev@x.com")
+        return engine
+
+    def test_the_own_login_without_a_displayed_account_clears_the_previous_one(self):
+        """S-17: going back to a folder login saved without oauthAccount must not keep
+        showing the account that was there before."""
+        engine = self.own_login_without_displayed_account()
+        engine.switch_claude_only(ClaudeFolder.override_for(None, self.personal), self.config)
+        self.assertEqual(self.folder_access_token(self.personal_dir), "sk-ant-oat01-own")
+        state = json.loads(Path(f"{self.personal_dir}/.claude.json").read_bytes())
+        self.assertNotIn("oauthAccount", state, "Claude Code no longer shows dev@x.com")
+        self.assertEqual(state["numStartups"], 7, "the rest of .claude.json is kept")
+
+    def test_clearing_the_displayed_account_is_undone_with_the_switch(self):
+        engine = self.own_login_without_displayed_account()
+        env_sh = AppPaths(self.environment).env_sh
+        env_sh.unlink()
+        env_sh.mkdir()
+        with self.assertRaises(StepFailed) as raised:
+            engine.switch_claude_only(ClaudeFolder.override_for(None, self.personal), self.config)
+        self.assertTrue(raised.exception.rollback.complete)
+        self.assertEqual(self.folder_access_token(self.personal_dir), "sk-ant-oat01-dev")
+        self.assertEqual(self.displayed_email(self.personal_dir), "dev@x.com")
 
     def test_an_account_lives_in_one_folder_at_a_time(self):
         engine = self.engine()
@@ -386,7 +417,7 @@ class OccupancyTests(SafeTestCase):
         self.assertEqual(ClaudeFolderOccupancy.from_dict(occupancy.to_dict()), occupancy)
         self.assertEqual(occupancy.to_dict(), {"accountByFolder": {"~/.claude": uuid_text(account)}})
 
-    def test_file_is_private_and_a_broken_file_reads_as_empty(self):
+    def test_file_is_private_and_a_missing_file_reads_as_empty(self):
         switcher = ClaudeLoginSwitcher(self.environment, self.claude_store)
         self.assertEqual(switcher.occupancy(), ClaudeFolderOccupancy())
         dev = ClaudeAccount(nickname="d", color=ProfileColor.RED)
@@ -396,8 +427,43 @@ class OccupancyTests(SafeTestCase):
         switcher.place(dev.id, str(folder))
         path = AppPaths(self.environment).claude_folders
         self.assertEqual(self.mode_of(path), 0o600)
-        path.write_text("{broken")
-        self.assertEqual(switcher.occupancy(), ClaudeFolderOccupancy())
+
+    # MARK: S-18: a broken occupancy file blocks instead of overwriting logins
+
+    def broken_occupancy(self):
+        """dev is live in a folder whose own login is saved; then the file breaks."""
+        switcher = ClaudeLoginSwitcher(self.environment, self.claude_store)
+        self.dev = ClaudeAccount(nickname="d", color=ProfileColor.RED)
+        switcher.store_new_account(self.dev.id, ClaudeLoginRecord(as_json(oauth("d")), None))
+        self.folder = str(self.home / ".claude-d")
+        os.makedirs(self.folder)
+        self.claude_store.write_folder_item(self.folder, as_json({"claudeAiOauth": oauth("own")}))
+        switcher.place(self.dev.id, self.folder)
+        AppPaths(self.environment).claude_folders.write_text("{broken")
+        return switcher
+
+    def test_a_broken_file_is_an_error_not_an_empty_occupancy(self):
+        switcher = self.broken_occupancy()
+        with self.assertRaises(login_vault.OccupancyUnreadable):
+            switcher.occupancy()
+        for content in ("[]", '{"accountByFolder": {"~/.claude": "not-a-uuid"}}', '{"accountByFolder": 3}'):
+            AppPaths(self.environment).claude_folders.write_text(content)
+            with self.subTest(content=content), self.assertRaises(login_vault.OccupancyUnreadable):
+                switcher.occupancy()
+
+    def test_place_remove_and_replace_refuse_and_overwrite_no_login(self):
+        switcher = self.broken_occupancy()
+        vault, folders = dict(self.claude_store.vault), dict(self.claude_store.folders)
+        with self.assertRaises(login_vault.OccupancyUnreadable):
+            switcher.place(None, self.folder)
+        with self.assertRaises(login_vault.OccupancyUnreadable):
+            switcher.place(self.dev.id, None)
+        with self.assertRaises(login_vault.OccupancyUnreadable):
+            switcher.remove_account(self.dev.id)
+        with self.assertRaises(login_vault.OccupancyUnreadable):
+            switcher.replace_login(self.dev.id, ClaudeLoginRecord(as_json(oauth("new")), None))
+        self.assertEqual(self.claude_store.vault, vault, "no saved login was overwritten or deleted")
+        self.assertEqual(self.claude_store.folders, folders)
 
 
 if __name__ == "__main__":

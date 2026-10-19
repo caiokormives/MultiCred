@@ -20,9 +20,23 @@ class Issue:
     detail: str | None = None
 
 
+# env.sh/env.fish export API keys into every shell, so a key may never be named after
+# a variable that controls the shell (code run at each prompt, word splitting, startup
+# files), the dynamic loader, or the desktop session the terminal talks to.
 RESERVED_ENV_VARS = {
     "PATH", "HOME", "SHELL", "USER", "LOGNAME", "TMPDIR", "LANG", "TERM",
     "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN", "GH_CONFIG_DIR", "GH_TOKEN", "GITHUB_TOKEN",
+    # shells
+    "PROMPT_COMMAND", "PS0", "PS1", "PS2", "PS3", "PS4", "PROMPT", "RPROMPT", "IFS", "BASH_ENV", "ENV",
+    "ZDOTDIR", "SHELLOPTS", "BASHOPTS", "CDPATH", "FPATH", "GLOBIGNORE", "HISTFILE", "HISTCONTROL",
+    "HISTSIZE", "HISTFILESIZE", "PWD", "OLDPWD", "MAIL", "MAILPATH", "POSIXLY_CORRECT", "INPUTRC",
+    "LC_ALL", "LANGUAGE",
+    # dynamic loader
+    "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT",
+    # desktop session
+    "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "XDG_RUNTIME_DIR",
+    "XDG_CONFIG_DIRS", "XDG_DATA_DIRS", "SSH_AUTH_SOCK", "DISPLAY", "WAYLAND_DISPLAY",
+    "DBUS_SESSION_BUS_ADDRESS",
 }
 
 _ENV_VAR = re.compile(r"[A-Z_][A-Z0-9_]*")

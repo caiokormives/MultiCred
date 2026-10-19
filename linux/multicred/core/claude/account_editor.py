@@ -12,7 +12,7 @@ import uuid
 from dataclasses import dataclass
 
 from .. import claude_paths
-from ..models import ClaudeAccount, ClaudeAccountKind, Config, ProfileColor
+from ..models import ClaudeAccount, ClaudeAccountKind, Config, ProfileColor, uuid_text
 from ..validation import issues_in
 
 _TOKEN = re.compile(r"[A-Za-z0-9._\-]+")
@@ -180,24 +180,46 @@ def discard_replaced_token(account: ClaudeAccount, secrets) -> None:
 
 # MARK: removal
 
-def remove(account_id: uuid.UUID, config: Config, secrets, switcher=None) -> Config:
-    """Removes the account and its secret; profiles using it fall back to their
-    folder's own login. A login account that is live in a folder gives the folder
-    its own login back first (needs `switcher`); if that fails nothing is removed."""
-    account = config.claude_account(account_id)
-    if account is not None and account.kind == ClaudeAccountKind.LOGIN and switcher is not None:
-        switcher.remove_account(account_id)
-    if account is not None:
-        try:
-            secrets.delete_item(account.secret_account)
-        except Exception:
-            pass
+def release_login(account: ClaudeAccount, switcher):
+    """Step 1 of removing an account: a login account live in a folder gives the folder
+    its own login back (its rotated login is saved to its vault entry by the switch).
+    Returns the undo, for when the save that follows fails; raises if the folder could
+    not be given back (then nothing is removed)."""
+    if account.kind != ClaudeAccountKind.LOGIN:
+        return lambda: None
+    key = switcher.occupancy().key_holding(account.id)
+    if key is None:
+        return lambda: None
+    from .login_vault import ClaudeFolderOccupancy
+    return switcher.place(None, ClaudeFolderOccupancy.config_dir_for_key(key))
+
+
+def remove(account_id: uuid.UUID, config: Config) -> Config:
+    """Step 2: the configuration without the account; profiles using it fall back to
+    their folder's own login. Pure: the vault entry and the token stay until the caller
+    has saved this config and calls `discard_removed_account` (step 3), so a failed
+    save loses nothing."""
     updated = _copy(config)
     updated.claude_accounts = [a for a in updated.claude_accounts if a.id != account_id]
     for profile in updated.profiles:
         if profile.claude_account_id == account_id:
             profile.claude_account_id = None
     return updated
+
+
+def discard_removed_account(account: ClaudeAccount, secrets, switcher) -> None:
+    """Step 3, after the save: deletes the account's saved login and its token (a login
+    account may still hold the token it had before being signed in again). A leftover
+    is harmless: no account in the configuration points at it any more."""
+    if account.kind == ClaudeAccountKind.LOGIN:
+        try:
+            switcher.store.delete_vault(uuid_text(account.id))
+        except Exception:
+            pass
+    try:
+        secrets.delete_item(account.secret_account)
+    except Exception:
+        pass
 
 
 def profiles_using(account_id: uuid.UUID, config: Config) -> list:

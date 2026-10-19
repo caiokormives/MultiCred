@@ -8,6 +8,7 @@ import subprocess
 from multicred.core.adapters.session_env import (
     ENVIRONMENT_D_FILE, SessionEnvironment, environment_d_line, parse_show_environment,
 )
+from multicred.core.adapters import session_env
 from multicred.core.runner import CommandResult
 from tests.support import SafeTestCase
 
@@ -56,6 +57,37 @@ class ParsingTests(SafeTestCase):
                          "CLAUDE_CONFIG_DIR=/h/.claude-x y's")
         for unsafe in ["/h/$HOME", "/h/back\\slash", '/h/"q"', "/h/`x`", " /lead", "/trail "]:
             self.assertIsNone(environment_d_line("CLAUDE_CONFIG_DIR", unsafe), unsafe)
+
+    def test_representable_is_the_same_rule_as_environment_d_line(self):
+        """S-19: the engine and Verificar ask the adapter instead of copying its regex."""
+        self.assertTrue(session_env.representable("/h/.claude-x y's"))
+        for unsafe in ["/h/$HOME", "/h/back\\slash", '/h/"q"', "/h/`x`", " /lead", "/trail ", ""]:
+            self.assertFalse(session_env.representable(unsafe), unsafe)
+
+
+class UnrepresentableFolderLogTests(SafeTestCase):
+    def test_the_switch_logs_a_warning_when_environment_d_cannot_hold_the_folder(self):
+        """S-19: the graphical session would go back to ~/.claude at the next login."""
+        from multicred.core.engine.switch_engine import SwitchEngine
+        from multicred.core.models import Config, Profile, ProfileColor
+        from tests.test_engine import FakeSystem, FakeTools
+
+        class Log:
+            def __init__(self):
+                self.lines = []
+
+            def log(self, level, message):
+                self.lines.append((level, message))
+
+        system = FakeSystem(self.runner)
+        folder = f"{self.home}/.claude-$cliente"
+        os.makedirs(folder)
+        profile = Profile(name="Cliente", color=ProfileColor.TEAL, claude_config_dir=folder)
+        log = Log()
+        SwitchEngine(self.environment, FakeTools(), log).switch_profile(profile.id, Config(profiles=[profile]))
+        self.assertEqual(system.claude, folder, "the running session still gets it")
+        warnings = [m for level, m in log.lines if level == "warning"]
+        self.assertTrue(any("environment.d" in m and folder in m for m in warnings), log.lines)
 
 
 class SessionEnvironmentTests(SafeTestCase):

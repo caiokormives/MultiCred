@@ -282,8 +282,13 @@ def describe_error(error: Exception) -> str:
     from ..core.editors import EditorError
     from ..core.runner import CommandError
     from ..core.storage import InvalidConfig, JSONStoreError
+    from ..core.claude.login_vault import ClaudeLoginError
+    from ..core.engine.types import SwitchError
+    from .messages import describe_switch_error
     from .model import ModelError
 
+    if isinstance(error, (SwitchError, ClaudeLoginError)):
+        return describe_switch_error(error)
     if isinstance(error, EditorError):
         if error.kind == "invalid":
             return describe_issues(error.issues)

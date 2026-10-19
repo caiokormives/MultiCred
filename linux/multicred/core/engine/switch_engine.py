@@ -15,16 +15,17 @@ import threading
 import uuid
 
 from ..adapters.github_cli import GitHubCLI
+from ..adapters import session_env
 from ..adapters.session_env import SessionEnvironment
 from ..claude import attribution
-from ..claude.login_vault import ClaudeLoginSwitcher
+from ..claude.login_vault import ClaudeLoginSwitcher, OccupancyUnreadable
 from ..models import ActiveState, ClaudeAccountKind, ClaudeFolder, Config, uuid_text
 from ..paths import AppPaths
 from ..rendering import gitconfig
 from ..rendering.envfile import SECRET_TOOL, APIKeyExport, ShellEnvironment, render_fish, render_posix
 from ..storage import AtomicFileWriter, StateStore, read_bytes, restore_file
 from ..tools import Tool
-from ..validation import issues_in
+from ..validation import RESERVED_ENV_VARS, is_valid_env_var_name, issues_in
 from .types import (
     Busy, ClaudeTarget, InvalidConfiguration, Preflight, PreflightFailure, RollbackOutcome, StateUnreadable,
     StepFailed, SwitchResult, SwitchStep, SwitchStepKind,
@@ -127,6 +128,10 @@ class SwitchEngine:
         token_account = chosen_account if chosen_account and chosen_account.kind == ClaudeAccountKind.TOKEN else None
         login_account = chosen_account if chosen_account and chosen_account.kind == ClaudeAccountKind.LOGIN else None
         applied_account = token_account or login_account
+        # A login account goes into the active profile's folder; with no profile there is
+        # no folder, so it could never be applied (a token account still can: shells).
+        if login_account is not None and profile is None:
+            raise Preflight(PreflightFailure("noActiveProfile", login_account.nickname))
         login_switcher = ClaudeLoginSwitcher(self.environment)
 
         now = self.environment.clock()
@@ -144,7 +149,7 @@ class SwitchEngine:
             exports.append(APIKeyExport(ClaudeFolder.TOKEN_VARIABLE, token_account.secret_account))
         shell_environment = ShellEnvironment(
             generation=new_state.generation,
-            managed_vars=config.managed_env_vars,
+            managed_vars=sorted(set(config.managed_env_vars) | self._previously_managed_vars()),
             claude=claude_target,
             api_keys=exports,
         )
@@ -190,6 +195,15 @@ class SwitchEngine:
             if not present:
                 raise Preflight(PreflightFailure("claudeTokenMissing", token_account.nickname))
 
+        # Which login each folder holds: unreadable means a switch could save a folder's
+        # live login over another login in the vault, so nothing is changed.
+        occupancy = None
+        if profile is not None:
+            try:
+                occupancy = login_switcher.occupancy()
+            except OccupancyUnreadable as error:
+                raise Preflight(PreflightFailure("claudeFoldersUnreadable", str(error.path))) from error
+
         steps: list[SwitchStep] = []
         if touches_git_and_github:
             identity = config.git_identity(profile.git_identity_id if profile else None)
@@ -206,7 +220,7 @@ class SwitchEngine:
         # Login accounts live in the folder's own credentials; leaving one (another
         # account or the folder's own login chosen) puts the folder's login back.
         if profile is not None and (login_account is not None
-                                    or login_switcher.occupancy().account_in(profile.claude_config_dir) is not None):
+                                    or occupancy.account_in(profile.claude_config_dir) is not None):
             steps.append(self._claude_login_step(login_switcher, login_account.id if login_account else None,
                                                  profile.claude_config_dir))
         steps.append(self._env_files_step(shell_environment))
@@ -233,6 +247,24 @@ class SwitchEngine:
             undo_stack.append((step.kind, undo))
         self._log("info", f"switch {transaction}: done generation={new_state.generation}")
         return SwitchResult(new_state, claude_target, [s.kind for s in steps])
+
+    def _previously_managed_vars(self) -> set[str]:
+        """The names the current env.sh EXPORTS (`NAME="$(…secret-tool…)" && … export NAME`):
+        a key removed since it was written must be unset once more, or open terminals keep
+        exporting it. Only exported names are carried, so a removed name is unset by the
+        next generation and then leaves the file: a variable the user later exports on
+        their own is not unset by MultiCred forever. The file is only parsed, never
+        executed; invalid or reserved names (PATH, CLAUDE_CONFIG_DIR…) are never carried."""
+        data = read_bytes(self.paths.env_sh)
+        if data is None:
+            return set()
+        names = set()
+        for line in data.decode("utf-8", "replace").splitlines():
+            name, separator, rest = line.partition('="$(')
+            if separator and f"export {name}" in rest:
+                names.add(name)
+        # (CLAUDE_CODE_OAUTH_TOKEN is reserved but always managed: it comes from the config.)
+        return {n for n in names if is_valid_env_var_name(n) and n not in RESERVED_ENV_VARS}
 
     def _load_state(self) -> ActiveState:
         try:
@@ -271,7 +303,15 @@ class SwitchEngine:
         return SwitchStep(SwitchStepKind.GITHUB, apply)
 
     def _session_step(self, target: ClaudeTarget, session: SessionEnvironment) -> SwitchStep:
-        return SwitchStep(SwitchStepKind.SESSION, lambda: session.apply(CLAUDE_VARIABLE, target.desired_value))
+        def apply():
+            value = target.desired_value
+            if value is not None and not session_env.representable(value):
+                self._log("warning", f"session: {CLAUDE_VARIABLE}={value} cannot be written to environment.d "
+                                     "($, \\, quotes or backticks); graphical apps go back to ~/.claude at the "
+                                     "next login")
+            return session.apply(CLAUDE_VARIABLE, value)
+
+        return SwitchStep(SwitchStepKind.SESSION, apply)
 
     def _claude_settings_step(self, config_dir: str | None, co_author: bool) -> SwitchStep:
         path = attribution.settings_file(config_dir, self.environment)

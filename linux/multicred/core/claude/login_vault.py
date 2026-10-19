@@ -52,6 +52,17 @@ class Unreadable(ClaudeLoginError):
         self.what = what
 
 
+class OccupancyUnreadable(ClaudeLoginError):
+    """`claude-folders.json` exists but cannot be read. Without it MultiCred cannot know
+    which account each folder holds, and a switch could save a folder's live login over
+    another login in the vault, so every change that needs it is refused."""
+
+    def __init__(self, path):
+        super().__init__(f"Não consegui ler {path} (qual conta do Claude está em cada pasta). "
+                         "Nada foi alterado.")
+        self.path = path
+
+
 def _object(data: bytes, what: str = "json") -> dict:
     try:
         parsed = json.loads(data)
@@ -152,14 +163,19 @@ class ClaudeLoginSwitcher:
         return uuid_text(ClaudeFolder.own_login(config_dir).id)
 
     def occupancy(self) -> ClaudeFolderOccupancy:
-        """A missing or broken file reads as "every folder has its own login"."""
-        data = read_bytes(self.occupancy_file)
+        """A missing file reads as "every folder has its own login". A file that exists
+        but cannot be parsed raises OccupancyUnreadable: reading it as empty would make
+        the next switch save an account's live login as the folder's own login."""
+        try:
+            data = read_bytes(self.occupancy_file)
+        except OSError:
+            raise OccupancyUnreadable(self.occupancy_file) from None
         if data is None:
             return ClaudeFolderOccupancy()
         try:
             return ClaudeFolderOccupancy.from_dict(_object(data))
         except (Unreadable, ValueError, TypeError, AttributeError):
-            return ClaudeFolderOccupancy()
+            raise OccupancyUnreadable(self.occupancy_file) from None
 
     def _save_occupancy(self, value: ClaudeFolderOccupancy) -> None:
         self.occupancy_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -181,8 +197,8 @@ class ClaudeLoginSwitcher:
     def replace_login(self, account_id: uuid.UUID, record: ClaudeLoginRecord) -> None:
         """A new login for an existing account (signed in again). If it is live in a
         folder, that folder gets it right away."""
+        key = self.occupancy().key_holding(account_id)  # before writing anything
         self.store_new_account(account_id, record)
-        key = self.occupancy().key_holding(account_id)
         if key is not None:
             self._write(record, ClaudeFolderOccupancy.config_dir_for_key(key))
 
@@ -265,7 +281,22 @@ class ClaudeLoginSwitcher:
         credentials file left empty is removed, as if it never existed)."""
         saved = self.store.read_vault(self.own_login_key(config_dir))
         if saved is not None:
-            return self._write(ClaudeLoginRecord.decode(saved), config_dir)
+            record = ClaudeLoginRecord.decode(saved)
+            undo_write = self._write(record, config_dir)
+            if record.account is not None:
+                return undo_write
+            # Saved without a "logged in as": the previous account's must not stay shown.
+            try:
+                shown_target, shown_before = self._remove_displayed_account(config_dir)
+            except Exception:
+                undo_write()
+                raise
+
+            def undo_own():
+                if shown_target is not None:
+                    restore_file(shown_before, shown_target, permissions=0o600)
+                undo_write()
+            return undo_own
 
         previous_item = self.store.read_folder_item(config_dir)
         if previous_item is not None:

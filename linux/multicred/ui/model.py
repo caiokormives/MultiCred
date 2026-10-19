@@ -7,7 +7,7 @@ import threading
 from typing import Callable
 
 from ..core.engine.switch_engine import SwitchEngine
-from ..core.engine.types import StepFailed, SwitchError
+from ..core.engine.types import Busy, StepFailed, SwitchError
 from ..core.models import ActiveState, ClaudeAccountKind, ClaudeFolder, Config
 from ..core.storage import ConfigRepository, JSONStoreError
 
@@ -35,6 +35,9 @@ class AppModel:
         self.state = ActiveState()
         self.load_error: Exception | None = None
         self.switching = False
+        # Switch requests started here and not finished yet (UI thread only): a request
+        # refused with Busy must not clear `switching` while another one still runs.
+        self._switches_in_flight = 0
         # A switch failed and could not undo everything: the machine is half switched.
         # Cleared by the next successful switch (the tray shows the orange dot meanwhile).
         self.inconsistent = False
@@ -100,17 +103,25 @@ class AppModel:
 
     def _run_switch(self, operation, on_done, claude_only: bool) -> None:
         config, previous = self.config, self.state
+        self._switches_in_flight += 1
         self.switching = True
         self.notify()
 
         def work():
+            # Whatever happens here must reach _finish, or the UI stays in "trocando".
             outcome = None
             try:
                 result, error = operation(config), None
-            except SwitchError as failure:
+            except Exception as failure:
                 result, error = None, failure
+                if not isinstance(failure, SwitchError):
+                    self._log("error", f"switch crashed: {failure!r}")
             if result is not None:
-                outcome = self._outcome(config, previous, result, claude_only)
+                try:
+                    outcome = self._outcome(config, previous, result, claude_only)
+                except Exception as failure:
+                    # The machine did switch; only the feedback is lost.
+                    self._log("error", f"switch feedback failed: {failure!r}")
             self.dispatch(self._finish, result, error, on_done, outcome)
 
         threading.Thread(target=work, name="multicred-switch", daemon=True).start()
@@ -144,6 +155,7 @@ class AppModel:
         config = self.config
         if config is None or self.state.profile_id is None or self.switching:
             return False
+        self._switches_in_flight += 1
         self.switching = True
         self.notify()
 
@@ -158,7 +170,8 @@ class AppModel:
         return True
 
     def _reapplied(self, result, error, on_done) -> None:
-        self.switching = False
+        self._switches_in_flight = max(0, self._switches_in_flight - 1)
+        self.switching = self._switches_in_flight > 0
         if error is None:
             if result is not None:
                 self.state = result.state
@@ -386,19 +399,41 @@ class AppModel:
             return False
 
     def remove_api_key(self, key_id) -> None:
+        """Removes the key and its secret. When the active profile exported it, the profile
+        is applied again at once: the next env files unset the variable only for one
+        generation, so a terminal idle across two later switches would keep it otherwise."""
         from ..core.editors import ConfigEditor
+        active = self.active_profile
+        exported = active is not None and key_id in active.api_key_ids
         self.edit(lambda config: ConfigEditor.remove_api_key(key_id, config, self.environment.secrets))
+        if exported:
+            self.reapply_active_profile()
 
     def remove_claude_account(self, account_id) -> None:
-        """Removes the account and its secret; a login account live in a folder gives the
-        folder its own login back first. Shells stop exporting a removed token that was
-        in use (Claude-only switch back to the folder login), like the Mac."""
+        """Removes the account and its secret, as a transaction: (1) a login account live
+        in a folder gives the folder its own login back, (2) the config is saved without
+        the account, (3) only then its saved login and token are deleted. A failed save
+        puts the account back in its folder and loses nothing. Shells stop exporting a
+        removed token that was in use (Claude-only switch back to the folder login),
+        like the Mac."""
         from ..core.claude import account_editor
         from ..core.claude.login_vault import ClaudeLoginSwitcher
 
+        account = self.config.claude_account(account_id) if self.config is not None else None
+        if account is None:
+            return
         was_applied = self.state.applied_claude_account_id == account_id
         switcher = ClaudeLoginSwitcher(self.environment)
-        self.edit(lambda config: account_editor.remove(account_id, config, self.environment.secrets, switcher))
+        undo = account_editor.release_login(account, switcher)
+        try:
+            self.edit(lambda config: account_editor.remove(account_id, config))
+        except Exception:
+            try:
+                undo()
+            except Exception as error:
+                self._log("error", f"could not put the Claude account back in its folder: {error!r}")
+            raise
+        account_editor.discard_removed_account(account, self.environment.secrets, switcher)
         if was_applied and self.active_profile is not None and not self.switching:
             self.switch_claude_only(None, lambda _result, _error: None)
 
@@ -552,7 +587,17 @@ class AppModel:
         self._background("verify", lambda: verifier.run(config, state, deep=deep), finished)
 
     def _finish(self, result, error, on_done, outcome=None):
-        self.switching = False
+        self._switches_in_flight = max(0, self._switches_in_flight - 1)
+        if isinstance(error, Busy):
+            # Refused, nothing changed. Another switch started here still runs and owns
+            # `switching`; if none does (the engine was busy with a Verificar fix), the
+            # flag goes back to idle.
+            on_done(result, error)
+            if self._switches_in_flight == 0 and self.switching:
+                self.switching = False
+                self.notify()
+            return False
+        self.switching = self._switches_in_flight > 0
         if result is not None:
             self.state = result.state
             self.inconsistent = False

@@ -222,6 +222,55 @@ class UninstallerTests(SafeTestCase):
         self.assertEqual(self.claude_store.vault, {}, "the login vault is emptied (accounts and own logins)")
         self.assertTrue(Path(self.claude_dir).is_dir(), "Claude folders are kept by default (D12)")
 
+    def test_a_folder_that_could_not_get_its_own_login_back_keeps_its_vault_entries(self):
+        """S-11: a failed restore must not delete the folder's original login (the only
+        copy, in the vault) nor the account that still lives in that folder."""
+        self.install([B])
+        other = ClaudeAccount(nickname="Outra", color=ProfileColor.GREEN, kind=ClaudeAccountKind.LOGIN)
+        self.config.claude_accounts.append(other)
+        self.activate_profile()
+        ClaudeLoginSwitcher(self.environment).store_new_account(other.id, ClaudeLoginRecord(
+            as_json(oauth("outra")), None))
+        ConfigRepository(self.environment).save(self.config)
+        own_key = ClaudeLoginSwitcher.own_login_key(self.claude_dir)
+        default_key = ClaudeLoginSwitcher.own_login_key(None)
+        self.claude_store.write_vault(default_key, as_json({"claudeAiOauth": oauth("default")}))
+        self.assertIn(own_key, self.claude_store.vault)
+
+        real_write = self.claude_store.write_folder_item
+
+        def failing_write(config_dir, data):
+            if config_dir == self.claude_dir:
+                raise OSError("disco cheio")
+            real_write(config_dir, data)
+        self.claude_store.write_folder_item = failing_write
+
+        report = self.uninstaller().apply()
+
+        self.assertIn(own_key, self.claude_store.vault, "the folder's own login is the only copy")
+        self.assertIn(uuid_text(self.login.id), self.claude_store.vault, "the account still lives there")
+        self.assertNotIn(uuid_text(other.id), self.claude_store.vault, "accounts living nowhere are deleted")
+        self.assertNotIn(default_key, self.claude_store.vault, "folders that were restored are emptied")
+        live = json.loads(self.claude_store.read_folder_item(self.claude_dir))
+        self.assertEqual(live["claudeAiOauth"]["accessToken"], "sk-ant-oat01-dev", "the folder keeps the account")
+        problem = next(p for p in report.problems if "~/.claude-pessoal" in p)
+        self.assertIn("Dev HINC", problem)
+        self.assertIn("nada foi perdido", problem)
+
+    def test_an_unreadable_claude_folders_file_keeps_the_login_vault(self):
+        """S-18: without knowing which folder holds which account, the vault may hold the
+        only copy of a folder's own login: keep it all and say so."""
+        self.install([B])
+        self.activate_profile()
+        vault = dict(self.claude_store.vault)
+        self.paths.claude_folders.write_text("{broken")
+        preview = self.uninstaller().preview()
+        self.assertNotIn("claudeVault", [i.kind for i in preview], "the vault is not going to be emptied")
+        report = self.uninstaller().apply()
+        self.assertEqual(self.claude_store.vault, vault)
+        self.assertTrue(any("claude-folders.json" in p for p in report.problems), report.problems)
+        self.assertFalse(self.environment.app_support_directory.exists(), "the rest still runs")
+
     def test_co_author_opt_out_written_by_multicred_is_undone(self):
         self.install([B])
         self.activate_profile()

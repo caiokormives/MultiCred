@@ -124,3 +124,39 @@ printf 'B:%s|%s\\n' "${{OPENAI_API_KEY-unset}}" "${{GEMINI_API_KEY-unset}}"
         rest, err = process.communicate(timeout=20)
         self.assertEqual(first + rest, "A:sk-openai|unset\nB:unset|g-gemini\n", err)
         self.assertEqual(system.gh_active, "dev-empresa", "profiles without GitHub do not touch gh")
+
+    def test_open_bash_drops_the_variable_of_a_removed_key_on_the_next_switch(self):
+        """S-15: removing a key from MultiCred, then switching, makes an open bash stop
+        exporting it (the next env.sh still unsets what the previous one managed)."""
+        FakeSystem(self.runner)
+        openai = APIKeyAccount(nickname="O", provider=APIProvider.OPENAI, color=ProfileColor.INDIGO)
+        self.secrets.set_secret(b"sk-openai", openai.secret_account)
+        a = Profile(name="A", color=ProfileColor.INDIGO, api_key_ids=[openai.id])
+        config = Config(api_keys=[openai], profiles=[a])
+        account = openai.secret_account
+        tool = self.make_executable("bin/secret-tool",
+                                    f'#!/bin/sh\n[ "$5" = {account} ] && printf %s sk-openai && exit 0\nexit 1\n')
+        engine = SwitchEngine(self.environment, FakeTools(), secret_tool=str(tool))
+        hook = AppPaths(self.environment).hook(ShellKind.BASH)
+        hook.parent.mkdir(parents=True, exist_ok=True)
+        hook.write_text(hooks.render(ShellKind.BASH))
+
+        engine.switch_profile(a.id, config)
+        removed = self.home / "removed"
+        script = f""". "$1"
+printf 'antes:%s\\n' "${{OPENAI_API_KEY-unset}}"
+while [ ! -e "{removed}.done" ]; do sleep 0.05; done
+_multicred_apply
+printf 'depois:%s\\n' "${{OPENAI_API_KEY-unset}}"
+"""
+        process = subprocess.Popen(["/bin/bash", "--norc", "--noprofile", "-c", script, "bash", str(hook)],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                   env={"HOME": str(self.home), "PATH": "/usr/bin:/bin"})
+        first = process.stdout.readline()
+        # The key is removed from MultiCred (config and secret), then the profile is applied again.
+        self.secrets.delete_item(account)
+        config = Config(profiles=[Profile(id=a.id, name="A", color=ProfileColor.INDIGO)])
+        engine.switch_profile(a.id, config)
+        (self.home / "removed.done").touch()
+        rest, err = process.communicate(timeout=20)
+        self.assertEqual(first + rest, "antes:sk-openai\ndepois:unset\n", err)

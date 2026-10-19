@@ -60,7 +60,9 @@ class PreflightFailure:
     kinds: profileNotFound, claudeAccountNotFound, toolMissing(tool),
     claudeDirectoryMissing(path), apiKeyMissing(nickname, envVar),
     claudeTokenMissing(nickname), claudeLoginMissing(nickname),
-    secretsUnavailable(reason).
+    secretsUnavailable(reason), noActiveProfile(nickname: a login account
+    chosen with no active profile, so no folder to put it in),
+    claudeFoldersUnreadable(path of claude-folders.json, which exists but cannot be read).
     """
 
     kind: str

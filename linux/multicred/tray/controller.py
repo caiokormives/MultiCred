@@ -91,7 +91,8 @@ class TrayController:
     def _reporting(self, title: str):
         def done(_result, error):
             if error is not None and self.on_error:
-                self.on_error(title, str(error))
+                from ..ui.messages import describe_switch_error
+                self.on_error(title, describe_switch_error(error))
         return done
 
     def _availability_changed(self, available: bool) -> None:

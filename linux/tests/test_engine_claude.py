@@ -184,6 +184,48 @@ class ClaudeEngineTests(SafeTestCase):
             self.engine().switch_claude_only(uuid.uuid4(), self.config)
         self.assertEqual(raised.exception.failure.kind, "claudeAccountNotFound")
 
+    def test_login_account_without_an_active_profile_is_a_preflight_failure(self):
+        """S-14: a login account lives in a profile's folder; with no profile active there
+        is no folder to put it in, so the switch is refused instead of recording an
+        account that was never applied."""
+        dev = ClaudeAccount(nickname="Dev HINC", color=ProfileColor.BLUE, kind=ClaudeAccountKind.LOGIN)
+        self.config.claude_accounts.append(dev)
+        ClaudeLoginSwitcher(self.environment).store_new_account(dev.id, ClaudeLoginRecord(
+            b'{"accessToken":"sk-ant-oat01-dev"}', None))
+        with self.assertRaises(Preflight) as raised:
+            self.engine().switch_claude_only(dev.id, self.config)
+        self.assertEqual((raised.exception.failure.kind, raised.exception.failure.detail),
+                         ("noActiveProfile", "Dev HINC"))
+        self.assertIsNone(self.engine().current_state().applied_claude_account_id, "state not written")
+        self.assertFalse(self.paths.env_sh.exists(), "nothing changed")
+        self.assertEqual(self.claude_store.folders, {})
+
+    def test_unreadable_claude_folders_file_is_a_preflight_failure(self):
+        """S-18: without knowing which account each folder holds, a switch could save a
+        folder's live login over another login in the vault: refuse, change nothing."""
+        dev = ClaudeAccount(nickname="Dev HINC", color=ProfileColor.BLUE, kind=ClaudeAccountKind.LOGIN)
+        self.config.claude_accounts.append(dev)
+        self.personal.claude_account_id = dev.id
+        ClaudeLoginSwitcher(self.environment).store_new_account(dev.id, ClaudeLoginRecord(
+            b'{"accessToken":"sk-ant-oat01-dev"}', None))
+        self.paths.claude_folders.parent.mkdir(parents=True, exist_ok=True)
+        self.paths.claude_folders.write_text("{broken")
+        vault = dict(self.claude_store.vault)
+        for start in (lambda: self.engine().switch_profile(self.personal.id, self.config),
+                      lambda: self.engine().switch_profile(self.work.id, self.config)):
+            with self.assertRaises(Preflight) as raised:
+                start()
+            self.assertEqual(raised.exception.failure.kind, "claudeFoldersUnreadable")
+        self.assertFalse(self.paths.env_sh.exists(), "nothing changed")
+        self.assertIsNone(self.system.claude)
+        self.assertEqual(self.claude_store.vault, vault)
+        self.assertEqual(self.claude_store.folders, {})
+
+    def test_token_account_without_an_active_profile_still_works(self):
+        result = self.engine().switch_claude_only(self.marco.id, self.config)
+        self.assertEqual(result.state.applied_claude_account_id, self.marco.id)
+        self.assertIn(TOKEN_EXPORT, self.env_sh())
+
     def test_generation_increases_and_activated_at_only_changes_on_profile_switch(self):
         clock = [FIXED_NOW]
         object.__setattr__(self.environment, "clock", lambda: clock[0])
