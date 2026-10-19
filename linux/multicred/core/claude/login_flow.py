@@ -15,6 +15,10 @@ macOS app keeps in SetupTokenSession / AppModel:
   vault; a setup-token goes to the Secret Service. The folder and its
   `.credentials.json` are deleted at the end, whatever happened. Test mode runs
   the LoginSimulator instead of the real `claude` (D30).
+- `LoginMode.FOLDER` is a Claude folder's own login (the Mac's "Entrar no Claude",
+  LoginSession.swift): `claude auth login` with that folder's `CLAUDE_CONFIG_DIR`,
+  no throwaway folder; Claude Code writes the login there itself and MultiCred
+  stores nothing. `logout_folder` is "Sair do login da pasta…".
 
 The code typed by the user is forwarded to the CLI and never stored; the
 visible output and the copied log show it (and any token) masked.
@@ -24,6 +28,7 @@ from __future__ import annotations
 
 import codecs
 import contextlib
+import json
 import os
 import re
 import shutil
@@ -37,6 +42,7 @@ from typing import Callable
 from ..log import redact_credential_like
 from ..models import ClaudeAccount, Config, ProfileColor, uuid_text
 from ..pty import PseudoTerminalProcess, PTYError
+from ..storage import AtomicFileWriter
 from ..tools import Tool
 from . import account_editor
 from .credentials import FileClaudeCredentialStore
@@ -45,6 +51,8 @@ from .login_vault import ClaudeLoginRecord, ClaudeLoginSwitcher, NoLoginInFolder
 # The login window gives up after ten minutes.
 LOGIN_TIMEOUT = 600.0
 CLAUDE_NOT_INSTALLED = "Claude Code não foi encontrado. Instale com: curl -fsSL https://claude.ai/install.sh | bash"
+# Mac LoginLaunchError.outsideSandbox, for a folder's own login or logout in test mode.
+FOLDER_OUTSIDE_TEST_HOME = "No modo de teste, a pasta precisa ficar dentro do HOME de teste."
 NO_LOGIN_FOUND = "O login terminou, mas não encontrei a credencial. Tente de novo."
 NO_TOKEN_SHOWN = "O Claude Code terminou sem mostrar um token. Tente de novo ou cole o token manualmente."
 
@@ -452,6 +460,60 @@ class LoginMode(str, Enum):
     LOGIN = "login"
     # `claude setup-token`: a long-lived token exported as CLAUDE_CODE_OAUTH_TOKEN.
     SETUP_TOKEN = "setupToken"
+    # `claude auth login` in a Claude folder itself (the target is its path, None =
+    # ~/.claude): the folder's own login, written by Claude Code (Mac LoginSession).
+    FOLDER = "folder"
+
+
+def _inside_home(environment, path: str) -> bool:
+    """Whether `path` (no `.`/`..` parts) really lies under the HOME (symlinks resolved)."""
+    if any(part in (".", "..") for part in path.split("/")):
+        return False
+    home = os.path.realpath(environment.home)
+    return os.path.realpath(path).startswith(home + os.sep)
+
+
+def folder_environment(environment, tools, config_dir: str | None) -> dict[str, str]:
+    """The CLI's environment for a folder: `CLAUDE_CONFIG_DIR` set to it, or absent for
+    the default ~/.claude (ClaudeCLI.environment_for)."""
+    env = terminal_environment(environment, tools)
+    env.pop("CLAUDE_CONFIG_DIR", None)
+    if config_dir is not None:
+        env["CLAUDE_CONFIG_DIR"] = config_dir
+    return env
+
+
+def logout_folder(environment, tools, config_dir: str | None) -> None:
+    """"Sair do login da pasta…" (AppModel.logoutClaudeFolder): `claude auth logout` with
+    the folder's CLAUDE_CONFIG_DIR. In test mode nothing runs: the simulated login is
+    removed from the sandbox the way Claude Code removes a login (the folder's
+    `.credentials.json`, and `oauthAccount` from its `.claude.json`, the rest stays).
+    Raises LoginLaunchError (not installed, folder outside the test HOME) or the
+    command's error."""
+    from ..models import ClaudeFolder
+    from .status import ClaudeCLI
+
+    if environment.mode == "real":
+        claude = tools.locate(Tool.CLAUDE)
+        if claude is None:
+            raise LoginLaunchError(CLAUDE_NOT_INSTALLED)
+        cli = ClaudeCLI(environment.runner, claude, environment.base_process_environment(tools.search_directories()))
+        cli.logout(ClaudeFolder.own_login(config_dir))
+        return
+    from .. import claude_paths
+    folder = config_dir if config_dir is not None else claude_paths.default_config_dir(environment)
+    state = claude_paths.state_file(config_dir, environment)
+    if not _inside_home(environment, folder) or not _inside_home(environment, str(state)):
+        raise LoginLaunchError(FOLDER_OUTSIDE_TEST_HOME)
+    FileClaudeCredentialStore(environment.home).delete_folder_item(config_dir)
+    environment.claude_credentials.delete_folder_item(config_dir)
+    try:
+        data = json.loads(state.read_bytes())
+    except (OSError, ValueError, UnicodeDecodeError):
+        return
+    if isinstance(data, dict) and "oauthAccount" in data:
+        del data["oauthAccount"]
+        AtomicFileWriter.write(json.dumps(data).encode(), state, permissions=0o600, follow_symlink=True)
 
 
 @dataclass(frozen=True)
@@ -611,6 +673,8 @@ class ClaudeLoginSession:
     # MARK: internals
 
     def _prepare(self) -> LoginCommand:
+        if self.mode == LoginMode.FOLDER:
+            return self._prepare_folder()
         path = resolve_login_tool(self.environment, self.tools, Tool.CLAUDE, self.simulated)
         from .login_simulator import LoginSimulator, SetupTokenSimulator
 
@@ -633,6 +697,31 @@ class ClaudeLoginSession:
         scratch = self._make_scratch()
         env["CLAUDE_CONFIG_DIR"] = scratch
         return LoginCommand(executable, arguments, env, str(self.environment.home), scratch, display)
+
+    def _prepare_folder(self) -> LoginCommand:
+        """`claude auth login` in the folder itself (Mac LoginCommand.make). Outside the real
+        system the folder must lie in the test HOME (the simulator checks it too)."""
+        from .. import claude_paths
+        from .login_simulator import LoginSimulator
+
+        config_dir = self.target
+        if self.environment.mode != "real":
+            folder = config_dir if config_dir is not None else claude_paths.default_config_dir(self.environment)
+            if not _inside_home(self.environment, folder):
+                raise LoginLaunchError(FOLDER_OUTSIDE_TEST_HOME)
+        path = resolve_login_tool(self.environment, self.tools, Tool.CLAUDE, self.simulated)
+        platform = self.environment.platform
+        env = folder_environment(self.environment, self.tools, config_dir)
+        env["BROWSER"] = platform.true  # the page opens the link itself
+        if path is None:
+            executable, arguments = LoginSimulator.executable(platform), LoginSimulator.arguments()
+            env["PATH"] = ":".join(platform.system_path)
+            display = "claude auth login (simulado)"
+        else:
+            executable, arguments = path, ["auth", "login"]
+            env["PATH"] = ":".join([os.path.dirname(path), env["PATH"]])
+            display = "claude auth login"
+        return LoginCommand(executable, arguments, env, str(self.environment.home), None, display)
 
     def _make_scratch(self) -> str:
         root = Path(self.environment.app_support_directory)
@@ -691,7 +780,14 @@ class ClaudeLoginSession:
     def _exited(self, status: int) -> None:
         with self._lock:
             self._timer.cancel()
-            if self.mode == LoginMode.LOGIN:
+            if self.mode == LoginMode.FOLDER:
+                # Claude Code wrote the login into the folder before exiting (Mac: processExited).
+                if not self._machine.phase.is_finished:
+                    self._stored = status == 0
+                    self._update(lambda: self._machine.process_exited(status))
+                    if status != 0:
+                        self._write_log(f"auth login exited {status}")
+            elif self.mode == LoginMode.LOGIN:
                 self._finish_login(status)
             else:
                 self._deliver_token_if_ready()

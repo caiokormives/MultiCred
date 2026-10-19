@@ -1,5 +1,6 @@
 """Contas: the Git, GitHub and Chaves de API pages and their editors, like the Mac
-(`MultiCred/Views/AccountsPages.swift`), plus the Claude page until S-03 rebuilds it.
+(`MultiCred/Views/AccountsPages.swift`). The Claude page is `claude.py`; it shares
+`AccountRow` from here.
 
 Each account kind has its own page (a sidebar entry), with the Mac's `PageHeader`
 inside the content (title, subtitle, prominent action), an empty state as a status page
@@ -25,13 +26,10 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
 
 from ...core.editors import ConfigEditor, EditorError  # noqa: E402
-from ...core.models import APIProvider, ClaudeAccountKind, GitHubAccount, GitIdentity, ProfileColor  # noqa: E402
+from ...core.models import APIProvider, GitHubAccount, GitIdentity, ProfileColor  # noqa: E402
 from .. import widgets  # noqa: E402
 from ..widgets import escape  # noqa: E402
 
-CLAUDE_NOTE = ("A conta é só a credencial: trocar a conta não muda agents, skills nem conversas, que ficam na "
-               "pasta do perfil. O MultiCred nunca mostra tokens; logins completos ficam no chaveiro do sistema "
-               "(Secret Service).")
 # AccountsPages.swift:85, 209, 484 ("no Keychain dele" / "Keychain do macOS" → chaveiro do sistema;
 # gh on Linux keeps its token in the keyring or in its own hosts.yml, so the GitHub note just
 # says "com o próprio gh").
@@ -66,7 +64,7 @@ class AccountRow(Gtk.ListBoxRow):
     """One row of an accounts list (Mac `AccountRow`, AccountsPages.swift:7-32): round
     avatar, title/subtitle, "usado em", monospaced detail, then the trailing status and
     buttons. `menu` is the Mac's context menu: (label, callback) pairs, opened with a
-    right click, a long press or Shift+F10."""
+    right click, a long press or Shift+F10; a None entry is the Mac's Divider."""
 
     def __init__(self, name: str, color: ProfileColor, title: str, subtitle: str, used_in: str, detail: str,
                  on_activate=None, menu=()):
@@ -131,11 +129,18 @@ class AccountRow(Gtk.ListBoxRow):
     def _install_menu(self) -> None:
         actions = Gio.SimpleActionGroup()
         self.menu_model = Gio.Menu()
-        for index, (text, callback) in enumerate(self.menu):
+        section = Gio.Menu()
+        for index, entry in enumerate(self.menu):
+            if entry is None:  # Divider: the items so far become a section
+                self.menu_model.append_section(None, section)
+                section = Gio.Menu()
+                continue
+            text, callback = entry
             action = Gio.SimpleAction.new(f"a{index}", None)
             action.connect("activate", lambda *_a, cb=callback: cb())
             actions.add_action(action)
-            self.menu_model.append(text, f"row.a{index}")
+            section.append(text, f"row.a{index}")
+        self.menu_model.append_section(None, section)
         self.insert_action_group("row", actions)
         click = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
         click.connect("pressed", lambda _g, _n, x, y: self.popup_menu(x, y))
@@ -164,12 +169,13 @@ class AccountRow(Gtk.ListBoxRow):
 
     def activate_menu(self, text: str) -> None:
         """Runs the context-menu item called `text` (what choosing it in the menu does)."""
-        callback = next(cb for label, cb in self.menu if label == text)
+        callback = next(entry[1] for entry in self.menu if entry is not None and entry[0] == text)
         callback()
 
     def info(self) -> dict:
         return {"title": self.title, "subtitle": self.subtitle, "used_in": self.used_in, "detail": self.detail,
-                "status": self.status, "buttons": list(self.buttons), "menu": [label for label, _ in self.menu]}
+                "status": self.status, "buttons": list(self.buttons),
+                "menu": [entry[0] for entry in self.menu if entry is not None]}
 
 
 class _AccountListPage(Adw.NavigationPage):
@@ -389,154 +395,6 @@ class APIKeysPage(_AccountListPage):
 
     def open_editor(self, item_id) -> Adw.NavigationPage:
         return self.window.push(APIKeyEditorPage(self.window, item_id))
-
-
-# MARK: Claude (until S-03)
-
-
-class AccountsPage(Adw.NavigationPage):
-    """The Claude entry: extra Claude accounts and the folders the profiles use. S-03
-    replaces it with the Mac's Claude page; Git, GitHub and Chaves de API have their own
-    pages above. `select_tab`/`current_tab` stay for the window's navigation."""
-
-    def __init__(self, window):
-        super().__init__(title="Claude", tag="accounts")
-        self.window, self.model = window, window.model
-        self.current_tab = "claude"
-        self._rows: list[Adw.ActionRow] = []
-        self._folder_titles: list[str] = []
-
-        self.add_button = widgets.button("+ Adicionar conta", self.add_account, "suggested-action")
-        self.box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
-        view = Adw.ToolbarView()
-        header = Adw.HeaderBar()
-        header.pack_end(self.add_button)
-        view.add_top_bar(header)
-        view.set_content(widgets.scrolled(self.box))
-        self.set_child(view)
-        self.refresh()
-
-    def select_tab(self, name: str) -> None:
-        """Only Claude is left here; the other kinds are pages of their own."""
-
-    def row_titles(self, tab: str = "claude") -> list[str]:
-        return [row.get_title() for row in self._rows] if tab == "claude" else []
-
-    def folder_titles(self) -> list[str]:
-        return list(self._folder_titles)
-
-    def refresh(self) -> None:
-        if self.model.config is None:
-            return
-        child = self.box.get_first_child()
-        while child is not None:
-            self.box.remove(child)
-            child = self.box.get_first_child()
-        self._rows = []
-        self._build_claude()
-
-    def _row(self, title: str, subtitle: str, letter: str, color: ProfileColor, suffixes=(),
-             menu=()) -> Adw.ActionRow:
-        """subtitle is Pango markup (callers escape their text)."""
-        row = Adw.ActionRow(title=escape(title), subtitle=subtitle)
-        row.add_prefix(widgets.account_avatar(letter, color, 34))
-        for widget in suffixes:
-            row.add_suffix(widget)
-        if menu:
-            actions = Gio.SimpleActionGroup()
-            items = Gio.Menu()
-            for index, (text, callback) in enumerate(menu):
-                action = Gio.SimpleAction.new(f"a{index}", None)
-                action.connect("activate", lambda *_a, cb=callback: cb())
-                actions.add_action(action)
-                items.append(text, f"row.a{index}")
-            row.insert_action_group("row", actions)
-            more = Gtk.MenuButton(icon_name="view-more-symbolic", menu_model=items, valign=Gtk.Align.CENTER,
-                                  tooltip_text="Mais ações")
-            more.add_css_class("flat")
-            row.add_suffix(more)
-        self._rows.append(row)
-        return row
-
-    @staticmethod
-    def _empty(text: str) -> Adw.ActionRow:
-        row = Adw.ActionRow(title=escape(text), activatable=False)
-        row.add_css_class("dim-label")
-        return row
-
-    def _build_claude(self) -> None:
-        config, box = self.model.config, self.box
-        group = Adw.PreferencesGroup()
-        group.set_header_suffix(widgets.button("Adicionar conta Claude…", lambda: self.request_login("add", None),
-                                               "flat"))
-        for account in config.claude_accounts:
-            in_use = self.model.state.applied_claude_account_id == account.id
-            parts = [escape(account.email)] if account.email else []
-            if account.kind == ClaudeAccountKind.LOGIN:
-                parts.append("login completo")
-            else:
-                parts.append("token (setup-token) · só terminais novos")
-            used = _used_in(p for p in config.profiles if p.claude_account_id == account.id)
-            if used:
-                parts.append(escape(used))
-            suffixes = []
-            if in_use:
-                suffixes.append(widgets.pill("em uso", "ok"))
-            elif not self.model.has_token(account):
-                suffixes.append(widgets.pill("precisa entrar", "warning"))
-                suffixes.append(widgets.button("Entrar…", lambda a=account: self.request_login("login", a)))
-            else:
-                suffixes.append(widgets.pill("conectada", "ok"))
-            group.add(self._row(account.nickname, " · ".join(parts), account.nickname, account.color, suffixes, (
-                ("Entrar de novo…", lambda a=account: self.request_login("login", a)),
-                ("Remover", lambda a=account: self._remove_claude(a)))))
-        if not config.claude_accounts:
-            group.add(self._empty("Nenhuma conta extra. Adicione uma para usar outro login sem trocar de pasta."))
-        box.append(group)
-
-        folders = Adw.PreferencesGroup(title="Pastas do Claude usadas pelos perfis")
-        self._folder_titles = []
-        for config_dir in self.model.claude_folders_in_use:
-            name = self.model.folder_name(config_dir)
-            plain = f"{name} (padrão)" if config_dir is None else name
-            self._folder_titles.append(plain)
-            title = f"<tt>{escape(name)}</tt>" + (" <span alpha='55%'>(padrão)</span>" if config_dir is None else "")
-            profiles = [p.name for p in config.profiles if p.claude_config_dir == config_dir]
-            summary = self.model.folder_summaries.get(config_dir)
-            parts = [escape(", ".join(profiles)) if profiles else "nenhum perfil"]
-            if summary is not None:
-                parts.append(f"{summary.conversation_count} conversas recentes")
-            row = Adw.ActionRow(title=title, subtitle=" · ".join(parts), activatable=True)
-            status = self.model.folder_status(config_dir)
-            if status is not None and status.kind == "loggedIn":
-                row.add_suffix(widgets.pill(status.email or "logada", "ok"))
-            elif status is not None and status.kind == "loggedOut":
-                row.add_suffix(widgets.pill("sem login", "warning"))
-                row.add_suffix(widgets.button("Entrar…", lambda d=config_dir: self.request_login("folder", d)))
-            row.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
-            row.connect("activated", lambda _r, d=config_dir: self.window.push(ClaudeFolderPage(self.window, d)))
-            folders.add(row)
-        box.append(folders)
-        box.append(widgets.note(CLAUDE_NOTE))
-
-    def add_account(self) -> None:
-        self.request_login("add", None)
-
-    def request_login(self, kind: str, account, tab: str | None = None) -> None:
-        self.window.on_login_requested(kind, account)
-
-    def _remove_claude(self, account) -> None:
-        def remove():
-            try:
-                self.model.remove_claude_account(account.id)
-            except Exception as error:
-                self.window.show_toast(widgets.describe_error(error))
-                return
-            self.window.show_toast(f"Conta {account.nickname} removida")
-
-        widgets.confirm(self, f"Remover a conta Claude {account.nickname}?",
-                        "O login guardado é apagado; os perfis que a usam voltam para o login da própria pasta.",
-                        "Remover", remove)
 
 
 # MARK: editors
@@ -989,35 +847,3 @@ class APIKeyEditorPage(_EditorPage):
             self.window.show_toast(widgets.describe_error(error))
             return
         self.finish(f"Chave {self.existing.nickname} removida")
-
-
-class ClaudeFolderPage(Adw.NavigationPage):
-    """What a Claude folder holds (local metadata only: login e-mail, recent conversation titles)."""
-
-    def __init__(self, window, config_dir):
-        name = window.model.folder_name(config_dir)
-        super().__init__(title=name)
-        self.window, self.model, self.config_dir = window, window.model, config_dir
-        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
-        summary = self.model.folder_summaries.get(config_dir)
-        info = Adw.PreferencesGroup(title=widgets.escape(name))
-        profiles = [p.name for p in self.model.config.profiles if p.claude_config_dir == config_dir]
-        info.add(Adw.ActionRow(title="Perfis", subtitle=escape(", ".join(profiles) or "nenhum")))
-        if summary is not None:
-            info.add(Adw.ActionRow(title="Login da pasta", subtitle=escape(summary.email or "sem login")))
-            info.add(Adw.ActionRow(title="Conversas", subtitle=f"{summary.project_count} projetos · "
-                                                              f"{summary.conversation_count} conversas"))
-        content.append(info)
-        recent = Adw.PreferencesGroup(title="Conversas recentes")
-        for conversation in (summary.recent_conversations if summary else []):
-            when = conversation.last_activity.astimezone().strftime("%d/%m %H:%M")
-            recent.add(Adw.ActionRow(title=escape(conversation.title),
-                                     subtitle=escape(" · ".join(x for x in (conversation.project, when) if x))))
-        if summary is None or not summary.recent_conversations:
-            recent.add(AccountsPage._empty("Nenhuma conversa nesta pasta."))
-        content.append(recent)
-        content.append(widgets.note("Lido só neste computador: títulos e datas das conversas, nunca o conteúdo."))
-        view = Adw.ToolbarView()
-        view.add_top_bar(Adw.HeaderBar())
-        view.set_content(widgets.scrolled(content))
-        self.set_child(view)

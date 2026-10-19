@@ -374,11 +374,12 @@ class SidebarTests(unittest.TestCase):
             page = window.nav.get_visible_page()
             seen["overview"] = (isinstance(page, ProfilesPage), page.get_title(), window.content_page.get_title())
 
-        def editor_back_selects_overview(app):
+        def editor_is_the_root_of_its_row(app):
+            # S-03: like the Mac, the editor is the page of the profile's row (no back button).
             window = app.window
             window.sidebar.select_row(window.sidebar_row(f"profile:{personal.id}"))
             window.nav.pop()
-            seen["after_pop"] = window.selected_sidebar_key()
+            seen["after_pop"] = (window.nav.get_navigation_stack().get_n_items(), window.selected_sidebar_key())
 
         def keys(app):
             window = app.window
@@ -390,7 +391,7 @@ class SidebarTests(unittest.TestCase):
             window.sidebar.emit("row-activated", window.sidebar_row("keys"))
             seen["reclicked"] = (window.nav.get_visible_page() is keys_page, window.selected_sidebar_key())
 
-        self.run_steps(model, [self.mark_active(model, work.id), click_profile, editor_shown, click_new, click_overview, editor_back_selects_overview,
+        self.run_steps(model, [self.mark_active(model, work.id), click_profile, editor_shown, click_new, click_overview, editor_is_the_root_of_its_row,
                                keys])
         self.assertEqual(seen["start"], ("main", "overview"), "with profiles the start page is Visão geral")
         self.assertEqual(seen["editor"], (True, personal.id, "Editar perfil"))
@@ -400,7 +401,7 @@ class SidebarTests(unittest.TestCase):
         self.assertEqual(seen["new"], (True, "Novo perfil", ""))
         self.assertEqual(seen["new_selected"], "new-profile")
         self.assertEqual(seen["overview"], (True, "Visão geral", "Visão geral"))
-        self.assertEqual(seen["after_pop"], "overview")
+        self.assertEqual(seen["after_pop"], (1, f"profile:{personal.id}"), "nothing to go back to")
         self.assertEqual(seen["keys"], ("keys", "keys", "Chaves de API"))
         self.assertEqual(seen["pushed"], "Nova chave de API")
         self.assertEqual(seen["reclicked"], (True, "keys"), "clicking the selected entry goes back to its page")
@@ -449,7 +450,7 @@ class SidebarTests(unittest.TestCase):
         def inspect(app):
             window = app.window
             seen["start"] = (window.current_section, window.selected_sidebar_key(),
-                             window.accounts_page.current_tab)
+                             window.nav.get_visible_page().get_tag())
             seen["perfis"] = window.sidebar_sections()[0]
 
         self.run_steps(model, [inspect])
@@ -509,7 +510,7 @@ class SidebarTests(unittest.TestCase):
                 seen[name] = (window.current_section, window.selected_sidebar_key())
             seen["accounts_tab"] = None
             window.open_page("accounts")
-            seen["accounts_tab"] = window.accounts_page.current_tab
+            seen["accounts_tab"] = window.nav.get_visible_page().get_tag()
             window.open_page("new-profile")
             page = window.nav.get_visible_page()
             seen["new-profile"] = (isinstance(page, ProfileEditorPage) and page.is_new, window.selected_sidebar_key())

@@ -202,7 +202,7 @@ class MainWindowSmokeTests(unittest.TestCase):
         return json.loads(self.config_path.read_text())
 
     def test_every_page_renders_and_edits_save(self):
-        from multicred.ui.pages.accounts import ClaudeFolderPage
+        from multicred.ui.pages.claude import ClaudeFolderDetailPage
 
         model, seen = self.model, {}
 
@@ -249,9 +249,9 @@ class MainWindowSmokeTests(unittest.TestCase):
                 window.open_page(name)
                 seen["tab_rows"][name] = [row.info()["title"] for row in window.nav.get_visible_page().rows]
             window.open_page("accounts")
-            page = window.accounts_page
-            seen["tab_rows"]["claude"] = page.row_titles("claude")
-            seen["folders"] = page.folder_titles()
+            page = window.nav.get_visible_page()
+            seen["tab_rows"]["claude"] = [row.info()["title"] for row in page.account_rows]
+            seen["folders"] = [row.info()["title"] for row in page.folder_rows]
 
         def shot_accounts(app):
             return self.screenshot(app.window, "contas")
@@ -339,8 +339,7 @@ class MainWindowSmokeTests(unittest.TestCase):
             seen["coauthor"] = editor.coauthor_row.get_active()
             window.nav.pop()
             window.open_page("accounts")
-            page = window.accounts_page
-            page.request_login("add", None)
+            window.nav.get_visible_page().add_button.emit("clicked")
             # S-04: a page pushed on Claude, as on the Mac (no dialog).
             seen["login_form"] = window.nav.get_visible_page() is window.login_page is not None
             if seen["login_form"]:
@@ -348,7 +347,7 @@ class MainWindowSmokeTests(unittest.TestCase):
 
         def other_actions(app):
             window = app.window
-            folder = window.push(ClaudeFolderPage(
+            folder = window.push(ClaudeFolderDetailPage(
                 window, str(self.sandbox / ".claude-empresa")))
             seen["folder_page"] = folder.get_title()
             window.nav.pop()
@@ -398,7 +397,7 @@ class MainWindowSmokeTests(unittest.TestCase):
         self.assertEqual(seen["tab_rows"]["github"], ["Empresa", "Pessoal"])
         self.assertEqual(seen["tab_rows"]["claude"], ["Empresa", "Cliente X"])
         self.assertEqual(seen["tab_rows"]["keys"], ["Empresa", "Empresa"])
-        self.assertEqual(seen["folders"], ["~/.claude (padrão)", "~/.claude-empresa"])
+        self.assertEqual(seen["folders"], ["~/.claude", "~/.claude-empresa"])
 
         self.assertEqual(seen["editor_title"], "Editar perfil")
         self.assertEqual(seen["editor_keys"], ["OpenAI", "Gemini"])

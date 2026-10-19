@@ -6,14 +6,15 @@ GitHub, Claude, Chaves de API with a gray count and an orange ⚠ by the Mac rul
 "Sistema" (Verificar with a green/orange dot once something was verified, Ajustes).
 Linux extra (user decision): "Visão geral", the dashboard of `pages/profiles.py`, heads
 the Perfis section and is the start page; without profiles the start page is Claude, as
-on the Mac. Clicking a profile opens its editor and never switches (the editor's and the
-dashboard's buttons do). Before setup, the onboarding replaces the whole content.
+on the Mac. Clicking a profile opens its editor as the page of that row (no back button)
+and never switches (the editor's and the dashboard's buttons do). Before setup, the
+onboarding replaces the whole content.
 
 Pages are built from `PAGE_FACTORIES` (name → callable(window) returning a widget), so
 the tray's `open_page(name)` and later slices can replace a page without touching the
-navigation (S-02/S-03: `PAGE_FACTORIES["git"] = lambda window: GitAccountsPage(window)`).
-A factory may return an Adw.NavigationPage or any widget (it is then wrapped with a
-header bar). Sub-pages (editors) are pushed on the content's Adw.NavigationView.
+navigation. A factory may return an Adw.NavigationPage or any widget (it is then wrapped
+with a header bar). Sub-pages (editors, details, logins) are pushed on the content's
+Adw.NavigationView.
 """
 
 from __future__ import annotations
@@ -42,9 +43,10 @@ SECTION_TITLES = {
 }
 # Page names the tray menu uses: "Contas…" opens Claude, as on the Mac.
 PAGE_ALIASES = {"accounts": "claude"}
-# Until S-02/S-03 give each kind of account its own page, the four Contas entries share
-# the tabbed AccountsPage: entry name → its tab.
-ACCOUNT_TABS = {"git": "git", "github": "github", "claude": "claude", "keys": "keys"}
+# The Contas entries, each a page of its own (S-02, S-03).
+ACCOUNT_KINDS = ("git", "github", "claude", "keys")
+# `current_section` while a profile's editor is the root of the content (its sidebar row).
+PROFILE_SECTION = "profile"
 
 # SF Symbols of the Mac sidebar → icon names (inventory B1). branch, </> and sparkle do
 # not exist in Adwaita: they are the app's own symbolic SVGs (widgets.load_icons).
@@ -85,8 +87,10 @@ def _profiles_page(window):
     return ProfilesPage(window)
 
 
-def _accounts_entry(window):
-    return window.accounts_page
+def _claude_page(window):
+    """S-03: the Mac's Claude page (pages/claude.py)."""
+    from .pages.claude import ClaudePage
+    return ClaudePage(window)
 
 
 def _account_list_page(class_name: str) -> Callable:
@@ -120,7 +124,7 @@ PAGE_FACTORIES: dict[str, Callable] = {
     "main": _profiles_page,
     "git": _account_list_page("GitAccountsPage"),
     "github": _account_list_page("GitHubAccountsPage"),
-    "claude": _accounts_entry,
+    "claude": _claude_page,
     "keys": _account_list_page("APIKeysPage"),
     "verify": _verify_page,
     "settings": _settings_page,
@@ -149,7 +153,6 @@ class MainWindow(Adw.ApplicationWindow):
         # one pushed, and what the last one reported.
         self.login_page = None
         self.last_login_result = None
-        self.folder_login_command = None
         self._toast = None
         self.toasts = Adw.ToastOverlay()
         view = Adw.ToolbarView()
@@ -163,7 +166,6 @@ class MainWindow(Adw.ApplicationWindow):
         view.add_top_bar(self.tray_banner)
         self.onboarding = None
         self._section_pages: dict[str, Adw.NavigationPage] = {}
-        self._accounts_page = None
         self.current_section: str | None = None
         self._selecting = False
 
@@ -237,7 +239,7 @@ class MainWindow(Adw.ApplicationWindow):
                 "keys": any(not model.has_secret(key) for key in config.api_keys),
             }
         else:
-            counts, warnings = dict.fromkeys(ACCOUNT_TABS, 0), dict.fromkeys(ACCOUNT_TABS, False)
+            counts, warnings = dict.fromkeys(ACCOUNT_KINDS, 0), dict.fromkeys(ACCOUNT_KINDS, False)
         for key, title in (("git", "Git"), ("github", "GitHub"), ("claude", "Claude"), ("keys", "Chaves de API")):
             items.append(SidebarItem(key, "Contas", title, icon=ICONS[key], count=counts[key],
                                      warning=warnings[key]))
@@ -421,10 +423,6 @@ class MainWindow(Adw.ApplicationWindow):
     def show_section(self, name: str) -> Adw.NavigationPage:
         page = self._section_page(name)
         self.current_section = name
-        tab = ACCOUNT_TABS.get(name)
-        if tab is not None and hasattr(page, "select_tab"):
-            page.select_tab(tab)
-            page.set_title(SECTION_TITLES[name])
         self.nav.replace([page])
         self.content_page.set_title(SECTION_TITLES.get(name, page.get_title()))
         self._select_sidebar(_section_key(name))
@@ -460,26 +458,20 @@ class MainWindow(Adw.ApplicationWindow):
         return self._section_page("main")
 
     @property
-    def accounts_page(self):
-        """The tabbed Contas page shared by the Git/GitHub/Claude/Chaves entries (until S-02/S-03)."""
-        if self._accounts_page is None:
-            from .pages.accounts import AccountsPage
-            self._accounts_page = AccountsPage(self)
-        return self._accounts_page
-
-    @property
     def rows(self):
         """Profile rows of the Visão geral dashboard, in configuration order."""
         return self.profiles_page.rows
 
     def show_profile_editor(self, profile_id):
-        """A profile's editor (None = new profile), pushed over Visão geral: opening it never
-        switches; its back button returns to the dashboard."""
+        """A profile's editor (None = new profile) as the page of its sidebar row, like the
+        Mac (MainWindowView.swift:90-94): the root of the content, no back button. Opening
+        it never switches."""
         from .pages.profile_editor import ProfileEditorPage
-        if self.current_section != "main":
-            self.show_section("main")
-        self.nav.pop_to_tag("main")
-        return self.push(ProfileEditorPage(self, profile_id))
+        page = ProfileEditorPage(self, profile_id)
+        self.current_section = PROFILE_SECTION
+        self.nav.replace([page])
+        self.content_page.set_title(page.get_title())
+        return page
 
     # MARK: logins (pages pushed in the content, as on the Mac)
 
@@ -495,7 +487,9 @@ class MainWindow(Adw.ApplicationWindow):
             from .pages.add_claude import AddClaudeAccountPage
             self._push_login("claude", AddClaudeAccountPage(self, account if kind == "login" else None))
         elif kind == "folder":
-            self._show_folder_login(account)
+            # The Mac's "Entrar no Claude": `claude auth login` in that folder, inside the app.
+            from .pages.claude import ClaudeFolderLoginPage
+            self._push_login("claude", ClaudeFolderLoginPage(self, account))
         elif kind == "github":
             from .pages.login import GitHubLoginPage
             self._push_login("github", GitHubLoginPage(self, host))
@@ -534,30 +528,6 @@ class MainWindow(Adw.ApplicationWindow):
         if account is not None and self.model.state.applied_claude_account_id == account.id:
             self.model.switch_claude_only(account.id, lambda _result, _error: None)
 
-    def _show_folder_login(self, config_dir: str | None) -> None:
-        """A folder's own login: the user runs Claude Code's login in a terminal."""
-        from ..core.quoting import single_quoted
-
-        command = "claude auth login" if config_dir is None else \
-            f"CLAUDE_CONFIG_DIR={single_quoted(config_dir)} claude auth login"
-        self.folder_login_command = command
-        dialog = Adw.AlertDialog(heading="Entrar na pasta do Claude",
-                                 body="Rode este comando num terminal e conclua o login no navegador:")
-        label = Gtk.Label(label=command, selectable=True, wrap=True, xalign=0)
-        label.add_css_class("monospace")
-        dialog.set_extra_child(label)
-        dialog.add_response("close", "Fechar")
-        dialog.add_response("copy", "Copiar comando")
-        dialog.set_response_appearance("copy", Adw.ResponseAppearance.SUGGESTED)
-
-        def responded(_dialog, response):
-            if response == "copy":
-                self.get_clipboard().set(command)
-                self.show_toast("Comando copiado")
-
-        dialog.connect("response", responded)
-        dialog.present(self)
-
     def run_verification(self) -> None:
         """"Verificar de novo": a deep check (gh tokens too) on the page when it is open."""
         page = self._section_pages.get("verify")
@@ -585,9 +555,15 @@ class MainWindow(Adw.ApplicationWindow):
         quit_action = Gio.SimpleAction.new("quit", None)
         quit_action.connect("activate", lambda *_: app.quit())
         self.add_action(quit_action)
+        settings = Gio.SimpleAction.new("settings", None)
+        settings.connect("activate", lambda *_: self._settings_shortcut())
+        self.add_action(settings)
         for number in range(1, 10):
             app.set_accels_for_action(f"win.activate-profile({number})", [f"<Control>{number}"])
         app.set_accels_for_action("win.verify", ["<Control>r"])
+        # The Mac's menu: "Ajustes…" ⌘, and "Sair do MultiCred" ⌘Q (inventory C, rows 17-18).
+        app.set_accels_for_action("win.settings", ["<Control>comma"])
+        app.set_accels_for_action("win.quit", ["<Control>q"])
 
     def activate_profile_number(self, number: int) -> None:
         """Ctrl+1…9: the first nine profiles in configuration order."""
@@ -602,6 +578,11 @@ class MainWindow(Adw.ApplicationWindow):
         if self.onboarding is None:
             self.open_page("verify")  # opening the section runs the checklist
 
+    def _settings_shortcut(self) -> None:
+        """Ctrl+, (Mac ⌘,): Ajustes; during the setup the onboarding stays."""
+        if self.onboarding is None:
+            self.open_page("settings")
+
     # MARK: state
 
     def on_close_request(self, _window):
@@ -613,8 +594,7 @@ class MainWindow(Adw.ApplicationWindow):
 
     def refresh(self) -> None:
         self._rebuild_sidebar()
-        # The four Contas entries share one page: refresh each page once.
-        for page in {id(p): p for p in self._section_pages.values()}.values():
+        for page in self._section_pages.values():
             if (hasattr(page, "refresh") and page.get_parent() is not None
                     and getattr(page, "refresh_on_notify", True)):
                 page.refresh()

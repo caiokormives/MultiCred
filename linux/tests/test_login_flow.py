@@ -512,5 +512,176 @@ class ClaudeAccountSaverTests(SafeTestCase):
         self.assertEqual(json.loads(record.oauth), {"accessToken": "a"})
 
 
+
+class FolderLoginSessionTests(SafeTestCase):
+    """S-03 (R-03): a Claude folder's own login runs `claude auth login` in that folder,
+    inside the app, like the Mac's LoginPage (LoginSession.swift / MainNavigator.swift:70-90).
+    Claude Code itself writes the login into the folder; nothing is captured or stored."""
+
+    def setUp(self):
+        super().setUp()
+        self.dispatch = SerialDispatcher()
+        self.finished = []
+
+    def session(self, config_dir, tools=None, simulated=None, environment=None):
+        session = ClaudeLoginSession(environment or self.environment, tools or ToolsAt(), LoginMode.FOLDER,
+                                     config_dir, None, dispatch=self.dispatch, on_finished=self.finished.append,
+                                     simulated=simulated)
+        self.addCleanup(session.stop)
+        return session
+
+    def wait_finished(self, session, timeout=10):
+        self.assertTrue(wait_until(lambda: session.phase.is_finished, timeout), session.output)
+        self.dispatch.drain()
+
+    def log_in(self, session, code="ABC123"):
+        session.start()
+        self.assertTrue(wait_until(lambda: session.phase == LoginPhase.WAITING_FOR_CODE, 8), session.output)
+        session.submit_code(code)
+        self.wait_finished(session)
+
+    def test_simulated_login_writes_the_login_into_the_target_folder(self):
+        from multicred.core.claude.status import status_from_state_file
+        from multicred.core.models import ClaudeFolder
+
+        folder = self.home / ".claude-empresa"
+        session = self.session(str(folder))
+        self.log_in(session)
+        command = session.command
+        self.assertEqual(command.environment["CLAUDE_CONFIG_DIR"], str(folder))
+        self.assertIsNone(command.scratch, "no throwaway folder: the login goes into the folder itself")
+        self.assertEqual(command.display, "claude auth login (simulado)")
+        self.assertEqual(command.executable, LoginSimulator.EXECUTABLE)
+        self.assertEqual(session.phase, LoginPhase.CONNECTED)
+        self.assertEqual(self.finished, [session])
+        self.assertIn("accessToken", json.loads((folder / ".credentials.json").read_text())["claudeAiOauth"])
+        status = status_from_state_file(ClaudeFolder.own_login(str(folder)), self.environment)
+        self.assertEqual((status.kind, status.email), ("loggedIn", LoginSimulator.SIMULATED_EMAIL))
+        self.assertFalse((self.home / ".config" / "multicred" / "scratch").exists())
+        self.assertIsNone(session.result, "nothing is stored by MultiCred")
+        self.assertEqual(self.claude_store.vault, {})
+        self.assertNotIn("ABC123", session.output)
+
+    def test_the_default_folder_runs_without_claude_config_dir(self):
+        session = self.session(None)
+        self.log_in(session)
+        self.assertNotIn("CLAUDE_CONFIG_DIR", session.command.environment)
+        self.assertEqual(session.phase, LoginPhase.CONNECTED)
+        self.assertTrue((self.home / ".claude" / ".credentials.json").exists())
+        self.assertEqual(json.loads((self.home / ".claude.json").read_text())["oauthAccount"]["emailAddress"],
+                         LoginSimulator.SIMULATED_EMAIL)
+
+    def test_the_real_cli_runs_auth_login_with_the_folder(self):
+        folder = self.home / ".claude-x"
+        folder.mkdir()
+        claude = str(self.make_executable("fakebin/claude", (
+            "#!/bin/sh\n"
+            "printf '%s\\n' \"$*\" > \"$HOME/claude-args\"\n"
+            "printf '%s\\n' \"$CLAUDE_CONFIG_DIR\" > \"$HOME/claude-dir\"\n"
+            "printf 'Opening browser to sign in...\\r\\n'\n"
+            "printf \"If the browser didn't open, visit: https://claude.com/cai/oauth/authorize?x=1\\r\\n\"\n"
+            "sleep 0.3\n"
+            "printf 'Login successful.\\r\\n'\n")))
+        session = self.session(str(folder), tools=ToolsAt(claude=claude), simulated=False)
+        session.start()
+        self.assertEqual(session.command.arguments, ["auth", "login"], "the Mac runs `claude auth login`")
+        self.assertEqual(session.command.display, "claude auth login")
+        self.wait_finished(session)
+        self.assertEqual(session.phase, LoginPhase.CONNECTED)
+        self.assertEqual(session.authorization_url, "https://claude.com/cai/oauth/authorize?x=1")
+        self.assertEqual(self.read(self.home / "claude-args").strip(), "auth login")
+        self.assertEqual(self.read(self.home / "claude-dir").strip(), str(folder))
+
+    def test_a_failing_cli_ends_in_failure(self):
+        claude = str(self.make_executable("fakebin/claude", "#!/bin/sh\nprintf 'Error: denied\\r\\n'\nexit 1\n"))
+        session = self.session(str(self.home / ".claude-x"), tools=ToolsAt(claude=claude), simulated=False)
+        session.start()
+        self.wait_finished(session)
+        self.assertEqual(session.phase, LoginPhase.failed("Error: denied"))
+
+    def test_rejected_code_writes_nothing(self):
+        folder = self.home / ".claude-x"
+        session = self.session(str(folder))
+        self.log_in(session, code="erro")
+        self.assertEqual(session.phase, LoginPhase.failed("Error: Invalid code or expired"))
+        self.assertFalse((folder / ".credentials.json").exists())
+
+    def test_a_folder_outside_the_test_home_is_refused(self):
+        outside = Path(tempfile.mkdtemp(prefix="mc-outside-"))
+        self.addCleanup(shutil.rmtree, outside, True)
+        for target in (str(outside), f"{self.home}/../{outside.name}"):
+            session = self.session(target)
+            session.start()
+            self.assertIsNone(session.command)
+            self.assertTrue(session.phase.is_failure)
+            self.assertEqual(session.launch_error,
+                             "No modo de teste, a pasta precisa ficar dentro do HOME de teste.")
+        self.assertEqual(list(outside.iterdir()), [])
+
+
+class FolderLogoutTests(SafeTestCase):
+    """"Sair do login da pasta…" (AppModel.logoutClaudeFolder): `claude auth logout` in the
+    folder; in test mode the simulated login is removed from the sandbox instead."""
+
+    def real_environment(self):
+        return SystemEnvironment(mode="real", home=self.home, login_shell="/bin/bash", user_name="tester",
+                                 runner=self.runner, secrets=self.secrets, claude_credentials=self.claude_store)
+
+    def test_real_mode_runs_claude_auth_logout_in_the_folder(self):
+        from multicred.core.claude.login_flow import logout_folder
+
+        self.runner.on("claude", ["auth", "logout"])
+        folder = str(self.home / ".claude-x")
+        logout_folder(self.real_environment(), ToolsAt(claude="/opt/claude/bin/claude"), folder)
+        logout_folder(self.real_environment(), ToolsAt(claude="/opt/claude/bin/claude"), None)
+        first, second = self.runner.requests
+        self.assertEqual((first.executable, first.arguments), ("/opt/claude/bin/claude", ["auth", "logout"]))
+        self.assertEqual(first.environment["CLAUDE_CONFIG_DIR"], folder)
+        self.assertNotIn("CLAUDE_CONFIG_DIR", second.environment, "the default folder is ~/.claude")
+
+    def test_real_mode_without_claude_says_how_to_install_it(self):
+        from multicred.core.claude.login_flow import CLAUDE_NOT_INSTALLED, LoginLaunchError, logout_folder
+
+        with self.assertRaises(LoginLaunchError) as raised:
+            logout_folder(self.real_environment(), ToolsAt(), None)
+        self.assertEqual(str(raised.exception), CLAUDE_NOT_INSTALLED)
+
+    def test_a_failing_logout_raises(self):
+        from multicred.core.claude.login_flow import logout_folder
+
+        self.runner.on("claude", ["auth", "logout"], exit_code=1, stderr="boom")
+        with self.assertRaises(Exception):
+            logout_folder(self.real_environment(), ToolsAt(claude="/opt/claude/bin/claude"), None)
+
+    def test_test_mode_removes_the_simulated_login_and_runs_nothing(self):
+        from multicred.core.claude.login_flow import logout_folder
+        from multicred.core.claude.status import status_from_state_file
+        from multicred.core.models import ClaudeFolder
+
+        folder = self.home / ".claude-x"
+        folder.mkdir()
+        (folder / ".credentials.json").write_text('{"claudeAiOauth":{"accessToken":"sk-ant-oat01-SIMULADO"}}')
+        (folder / ".claude.json").write_text('{"oauthAccount":{"emailAddress":"a@b.c"},"numStartups":3}')
+        self.claude_store.write_folder_item(str(folder), b"live")
+        logout_folder(self.environment, ToolsAt(claude="/opt/claude/bin/claude"), str(folder))
+        self.assertEqual(self.runner.requests, [])
+        self.assertFalse((folder / ".credentials.json").exists())
+        self.assertEqual(json.loads((folder / ".claude.json").read_text()), {"numStartups": 3},
+                         "like Claude Code: only the login goes, the rest of .claude.json stays")
+        self.assertIsNone(self.claude_store.read_folder_item(str(folder)))
+        status = status_from_state_file(ClaudeFolder.own_login(str(folder)), self.environment)
+        self.assertEqual(status.kind, "loggedOut")
+
+    def test_test_mode_never_touches_a_folder_outside_the_test_home(self):
+        from multicred.core.claude.login_flow import LoginLaunchError, logout_folder
+
+        outside = Path(tempfile.mkdtemp(prefix="mc-outside-"))
+        self.addCleanup(shutil.rmtree, outside, True)
+        (outside / ".claude.json").write_text('{"oauthAccount":{"emailAddress":"a@b.c"}}')
+        with self.assertRaises(LoginLaunchError):
+            logout_folder(self.environment, ToolsAt(), str(outside))
+        self.assertIn("oauthAccount", (outside / ".claude.json").read_text())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -165,8 +165,6 @@ def main() -> int:
             window = app.window
             window.dismiss_toast()
             window.open_page(page)
-            if page == "accounts":
-                window.accounts_page.select_tab("claude")
             report["titles"][name] = window.content_page.get_title()
             return False
 

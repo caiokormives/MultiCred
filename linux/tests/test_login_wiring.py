@@ -126,16 +126,28 @@ class LoginWiringTests(unittest.TestCase):
         self.assertEqual(len(imported), 1, "a successful gh login adds the new accounts to the config")
         self.assertTrue(seen.get("stopped"), "leaving the page stops gh")
 
-    def test_folder_login_shows_the_command_to_run(self):
+    def test_folder_login_is_a_page_on_claude_that_runs_the_login_in_the_folder(self):
+        from multicred.ui.pages.claude import ClaudeFolderLoginPage
         seen = {}
         folder = f"{self.sandbox}/.claude-x y"
 
         def drive(app):
             window = app.window
+            window.open_page("main")
             window.on_login_requested("folder", folder)
-            seen["command"] = window.folder_login_command
-            GLib.timeout_add(200, app.quit)
+            page = window.nav.get_visible_page()
+            seen["page"] = isinstance(page, ClaudeFolderLoginPage) and page is window.login_page
+            seen["section"] = (window.current_section, window.selected_sidebar_key())
+
+            def started():
+                seen["environment"] = page.session.command.environment.get("CLAUDE_CONFIG_DIR")
+                seen["display"] = page.session.command.display
+                app.quit()
+            self.poll(lambda: page.session is not None and page.session.command is not None, started)
             return True
 
         self.run_app(drive)
-        self.assertEqual(seen.get("command"), f"CLAUDE_CONFIG_DIR='{folder}' claude auth login")
+        self.assertTrue(seen.get("page"), "S-03: the Mac's \"Entrar no Claude\" page, not a command to copy")
+        self.assertEqual(seen.get("section"), ("claude", "claude"))
+        self.assertEqual(seen.get("environment"), folder)
+        self.assertEqual(seen.get("display"), "claude auth login (simulado)")

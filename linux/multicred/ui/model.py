@@ -329,17 +329,21 @@ class AppModel:
         return Installer(self.environment).preview(options)
 
     def complete_onboarding(self, config: Config, options, initial_profile_id,
-                            on_done: Callable[[object | None, Exception | None], None]) -> None:
+                            on_done: Callable[[object | None, Exception | None], None],
+                            open_at_login: bool | None = None) -> None:
         """Onboarding's last step: install, save the configuration, activate the initial profile.
 
         The installer runs before the save (the Mac saves first): if it fails nothing
-        is configured and the onboarding can simply be run again.
+        is configured and the onboarding can simply be run again. `open_at_login` is
+        step 3's switch (AppModel.swift:536-548); None keeps the setting as it is.
         """
         from ..core.install.installer import Installer
         from ..core.storage import InvalidConfig
         from ..core.validation import issues_in
 
         config.settings.enabled_shells = list(options.shells)
+        if open_at_login is not None:
+            config.settings.open_at_login = open_at_login
 
         def work():
             try:
@@ -359,12 +363,15 @@ class AppModel:
         self.config = config
         self.load_error = None
         # "Abrir ao iniciar a sessão" is on by default, like the Mac's login item at setup;
-        # only from the installed package (Ajustes explains otherwise).
-        if config.settings.open_at_login and self.autostart.is_available():
-            try:
+        # only from the installed package (Ajustes explains otherwise). Switched off, an
+        # entry left from an earlier setup goes away (the Mac's setOpenAtLogin(false)).
+        try:
+            if config.settings.open_at_login and self.autostart.is_available():
                 self.autostart.enable()
-            except OSError as error:
-                self._log("error", f"autostart not written: {error}")
+            elif not config.settings.open_at_login and self.autostart.is_enabled():
+                self.autostart.disable()
+        except OSError as error:
+            self._log("error", f"autostart not changed: {error}")
         self.notify()
         if initial_profile_id is None or config.profile(initial_profile_id) is None:
             on_done(None, None)
@@ -592,6 +599,53 @@ class AppModel:
                 on_done()
 
         self._background("claude-folders", work, finished)
+
+    # S-03: one folder at a time (the Claude page's folder detail and login).
+
+    def load_folder_summary(self, config_dir: str | None, on_done: Callable[[], None] | None = None) -> None:
+        """What one folder holds (ClaudeFolderDetailPage's `.task`), off the UI thread."""
+        from ..core.claude import folder_inspector
+
+        def finished(summary, _error):
+            if summary is not None:
+                self.folder_summaries[config_dir] = summary
+                self.notify()
+            if on_done is not None:
+                on_done()
+
+        self._background("claude-folder", lambda: folder_inspector.summarize(config_dir, self.environment), finished)
+
+    def refresh_folder_status(self, config_dir: str | None, force: bool = True,
+                              on_done: Callable[[], None] | None = None) -> None:
+        """Mac refreshFolderStatus: after the folder's login or logout, its status read again."""
+        from ..core.claude.status import ClaudeStatusService
+
+        if self._status_service is None:
+            self._status_service = ClaudeStatusService(self.environment, self.tools)
+        service, account = self._status_service, ClaudeFolder.own_login(config_dir)
+
+        def finished(status, _error):
+            if status is not None:
+                self.claude_statuses[account.id] = status
+                self.notify()
+            if on_done is not None:
+                on_done()
+
+        self._background("claude-status", lambda: service.status(account, force=force), finished)
+
+    def logout_claude_folder(self, config_dir: str | None, on_done: Callable[[Exception | None], None]) -> None:
+        """"Sair do login da pasta…" (Mac logoutClaudeFolder), off the UI thread; the folder's
+        status is read again afterwards, whatever happened."""
+        from ..core.claude.login_flow import logout_folder
+
+        def finished(_result, error):
+            if error is None:
+                self._log("info", f"claude logout for folder {self.folder_name(config_dir)}")
+            self.refresh_folder_status(config_dir)
+            self.load_folder_summary(config_dir)
+            on_done(error)
+
+        self._background("claude-logout", lambda: logout_folder(self.environment, self.tools, config_dir), finished)
 
     # MARK: Verificar
 
