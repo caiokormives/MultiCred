@@ -132,7 +132,8 @@ class TermuxPackagingTests(SafeTestCase):
         outside = [f for f in files if not (f.startswith(prefix) or prefix.startswith(f))]
         self.assertEqual(outside, [], "only $PREFIX (and its parent directories) is installed")
         for path in ("bin/multicred", "lib/multicred/multicred/__main__.py", "lib/multicred/multicred/cli.py",
-                     "lib/multicred/multicred/cli_menus.py", "lib/multicred/multicred/core/platform.py",
+                     "lib/multicred/multicred/cli_menus.py", "lib/multicred/multicred/cli_text.py",
+                     "lib/multicred/multicred/core/platform.py",
                      "lib/multicred/multicred/core/file_secrets.py",
                      "lib/multicred/multicred/core/claude/termux_support.py",
                      "lib/multicred/multicred/ui/messages.py", "lib/multicred/multicred/ui/feedback.py",
@@ -275,6 +276,7 @@ class TermuxPackagingTests(SafeTestCase):
         modules = sorted(".".join(p.relative_to(lib).with_suffix("").parts) for p in lib.rglob("*.py"))
         modules = [m.removesuffix(".__init__") for m in modules
                    if m not in ("multicred.core.secret_service", "multicred.__main__")]
+        self.assertIn("multicred.cli_text", modules)  # S-20: the menus' choice_index
         code = ("import importlib, sys\nsys.path.insert(0, sys.argv[1])\nfor name in sys.argv[2:]:\n"
                 "    importlib.import_module(name)\nprint('gi' in sys.modules)\n")
         result = subprocess.run([sys.executable, "-S", "-P", "-c", code, str(lib), *modules], capture_output=True,

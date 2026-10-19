@@ -312,26 +312,158 @@ class VerifierTests(VerifierTestCase):
         self.assertIsNone(error)
         return report
 
-    def test_the_app_model_passes_its_cached_folder_statuses(self):
-        """S-16 (review r1): AppModel.verify gives the Verifier the statuses the model already
-        has (the Mac passes its status service, AppModel.swift:444-452), so the profile's
-        folder is not asked `claude auth status` again; not cached yet → asked once."""
+    def test_the_app_model_passes_its_status_service(self):
+        """S-16/S-19 (reviews r1, r2): AppModel.verify asks the model's status service, like
+        the Mac (AppModel.swift:444-452 passes `service.status(for:)`): a folder it already
+        knows (within its validity) is not asked `claude auth status` again; unknown → once."""
         from multicred.core.models import ClaudeFolder
         from multicred.ui.model import AppModel
 
         model = AppModel(self.environment, FakeTools(), processes=FixedProcessScanner(0))
         model.config, model.state = self.config, StateStore(self.paths, self.environment.clock).load()
+        folder = ClaudeFolder.own_login(self.claude_dir)
+        model._status_service_instance().status(folder)  # what refresh_claude_statuses leaves
         before = len(self.claude_status_requests())
-        model.claude_statuses[ClaudeFolder.own_login(self.claude_dir).id] = ClaudeLoginStatus.logged_in(
-            "cache@empresa.com.br")
         item = self.check(self.model_verify(model), "claude.login")
-        self.assertEqual(item.found, "login da pasta ~/.claude-empresa · cache@empresa.com.br")
+        self.assertEqual(item.found, "login da pasta ~/.claude-empresa · dev@empresa.com.br")
         self.assertEqual(len(self.claude_status_requests()), before, "cached: claude auth status not run")
 
-        model.claude_statuses.clear()
-        item = self.check(self.model_verify(model), "claude.login")
-        self.assertEqual(item.found, "login da pasta ~/.claude-empresa · dev@empresa.com.br")  # the folder's file
+        model._status_service_instance().invalidate()
+        self.check(self.model_verify(model), "claude.login")
         self.assertEqual(len(self.claude_status_requests()), before + 1)
+
+    # S-19 (review r2, achados 1, 5, 6)
+
+    def model_with_clock(self, dispatch=None):
+        """An AppModel whose clock the test moves (the status service's validity is 300 s)."""
+        from multicred.ui.model import AppModel
+
+        now = [self.environment.clock()]
+        environment = dataclasses.replace(self.environment, clock=lambda: now[0])
+        kwargs = {"dispatch": dispatch} if dispatch is not None else {}
+        model = AppModel(environment, FakeTools(), processes=FixedProcessScanner(0), **kwargs)
+        model.config, model.state = self.config, StateStore(self.paths, self.environment.clock).load()
+        return model, now
+
+    def refresh_statuses(self, model):
+        import threading
+        done = threading.Event()
+        model.refresh_claude_statuses(done.set)
+        self.assertTrue(done.wait(20), "refresh never finished")
+
+    def test_a_login_made_in_the_terminal_shows_after_the_status_validity(self):
+        """Achado 1: the model's statuses never expire; Verificar from the tray/sidebar used
+        them first and kept saying "sem login" after `claude auth login` in a terminal."""
+        from datetime import timedelta
+
+        from multicred.core.models import ClaudeFolder
+
+        model, now = self.model_with_clock()
+        self.set_folder_login(None)
+        self.refresh_statuses(model)
+        folder_id = ClaudeFolder.own_login(self.claude_dir).id
+        self.assertEqual(model.claude_statuses[folder_id].kind, "loggedOut")
+        self.assertEqual(self.check(self.model_verify(model), "claude.login").status, CheckStatus.ERROR)
+
+        self.set_folder_login("dev@empresa.com.br")  # `claude auth login` in a terminal
+        now[0] += timedelta(seconds=60)
+        self.assertEqual(self.check(self.model_verify(model), "claude.login").status, CheckStatus.ERROR,
+                         "within the validity the cached status is kept, like the Mac")
+        now[0] += timedelta(seconds=300)
+        item = self.check(self.model_verify(model), "claude.login")
+        self.assertEqual((item.status, item.found),
+                         (CheckStatus.OK, "login da pasta ~/.claude-empresa · dev@empresa.com.br"))
+
+    def test_the_status_verify_resolves_lands_in_the_model_on_the_ui_thread(self):
+        """Achado 6: sidebar, tray and Verificar agree. The status the service resolved for
+        Verificar is the model's too, written on the UI thread (model.dispatch)."""
+        import queue
+        import threading
+        from datetime import timedelta
+
+        from multicred.core.models import ClaudeFolder
+
+        calls = queue.Queue()
+        model, now = self.model_with_clock(dispatch=lambda fn, *args: calls.put((fn, args)))
+        writers = []
+
+        class Recording(dict):
+            def __setitem__(self, key, value):
+                writers.append(threading.current_thread())
+                super().__setitem__(key, value)
+
+            def update(self, *args, **kwargs):
+                writers.append(threading.current_thread())
+                super().update(*args, **kwargs)
+
+        model.claude_statuses = Recording()
+        notified = []
+        model.add_listener(lambda: notified.append(dict(model.claude_statuses)))
+        folder_id = ClaudeFolder.own_login(self.claude_dir).id
+        self.set_folder_login(None)
+        model.claude_statuses[folder_id] = model._status_service_instance().status(
+            ClaudeFolder.own_login(self.claude_dir))
+        self.assertTrue(model.needs_claude_login(self.profile))
+        writers.clear()
+
+        self.set_folder_login("dev@empresa.com.br")
+        now[0] += timedelta(seconds=301)
+        done = []
+        model.verify(lambda report, error: done.append((report, error)))
+        for _ in range(400):  # the UI thread's main loop
+            try:
+                fn, args = calls.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            fn(*args)
+            if done:
+                break
+        self.assertTrue(done, "verify never finished")
+        report, error = done[0]
+        self.assertIsNone(error)
+        self.assertEqual(self.check(report, "claude.login").status, CheckStatus.OK)
+        self.assertEqual(model.claude_statuses[folder_id].kind, "loggedIn")
+        self.assertEqual(model.folder_status(self.claude_dir).email, "dev@empresa.com.br")
+        self.assertFalse(model.needs_claude_login(self.profile))
+        self.assertTrue(writers, "the resolved status was written into claude_statuses")
+        self.assertEqual(set(writers), {threading.main_thread()}, "only the UI thread writes the statuses")
+        self.assertTrue(any(statuses.get(folder_id) and statuses[folder_id].kind == "loggedIn"
+                            for statuses in notified), "listeners were told")
+
+    def test_the_status_service_is_created_once_by_concurrent_threads(self):
+        """Achado 5: verify, refresh_claude_statuses and refresh_folder_status ask for it from
+        worker threads; two services would keep two caches (and invalidate only one)."""
+        import threading
+        import time
+        from unittest import mock
+
+        from multicred.core.claude import status as status_module
+
+        original = status_module.ClaudeStatusService
+
+        class Slow(original):
+            def __init__(self, *args, **kwargs):
+                time.sleep(0.05)  # widens the window between "is None" and the assignment
+                super().__init__(*args, **kwargs)
+
+        model, _ = self.model_with_clock()
+        model._status_service = None
+        barrier = threading.Barrier(8)
+        found = []
+
+        def ask():
+            barrier.wait()
+            found.append(model._status_service_instance())
+
+        with mock.patch.object(status_module, "ClaudeStatusService", Slow):
+            threads = [threading.Thread(target=ask) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(10)
+        self.assertEqual(len(found), 8)
+        self.assertEqual(len({id(service) for service in found}), 1, "one shared service")
+        self.assertIs(model._status_service_instance(), found[0])
 
     def test_claude_account_in_use_is_checked_in_the_keyring_and_its_fix_signs_in_again(self):
         """Verifier.swift:130-144: with an account applied, the folder's own login does not
@@ -537,3 +669,65 @@ class VerifierTests(VerifierTestCase):
         self.verifier.producers.append(lambda context: [extra])
         report = self.verify()
         self.assertIn(extra, report.in_section(CheckSection.INTEGRATION))
+
+    # S-18 (review r2, achados 2-4): "Corrigir tudo" re-checks at the requested depth itself.
+
+    def gh_token_health_asks(self):
+        return sum(1 for r in self.runner.requests
+                   if Path(r.executable).name == "gh" and r.arguments[:2] == ["auth", "status"])
+
+    def test_fix_all_deep_ends_with_a_deep_recheck_inside_the_memo(self):
+        """The terminal's `verificar --corrigir` shows the report as deep as the first one (the
+        GitHub login row stays); repairs re-check shallowly, the last re-check is deep, and the
+        folder's login status is still asked once (no extra `claude auth status`)."""
+        asked = []
+
+        def status(account):
+            asked.append(account.config_dir)
+            return ClaudeLoginStatus.logged_in(None)
+
+        verifier = Verifier(self.environment, FakeTools(), FixedProcessScanner(0), claude_status=status)
+        self.system.gh_logins = [("dev-empresa", "failed"), ("dev-pessoal", "success")]
+        self.system.gh_active = "dev-pessoal"
+        (self.home / ".bashrc").write_text("export KEEP=yes\n")
+        before = self.gh_token_health_asks()
+        fixed = verifier.fix_all(config=self.config, deep=True)
+        self.assertEqual(fixed.errors, [])
+        self.assertTrue(fixed.is_consistent, self.problems(fixed))
+        token = self.check(fixed, "gh.token")
+        self.assertEqual((token.status, token.found), (CheckStatus.WARNING, "o gh precisa de um novo login"))
+        self.assertEqual(self.gh_token_health_asks() - before, 1, "only the last re-check is deep")
+        self.assertEqual(asked, [self.claude_dir])
+
+    def test_fix_all_is_shallow_by_default_like_the_mac_window(self):
+        """AppModel.swift:500/510: the window re-checks with verify(checkTokens: false)."""
+        self.system.gh_logins = [("dev-empresa", "failed"), ("dev-pessoal", "success")]
+        (self.home / ".bashrc").write_text("export KEEP=yes\n")
+        fixed = self.verifier.fix_all(config=self.config)
+        self.assertNotIn("gh.token", [c.id for c in fixed.checks])
+        self.assertEqual(self.gh_token_health_asks(), 0)
+
+    def test_a_failing_recheck_keeps_the_repairs_and_their_errors(self):
+        """The repairs ran: a re-check that fails afterwards does not turn them into
+        "Não consegui corrigir", and the repairs' own failures are not lost."""
+        from multicred.core.engine.verifier import RecheckFailed
+
+        self.system.gh_active = "dev-pessoal"
+        self.system.fail_gh_switch_to = "dev-empresa"
+        (self.home / ".bashrc").write_text("export KEEP=yes\n")
+
+        def fails_when_deep(context):
+            if context.deep:
+                raise OSError("state.json ilegível")
+            return []
+
+        self.verifier.producers.append(fails_when_deep)
+        with self.assertRaises(RecheckFailed) as caught:
+            self.verifier.fix_all(config=self.config, deep=True)
+        self.assertEqual(str(caught.exception.cause), "state.json ilegível")
+        self.assertEqual(len(caught.exception.errors), 1)
+        self.assertIn("keyring locked", caught.exception.errors[0])
+        self.assertIn("multicred", (self.home / ".bashrc").read_text(), "the shell repair was applied")
+        # The window shows str(error) after "Não consegui verificar:": both parts are there.
+        self.assertIn("state.json ilegível", str(caught.exception))
+        self.assertIn("keyring locked", str(caught.exception))

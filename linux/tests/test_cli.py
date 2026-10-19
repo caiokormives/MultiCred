@@ -379,6 +379,27 @@ class CliReviewR1Tests(SafeTestCase):
             self.assertIsNone(cli.choice_index(text, 3), text)
         self.assertIsNone(cli.choice_index("7", 2, first=8))
 
+    def test_choice_index_lives_outside_the_cli_dispatcher(self):
+        """S-20 (review r2, achado 7): cli.py imports cli_menus lazily (the dispatcher); the
+        menus took choice_index from cli.py at import time, reversing that. It lives in
+        cli_text, which imports neither; cli.choice_index stays importable."""
+        def fresh_interpreter(module):
+            """The multicred modules a new Python has after importing `module`."""
+            code = (f"import sys\nimport {module}\n"
+                    "print(sorted(n for n in sys.modules if n.startswith('multicred')))\n")
+            result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60,
+                                    cwd=str(Path(cli.__file__).resolve().parents[1]),
+                                    env={"PYTHONDONTWRITEBYTECODE": "1", "LANG": "C.UTF-8"})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return result.stdout.strip()
+
+        self.assertNotIn("'multicred.cli'", fresh_interpreter("multicred.cli_menus"),
+                         "importing cli_menus must not import cli.py")
+        self.assertEqual(fresh_interpreter("multicred.cli_text"), "['multicred', 'multicred.cli_text']")
+        from multicred import cli_menus, cli_text
+        self.assertIs(cli_menus.choice_index, cli_text.choice_index)
+        self.assertIs(cli.choice_index, cli_text.choice_index)
+
     # achado 5 (not applied, see the S-15 report): removing the applied Claude account with no
     # active profile still goes back to the folder's login, like the Mac (AppModel.swift:372-375,
     # "Shells must stop exporting a token that no longer exists") and ui/model.py.
@@ -437,22 +458,54 @@ class CliReviewR1Tests(SafeTestCase):
 
         class FakeVerifier:
             runs = []
+            fixes = []
 
             def run(self, config, state, deep=False):
                 self.runs.append(deep)
-                return VerifyReport([broken, token] if len(self.runs) == 1 else [token], when)
+                return VerifyReport([broken, token], when)
 
-            def fix_all(self, report, config):
-                return VerifyReport([], when, errors=["Bash carrega o MultiCred: sem permissão"])
+            def fix_all(self, report=None, config=None, deep=False):
+                # S-18: the verifier re-checks at this depth itself, inside its memo.
+                self.fixes.append(deep)
+                return VerifyReport([token], when, errors=["Bash carrega o MultiCred: sem permissão"])
 
         fake = FakeVerifier()
         with mock.patch.object(cli, "make_verifier", lambda *args, **kwargs: fake):
             code, out, err = self.cli("verificar", "--corrigir", inp="s\n")
-        self.assertEqual(fake.runs, [True, True])
+        self.assertEqual((fake.runs, fake.fixes), ([True], [True]), "no extra run after Corrigir tudo")
         after = out.split("Executar? [s/N] ", 1)[1].splitlines()
         self.assertIsNotNone(row_of(after, "!", "GitHub CLI · login de dev-b"), after)
         self.assertIn("Não consegui corrigir: Bash carrega o MultiCred: sem permissão", err)
         self.assertEqual(code, 1)
+
+    def test_verificar_corrigir_after_a_failing_recheck_names_the_recheck_not_the_repairs(self):
+        """S-18 (review r2, achado 2): the repairs ran; the re-check after them failed."""
+        from datetime import datetime, timezone
+        from unittest import mock
+
+        from multicred.core.engine.verifier import Check, CheckStatus, Fix, RecheckFailed, VerifyReport
+        broken = Check("shell", "Bash carrega o MultiCred", CheckStatus.ERROR, fix=Fix("install", "Reescrever"))
+        when = datetime(2026, 10, 19, 12, tzinfo=timezone.utc)
+
+        class FakeVerifier:
+            def __init__(self, errors):
+                self.errors = errors
+
+            def run(self, config, state, deep=False):
+                return VerifyReport([broken], when)
+
+            def fix_all(self, report=None, config=None, deep=False):
+                raise RecheckFailed(OSError("state.json ilegível"), self.errors)
+
+        for errors in ([], ["GitHub CLI · conta ativa: keyring locked"]):
+            with mock.patch.object(cli, "make_verifier", lambda *args, **kwargs: FakeVerifier(errors)):
+                code, out, err = self.cli("verificar", "--corrigir", inp="s\n")
+            self.assertEqual(code, 1)
+            lines = err.splitlines()
+            self.assertIn("Não consegui verificar de novo depois de corrigir: state.json ilegível", lines)
+            self.assertIn("Para ver o resultado: multicred verificar", lines)
+            failed = [line for line in lines if line.startswith("Não consegui corrigir")]
+            self.assertEqual(failed, ["Não consegui corrigir: " + "; ".join(errors)] if errors else [], err)
 
     # achado 7: "Corrigir tudo" = report.fixable, one per key
 

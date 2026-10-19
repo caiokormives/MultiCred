@@ -52,7 +52,10 @@ class AppModel:
         self.github_logins: list = []
         self.claude_statuses: dict = {}
         self.folder_summaries: dict = {}
+        # One ClaudeStatusService (its TTL cache) for every lookup; created on first use from
+        # whichever thread gets there first, hence the lock.
         self._status_service = None
+        self._status_service_lock = threading.Lock()
         # Last Verificar report (S-08): needs `ok_count` and `checks`; None = never ran.
         self.verification = None
         # S-09: Claude Code sessions counted after each switch (the feedback warns about them),
@@ -561,15 +564,24 @@ class AppModel:
     def _status_service_instance(self):
         from ..core.claude.status import ClaudeStatusService
 
-        if self._status_service is None:
-            self._status_service = ClaudeStatusService(self.environment, self.tools)
-        return self._status_service
+        with self._status_service_lock:
+            if self._status_service is None:
+                self._status_service = ClaudeStatusService(self.environment, self.tools)
+            return self._status_service
 
     def _known_claude_status(self, account):
-        """Verificar's folder status (off the UI thread): the model's, else the status
-        service's (its own cache, or `claude auth status` when it has none)."""
-        known = self.claude_statuses.get(account.id)
-        return known if known is not None else self._status_service_instance().status(account)
+        """Verificar's folder status (off the UI thread): the status service's, like the Mac
+        (AppModel.swift:444-452), so it expires (TTL) and a login made in a terminal shows.
+        `claude_statuses` never expire, so they are not read here; what the service resolves
+        is written into them (on the UI thread), so the sidebar, the tray and Verificar agree."""
+        status = self._status_service_instance().status(account)
+        self.dispatch(_once, self._remember_claude_status, account.id, status)
+        return status
+
+    def _remember_claude_status(self, account_id, status) -> None:
+        if self.claude_statuses.get(account_id) != status:
+            self.claude_statuses[account_id] = status
+            self.notify()
 
     def refresh_claude_statuses(self, on_done: Callable[[], None] | None = None) -> None:
         """Login status of every folder in use (`claude auth status` takes ~1 s each)."""
@@ -661,9 +673,9 @@ class AppModel:
             if on_done is not None:
                 on_done(None, None)
             return
-        # The model's scanner (no GTK here: the tray runs this too), and the folders'
-        # statuses the model already has (the Mac passes its status service,
-        # AppModel.swift:444-452): no second `claude auth status` for a cached folder.
+        # The model's scanner (no GTK here: the tray runs this too), and the model's status
+        # service (the Mac passes it, AppModel.swift:444-452): no second `claude auth
+        # status` for a folder it knows, and a status older than its TTL is asked again.
         verifier = Verifier(self.environment, self.tools, self.processes, engine=self.engine, log=self.log,
                             claude_status=self._known_claude_status)
 

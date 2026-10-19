@@ -26,7 +26,7 @@ import getpass
 import queue
 import unicodedata
 
-from .cli import choice_index
+from .cli_text import choice_index
 from .core.models import APIProvider, ClaudeAccountKind, GitHubAccount, GitIdentity, Profile, ProfileColor, \
     ProfileIcon, ShellKind
 

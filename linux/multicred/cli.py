@@ -35,6 +35,7 @@ import tempfile
 from pathlib import Path
 
 from . import VERSION
+from .cli_text import choice_index
 
 NOT_CONFIGURED = "MultiCred ainda não foi configurado."
 # The Mac's marks: ✓ on the active item, the warning subtitle of a profile item.
@@ -183,16 +184,6 @@ def run(args, environment=None, tools=None, out=None, err=None, inp=None) -> int
         "verificar": lambda: session.verify(args.corrigir),
         "desinstalar": session.uninstall,
     }[args.command]()
-
-
-def choice_index(text: str, count: int, first: int = 1) -> int | None:
-    """The 0-based position of a typed number among `count` choices numbered from `first`,
-    or None. Only ASCII 0-9: str.isdigit() also takes "²" (int() then raises) and
-    int() reads "١" or "１" as 1, which nobody typing a menu number means."""
-    if not (text.isascii() and text.isdecimal()):
-        return None
-    index = int(text) - first
-    return index if 0 <= index < count else None
 
 
 def resolve_profile(config, text: str):
@@ -702,14 +693,21 @@ class _Session:
         if not self._confirm("Executar? [s/N] "):
             self._say("Nada foi alterado.")
             return 1
+        from .core.engine.verifier import RecheckFailed
+
         try:
-            errors = verifier.fix_all(report, config).errors
-            # fix_all re-checks shallowly between repairs; the report shown has the depth of
-            # the first, so the GitHub login row stays while it is not resolved and "N de M"
-            # counts the same rows. (The window keeps the Mac's shallow re-check:
-            # AppModel.swift:500/510 verify(checkTokens: false).)
-            report = verifier.run(config, engine.current_state(), deep=True)
-            report.errors = errors
+            # The report after the repairs has the depth of the first, so the GitHub login
+            # row stays while it is not resolved and "N de M" counts the same rows; the
+            # verifier re-checks at that depth inside its memo (no second `claude --version`
+            # or `claude auth status`). The window keeps the Mac's shallow re-check.
+            report = verifier.fix_all(report, config, deep=True)
+        except RecheckFailed as error:
+            # The repairs ran; only the re-check after them failed.
+            self._say(f"Não consegui verificar de novo depois de corrigir: {error.cause}",
+                      "Para ver o resultado: multicred verificar", error=True)
+            if error.errors:
+                self._say("Não consegui corrigir: " + "; ".join(error.errors), error=True)
+            return 1
         except Exception as error:
             self._say(f"Não consegui corrigir: {error}", error=True)
             return 1

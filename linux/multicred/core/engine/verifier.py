@@ -180,6 +180,20 @@ class VerifyReport:
         return not self.problems
 
 
+class RecheckFailed(Exception):
+    """"Corrigir tudo" ran its repairs but a re-check after them failed. The repairs that
+    worked stay done (they are not "Não consegui corrigir"); `errors` are the repairs' own
+    failures and `cause` what broke the re-check. The text has both, for screens that show
+    only str(error)."""
+
+    def __init__(self, cause: Exception, errors: list[str]):
+        self.cause, self.errors = cause, list(errors)
+        text = str(cause)
+        if self.errors:
+            text += " · Não consegui corrigir: " + "; ".join(self.errors)
+        super().__init__(text)
+
+
 @dataclass(frozen=True)
 class VerifyContext:
     """What every check producer gets for one run."""
@@ -323,27 +337,44 @@ class Verifier:
         report.errors = errors
         return report
 
-    def fix_all(self, report: VerifyReport | None = None, config: Config | None = None) -> VerifyReport:
+    def fix_all(self, report: VerifyReport | None = None, config: Config | None = None,
+                deep: bool = False) -> VerifyReport:
         """Repairs every fixable problem, one repair at a time, re-checking in between so
         no repair runs for a check another repair already fixed. Failures are collected
-        in the returned report's `errors`; the remaining repairs still run."""
+        in the returned report's `errors`; the remaining repairs still run.
+
+        The re-checks between repairs are shallow; the returned report has the depth
+        `deep` (the terminal passes the depth of the report it showed, so the GitHub
+        login row stays; the window keeps the Mac's shallow re-check, AppModel.swift:500/510
+        verify(checkTokens: false)). It is computed inside the same memo, so Claude's
+        statuses and Termux's `claude --version` are not asked again. A re-check that
+        fails after the repairs raises RecheckFailed with the repairs' errors."""
         config = self._require(config)
         with self._remembering_statuses():
-            return self._fix_all(config)
+            return self._fix_all(config, deep)
 
-    def _fix_all(self, config: Config) -> VerifyReport:
+    def _fix_all(self, config: Config, deep: bool) -> VerifyReport:
         attempted: set[str] = set()
         errors: list[str] = []
-        current = self._fresh(config)
+        current = self._fresh(config)  # nothing repaired yet: a failure here is plain
         while True:
             pending = next((c for c in current.fixable if c.fix.key not in attempted), None)
             if pending is None:
                 break
             attempted.add(pending.fix.key)
             errors += self._apply(pending)
-            current = self._fresh(config)
+            current = self._recheck(config, errors)
+        if deep:
+            current = self._recheck(config, errors, deep=True)
         current.errors = errors
         return current
+
+    def _recheck(self, config: Config, errors: list[str], deep: bool = False) -> VerifyReport:
+        try:
+            return self._fresh(config, deep)
+        except Exception as error:
+            self._log("error", f"verify: re-check after the repairs failed: {error}")
+            raise RecheckFailed(error, errors) from error
 
     # MARK: fixes
 
@@ -361,9 +392,9 @@ class Verifier:
         finally:
             self._status_memo, self._diagnosis_memo = None, None
 
-    def _fresh(self, config: Config) -> VerifyReport:
+    def _fresh(self, config: Config, deep: bool = False) -> VerifyReport:
         state = StateStore(self.paths, self.environment.clock).load()
-        return self.run(config, state, deep=False)
+        return self.run(config, state, deep=deep)
 
     def _apply(self, check: Check) -> list[str]:
         self._log("info", f"verify: fix {check.id} ({check.fix.key})")

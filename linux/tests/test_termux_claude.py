@@ -272,6 +272,27 @@ class TermuxVerifierTests(TermuxClaudeWorld):
         self.assertEqual(self.version_runs() - before, 2)
         self.assert_stayed_in_termux()
 
+    def auth_status_runs(self):
+        claude = str(self.prefix / "bin" / "claude")
+        return sum(1 for r in self.recording.requests
+                   if r.executable == claude and r.arguments[:2] == ["auth", "status"])
+
+    def test_verificar_corrigir_asks_claude_once_for_the_report_and_once_for_the_repairs(self):
+        """S-18 (review r2, achado 3): `verificar --corrigir` = the deep report, then
+        "Corrigir tudo" whose last re-check is deep inside the verifier's memo; no extra run
+        repeats `claude --version` (up to 10 s) or `claude auth status`."""
+        if not self.has_git:
+            self.skipTest("git is not installed on this machine")
+        self.install_claude("2.1.112")
+        self.assertEqual(self.cli("trocar", "Celular")[0], 0)
+        versions, statuses = self.version_runs(), self.auth_status_runs()
+        code, out, err = self.cli("verificar", "--corrigir", inp="s\n")
+        self.assertIn("Executar? [s/N] ", out)
+        self.assertNotIn("Não consegui", err)
+        self.assertEqual(self.version_runs() - versions, 2, "the report, then Corrigir tudo")
+        self.assertEqual(self.auth_status_runs() - statuses, 2, "the report, then Corrigir tudo")
+        self.assert_stayed_in_termux()
+
     def test_claude_code_row_states(self):
         self.assertEqual(self.cli("trocar", "Celular")[0], 0)
         report = self.verify()
