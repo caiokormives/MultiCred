@@ -3,6 +3,14 @@
 App de barra de menus para macOS 14+ que troca, com um clique, a identidade do git, a conta ativa
 do GitHub CLI, a conta do Claude Code (`CLAUDE_CONFIG_DIR`) e as chaves de API dos terminais.
 
+## Linux (Ubuntu e Pop!_OS)
+
+Há uma versão para Ubuntu 24.04+ e Pop!_OS 24.04+ (GTK 4 + libadwaita, na bandeja do COSMIC ou
+do GNOME), em `linux/`: `linux/packaging/build-deb.sh` gera o `.deb`, instalado com
+`sudo apt install ./linux/dist/multicred_<versão>_all.deb`. Instalação, o que o app altera, o
+que nunca toca, desinstalação e as diferenças em relação ao macOS: [linux/README.md](linux/README.md).
+O restante deste arquivo é sobre o macOS.
+
 ## Instalar
 
 1. Baixe o `MultiCred.dmg` mais recente em [Releases](https://github.com/Rafael-Leivas/MultiCred/releases/latest).

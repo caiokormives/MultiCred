@@ -1,10 +1,14 @@
 [Desktop Entry]
 Type=Application
 Name=MultiCred
+GenericName=Troca de identidade de dev
 Comment=Troca de identidade de dev com um clique
 Exec=multicred
 Icon=app.multicred.MultiCred
 Terminal=false
-Categories=Development;Utility;
-Keywords=git;github;claude;perfil;identidade;
+Categories=Development;
+Keywords=git;github;claude;perfil;identidade;conta;
 StartupNotify=true
+StartupWMClass=app.multicred.MultiCred
+SingleMainWindow=true
+X-GNOME-UsesNotifications=true

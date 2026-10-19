@@ -21,6 +21,9 @@ from .window import NO_TRAY_TEXT, MainWindow  # noqa: E402,F401
 class MultiCredApplication(Adw.Application):
     def __init__(self, model: AppModel, background: bool = False,
                  flags: Gio.ApplicationFlags = Gio.ApplicationFlags.DEFAULT_FLAGS):
+        # On X11 the window's WM_CLASS is the program name ("python3" otherwise): the
+        # launcher's StartupWMClass needs the application id (Wayland uses the id itself).
+        GLib.set_prgname(APP_ID)
         super().__init__(application_id=APP_ID, flags=flags)
         self.model = model
         self.background = background

@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>app.multicred.MultiCred</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>MultiCred</name>
+  <summary>Troca de identidade de dev com um clique</summary>
+  <description>
+    <p>
+      O MultiCred troca, numa transação, a identidade do git, a conta ativa do GitHub CLI,
+      a pasta e a conta do Claude Code e as chaves de API dos terminais. Se um passo falha,
+      os anteriores são desfeitos.
+    </p>
+    <p>
+      Fica na bandeja do COSMIC (Pop!_OS) e do GNOME (Ubuntu, com a extensão AppIndicator).
+      Terminais já abertos adotam o novo perfil no próximo prompt.
+    </p>
+  </description>
+  <launchable type="desktop-id">app.multicred.MultiCred.desktop</launchable>
+  <url type="homepage">https://github.com/Rafael-Leivas/MultiCred</url>
+  <developer id="app.multicred">
+    <name>MultiCred</name>
+  </developer>
+  <categories>
+    <category>Development</category>
+  </categories>
+  <keywords>
+    <keyword>git</keyword>
+    <keyword>github</keyword>
+    <keyword>claude</keyword>
+    <keyword>perfil</keyword>
+  </keywords>
+  <provides>
+    <binary>multicred</binary>
+  </provides>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="@VERSION@" date="@DATE@">
+      <description>
+        <p>Primeira versão para Ubuntu 24.04 e Pop!_OS 24.04.</p>
+      </description>
+    </release>
+  </releases>
+</component>

@@ -1,0 +1,8 @@
+multicred (0.1.0) noble; urgency=medium
+
+  * First release for Ubuntu 24.04 and Pop!_OS 24.04: transactional switch of
+    the git identity, the active gh account, the Claude Code folder and account
+    and the API keys of the shells; tray icon (StatusNotifierItem), main window,
+    onboarding, Verificar, Ajustes and uninstall.
+
+ -- MultiCred <noreply@multicred.app>  Sun, 18 Oct 2026 12:00:00 -0300
